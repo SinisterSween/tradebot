@@ -1,0 +1,50 @@
+{
+  "name": "libzlib",
+  "version": "1.3.1",
+  "build": "hd23fc13_2",
+  "build_number": 2,
+  "channel": "https://conda.anaconda.org/conda-forge/osx-64",
+  "subdir": "osx-64",
+  "fn": "libzlib-1.3.1-hd23fc13_2.conda",
+  "md5": "003a54a4e32b02f7355b50a837e699da",
+  "url": "https://conda.anaconda.org/conda-forge/osx-64/libzlib-1.3.1-hd23fc13_2.conda",
+  "sha256": "8412f96504fc5993a63edf1e211d042a1fd5b1d51dedec755d2058948fcced09",
+  "depends": [
+    "__osx >=10.13"
+  ],
+  "constrains": [
+    "zlib 1.3.1 *_2"
+  ],
+  "license": "Zlib",
+  "timestamp": 1727963183000,
+  "size": 57133,
+  "requested_spec": "None",
+  "package_tarball_full_path": "/Users/hatefulsween/miniforge3/pkgs/libzlib-1.3.1-hd23fc13_2.conda",
+  "extracted_package_dir": "/Users/hatefulsween/miniforge3/pkgs/libzlib-1.3.1-hd23fc13_2",
+  "files": [
+    "lib/libz.1.3.1.dylib",
+    "lib/libz.1.dylib"
+  ],
+  "paths_data": {
+    "paths_version": 1,
+    "paths": [
+      {
+        "_path": "lib/libz.1.3.1.dylib",
+        "path_type": "hardlink",
+        "sha256": "c2bf4a20230229e5bf35c04939ae067ec6fce5714af9776fce0c6a7cae646af9",
+        "size_in_bytes": 101360,
+        "sha256_in_prefix": "c2bf4a20230229e5bf35c04939ae067ec6fce5714af9776fce0c6a7cae646af9"
+      },
+      {
+        "_path": "lib/libz.1.dylib",
+        "path_type": "softlink",
+        "sha256": "c2bf4a20230229e5bf35c04939ae067ec6fce5714af9776fce0c6a7cae646af9",
+        "size_in_bytes": 101360
+      }
+    ]
+  },
+  "link": {
+    "source": "/Users/hatefulsween/miniforge3/pkgs/libzlib-1.3.1-hd23fc13_2",
+    "type": 1
+  }
+}

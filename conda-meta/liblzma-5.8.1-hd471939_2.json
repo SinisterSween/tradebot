@@ -1,0 +1,43 @@
+{
+  "name": "liblzma",
+  "version": "5.8.1",
+  "build": "hd471939_2",
+  "build_number": 2,
+  "channel": "https://conda.anaconda.org/conda-forge/osx-64",
+  "subdir": "osx-64",
+  "fn": "liblzma-5.8.1-hd471939_2.conda",
+  "md5": "8468beea04b9065b9807fc8b9cdc5894",
+  "url": "https://conda.anaconda.org/conda-forge/osx-64/liblzma-5.8.1-hd471939_2.conda",
+  "sha256": "7e22fd1bdb8bf4c2be93de2d4e718db5c548aa082af47a7430eb23192de6bb36",
+  "depends": [
+    "__osx >=10.13"
+  ],
+  "constrains": [
+    "xz 5.8.1.*"
+  ],
+  "license": "0BSD",
+  "timestamp": 1749230155000,
+  "size": 104826,
+  "requested_spec": "None",
+  "package_tarball_full_path": "/Users/hatefulsween/miniforge3/pkgs/liblzma-5.8.1-hd471939_2.conda",
+  "extracted_package_dir": "/Users/hatefulsween/miniforge3/pkgs/liblzma-5.8.1-hd471939_2",
+  "files": [
+    "lib/liblzma.5.dylib"
+  ],
+  "paths_data": {
+    "paths_version": 1,
+    "paths": [
+      {
+        "_path": "lib/liblzma.5.dylib",
+        "path_type": "hardlink",
+        "sha256": "8956427bfe298f47a9daef074dcb1890953c4acff45df19a61fbb6b1f0d4e344",
+        "size_in_bytes": 190640,
+        "sha256_in_prefix": "8956427bfe298f47a9daef074dcb1890953c4acff45df19a61fbb6b1f0d4e344"
+      }
+    ]
+  },
+  "link": {
+    "source": "/Users/hatefulsween/miniforge3/pkgs/liblzma-5.8.1-hd471939_2",
+    "type": 1
+  }
+}
