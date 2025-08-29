@@ -10,7 +10,8 @@ class Position:
     avg_price: float = 0.0
 class OrderManager:
     def __init__(self, commission_per_contract, exchange_fees_per_contract, tick_size,
-                 fee_bps: float = 1.0, fee_fixed: float = 0.0, slip_bps: float = 0.5):
+                 fee_bps: float = 1.0, fee_fixed: float = 0.0, slip_bps: float = 0.5,
+                 dollars_per_point: float = 1.0):
         self.commission = commission_per_contract
         self.exch_fees = exchange_fees_per_contract
         self.tick_size = tick_size
@@ -23,10 +24,12 @@ class OrderManager:
         self.slip_bps  = float(slip_bps)
         # track last entry fee so we net it out on exit
         self._last_entry_fee = 0.0
+        self.dpp = float(dollars_per_point)
     # --- helpers ---
     def _notional_fee(self, price: float, qty: int) -> float:
         # bps on notional + absolute fixed per side
-        return abs(price * qty) * (self.fee_bps / 10_000.0) + self.fee_fixed
+        dollar_notional = abs(price * self.dpp * qty)
+        return dollar_notional * (self.fee_bps / 10_000.0) + self.fee_fixed
 
     def _per_contract_fee(self, qty: int) -> float:
         # commission + exchange fees, per contract
@@ -66,7 +69,7 @@ class OrderManager:
             "entry_price": entry_px,
             "price": entry_px,             # keep legacy field for your equity_curve()
             "fees": entry_fee,
-            "notional": abs(entry_px * order.qty),
+            "notional": abs(entry_px * self.dpp * order.qty),
         })
     # --- exit path (stop/target) ---
     def simulate_bracket(self, bar: pd.Series, oco: Bracket):
@@ -101,7 +104,7 @@ class OrderManager:
         total_fees = self._last_entry_fee + exit_fee
 
         # gross pnl (ticks * qty * direction)
-        gross_pnl = (exit_px - self.pos.avg_price) * qty * side_mult(side)
+        gross_pnl = (exit_px - self.pos.avg_price) * self.dpp * qty * side_mult(side)
         net_pnl = gross_pnl - total_fees
         self.realized_pnl += net_pnl
 

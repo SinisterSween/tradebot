@@ -31,13 +31,16 @@ def main(cfg_path="config/settings.dev.yaml", show_gui=True,
         news_lockout_minutes=cfg["risk"]["news_lockout_minutes"],
     )
     risk = RiskGovernor(risk_cfg)
+    dpp = fees["tick_value"] / fees["tick_size"]
+
     om = OrderManager(
         commission_per_contract=fees["commission_per_contract"],
         exchange_fees_per_contract=fees["exchange_fees_per_contract"],
         tick_size=fees["tick_size"],
         fee_bps=fee_bps if fee_bps is not None else fees.get("fee_bps", 1.0), 
         fee_fixed=fee_fixed if fee_fixed is not None else fees.get("fee_fixed", 0.0),
-        slip_bps=slip_bps if slip_bps is not None else fees.get("slip_bps", 0.5)
+        slip_bps=slip_bps if slip_bps is not None else fees.get("slip_bps", 0.5),
+        dollar_per_point=dpp,
     )
     lb = latency_bars if latency_bars is not None else cfg["fees"].get("latency_bars", 0)
     delay = BarDelay(bars=lb)
