@@ -67,7 +67,7 @@ def main(cfg_path="config/settings.dev.yaml", show_gui=True,
             current_bracket = None
 
         for due_order in delay.due(i):
-                om.place_and_simulate(bar, due_order)
+            om.place_and_simulate(bar, due_order)
 
         if not risk.can_trade_now(bar["t_local"]):
             if open_position and current_bracket:

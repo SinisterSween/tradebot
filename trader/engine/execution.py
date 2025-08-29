@@ -36,7 +36,7 @@ class OrderManager:
         self._last_entry_fee = 0.0
     def _round_to_tick(self, px: float) -> float:
         t = float(self.tick_size)
-        return round(px / t) * t
+        return round(px / t) * t if t > 0 else px
     # --- entry path ---
     def place_and_simulate(self, bar: pd.Series, order: Order):
         # fill at bar open with slippage (latency means next bar open generally)
@@ -45,7 +45,7 @@ class OrderManager:
         if self.pos.qty != 0:
             return
         ref_px = float(bar["open"])
-        entry_px = market_slippage(ref_px, order.side, bps=self.slip_bps)
+        entry_px = market_slippage(ref_px, order.side, self.tick_size, bps=self.slip_bps)
         entry_px = self._round_to_tick(entry_px)
         
         # fees: notional (bps/fixed) + per-contract
@@ -93,7 +93,7 @@ class OrderManager:
             return None
 
         # slippage on exit
-        exit_px = market_slippage(float(exit_price), side=side, bps=self.slip_bps)
+        exit_px = market_slippage(float(exit_price), side, self.tick_size, bps=self.slip_bps)
         exit_px = self._round_to_tick(exit_px)
 
         # fees on exit side
