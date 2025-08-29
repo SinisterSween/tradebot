@@ -20,6 +20,7 @@ def main(cfg_path="config/settings.dev.yaml", show_gui=True,
     df = pd.read_csv(cfg["data"]["csv_path"])
     df = prepare_bars(df, cfg["timezone"], cfg["strategy"]["orb_minutes"])
     fees = cfg["fees"]
+    base_eq = cfg["risk"]["account_equity"]
     risk_cfg = RiskConfig(
         account_equity=cfg["risk"]["account_equity"],
         risk_pct=cfg["risk"]["risk_pct"],
@@ -103,7 +104,7 @@ def main(cfg_path="config/settings.dev.yaml", show_gui=True,
             
     # --- Build equity + PnL series cleanly ---
     curve = equity_curve(om.trades)
-    base_eq = cfg["risk"]["account_equity"]
+    
     pnl_series = curve  # cumulative PnL from your engine
     equity_series = base_eq + pnl_series
 
