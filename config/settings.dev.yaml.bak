@@ -1,19 +1,19 @@
-symbol: ES
-timezone: America/Chicago
+symbol: "ES"
+timezone: "America/Chicago"
 data:
-  csv_path: data/ES_1m.csv
-  datetime_col: datetime
+  csv_path: "data/ES_1m.csv"
+  datetime_col: "datetime"
 fees:
-  commission_per_contract: 0.85
-  exchange_fees_per_contract: 1.2
-  tick_value: 1.25
+  commission_per_contract: 2.20
+  exchange_fees_per_contract: 1.25
+  tick_value: 12.5
   tick_size: 0.25
 risk:
   account_equity: 25000
   risk_pct: 0.004
   max_daily_loss_R: 1.5
   max_consec_losses: 3
-  flat_time: '15:55'
+  flat_time: "15:55"
   news_lockout_minutes: 3
 strategy:
   orb_minutes: 5
@@ -25,5 +25,4 @@ strategy:
   stop_pad_ticks: 0
   trail_pad_ticks: 1
   session_windows:
-  - start: 08:35
-    end: '15:20'
+    - { start: "08:35", end: "15:20" }

@@ -1,0 +1,47 @@
+symbol: "MES"
+timezone: "America/Chicago"
+
+ibkr:
+  host: "127.0.0.1"
+  port: 7497
+  client_id: 101
+  account: ""
+  use_continuous: false
+  front_month: "202509"
+  exchange: "CME"
+  currency: "USD"
+  what_to_show: "TRADES"
+  bar_size_secs: 60
+
+fees:
+  commission_per_contract: 0.85
+  exchange_fees_per_contract: 1.20
+  tick_value: 1.25
+  tick_size: 0.25
+
+risk:
+  account_equity: 25000
+  risk_pct: 0.002
+  max_daily_loss_R: 1.0
+  max_consec_losses: 3
+  flat_time: "15:55"
+  news_lockout_minutes: 3
+
+strategy:
+  orb_minutes: 5
+  atr_len: 14
+  break_eps_ticks: 0
+  atr_mult: 0.5
+  target_R: 1.0
+  slope_min: 0.0
+  stop_pad_ticks: 0
+  trail_pad_ticks: 1
+  session_windows:
+    - { start: "08:35", end: "15:20" }
+
+metrics:
+  host: "0.0.0.0"
+  port: 8000
+
+logging_path: "logs/executions.csv"
+state_path: "state/bot_state.json"

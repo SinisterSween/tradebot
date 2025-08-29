@@ -1,9 +1,11 @@
 import yaml, pandas as pd
+import matplotlib.pyplot as plt
+import argparse
 from trader.engine.backtest import prepare_bars, equity_curve
 from trader.engine.execution import OrderManager
 from trader.engine.risk import RiskConfig, RiskGovernor
 from trader.strategies.hybrid_orb_vwap import HybridOrbVwap, StratConfig
-def main(cfg_path="config/settings.dev.yaml"):
+def main(cfg_path="config/settings.dev.yaml", show_gui=True):
     cfg = yaml.safe_load(open(cfg_path, "r"))
     df = pd.read_csv(cfg["data"]["csv_path"])
     df = prepare_bars(df, cfg["timezone"], cfg["strategy"]["orb_minutes"])
@@ -67,5 +69,23 @@ def main(cfg_path="config/settings.dev.yaml"):
     print(f"Trades: {len(winners)+len(losers)}  |  Hit Rate: {hit_rate:.1f}%  |  Total PnL: ${total_pnl:,.2f}")
     if not curve.empty:
         print(f"Max Drawdown (approx): ${float((curve.cummax()-curve).max()):,.2f}")
+
+    
+    trades_df = pd.DataFrame(om.trades)
+    trades_df.to_csv("logs/backtest_trades.csv", index=False)
+    print("\nSaved trades to logs/backtest_trades.csv")
+    print(trades_df.head(10))
+    if not curve.empty:
+        ax = curve.plot(title="Equity Curve")
+        fig = ax.get_figure()
+        fig.savefig("logs/equity_curve.png", dpi=120, bbox_inches="tight")
+        print("Saved chart to logs/equity_curve.png")
+        if show_gui:
+            plt.show()
+
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config/settings.dev.yaml")
+    ap.add_argument("--no-gui", action="store_true", help="Save chart but do not show it")
+    args = ap.parse_args()
+    main(cfg_path=args.config, show_gui=not args.no_gui)

@@ -1,0 +1,52 @@
+# -------- settings --------
+ENV := tradebot
+PY  := conda run -n $(ENV) python
+PIP := conda run -n $(ENV) pip
+
+CSV := data/ES_1m.csv
+
+# -------- targets --------
+.PHONY: help setup backtest live metrics-up metrics-down logs tail clean
+
+help:
+	@echo "make setup        # install Python deps into '$(ENV)'"
+	@echo "make backtest     # run backtest on $(CSV)"
+	@echo "make live         # run live (paper) bot via IBKR"
+	@echo "make metrics-up   # start Prometheus + Grafana"
+	@echo "make metrics-down # stop Prometheus + Grafana"
+	@echo "make logs         # show backtest/live logs"
+	@echo "make tail         # tail live execution log"
+	@echo "make clean        # remove generated logs/state"
+
+setup:
+	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
+
+backtest:
+	test -f $(CSV) || (echo "Missing $(CSV). Put ES 1m data there." && 
+exit 1)
+	$(PY) run_backtest.py
+
+live:
+	$(PY) run_live.py
+
+metrics-up:
+	docker compose up -d
+
+metrics-down:
+	docker compose down
+
+logs:
+	@ls -lh logs || true
+	@echo "CSV: logs/backtest_trades.csv (backtests), 
+logs/executions.csv (live runs)"
+
+tail:
+	@touch logs/executions.csv
+	tail -n 50 -f logs/executions.csv
+
+clean:
+	@rm -f logs/*.csv
+	@rm -f state/*.json
+	@echo "Cleaned logs/ and state/"
+

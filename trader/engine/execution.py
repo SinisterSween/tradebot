@@ -25,7 +25,9 @@ class OrderManager:
         self.pos.side = order.side
         self.pos.qty = order.qty
         self.pos.avg_price = entry_px
-        self.trades.append({"ts": order.ts, "action": "ENTRY", "side": order.side, "qty": order.qty, "price": entry_px, "fees": entry_cost})
+        self.trades.append({"ts": order.ts, "action": "ENTRY", "side": 
+order.side, "qty": order.qty, "entry_price": entry_px,  "price": entry_px, 
+"fees": entry_cost})
     def simulate_bracket(self, bar: pd.Series, oco: Bracket):
         if self.pos.qty == 0: return None
         hi, lo = bar["high"], bar["low"]

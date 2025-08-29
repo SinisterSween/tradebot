@@ -1,0 +1,7 @@
+name: tradebot
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+prefix: /Users/hatefulsween/miniforge3/envs/tradebot
