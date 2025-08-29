@@ -8,6 +8,10 @@ fees:
   exchange_fees_per_contract: 1.2
   tick_value: 1.25
   tick_size: 0.25
+  fee_bps: 1.0
+  fee_fixed: 0.0
+  slip_bps: 0.5
+  latency_bars: 1
 risk:
   account_equity: 25000
   risk_pct: 0.004

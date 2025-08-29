@@ -5,12 +5,13 @@ CSV  := data/ES_1m.csv
 LOGS := logs
 EXEC_LOG := $(LOGS)/executions.csv
 
-.PHONY: help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env
+.PHONY: help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check
 
 
 help:
 	@echo "make setup        # install deps into '$(ENV)'" ; \
 	@echo "make backtest     # run backtest on $(CSV)" ; \
+	@echo "make backtest-gui # run backtest with GUI" ; \
 	@echo "make live         # run live (paper) bot via IBKR" ; \
 	@echo "make metrics-up   # start Prometheus + Grafana" ; \
 	@echo "make metrics-down # stop Prometheus + Grafana" ; \
@@ -26,9 +27,38 @@ setup: ensure-env
 	conda run -n $(ENV) pip install -r requirements.txt
 
 backtest: ensure-env 
-	@test -f $(CSV) || (echo "Missing $(CSV). Put ES 1m data there." && exit 1) ; \
+	@test -f $(CSV) || (echo "Missing $(CSV). Put ES 1m data there." && exit 1)
 	@mkdir -p $(LOGS)
-	conda run -n $(ENV) python run_backtest.py
+	@echo ">> running (headless): python run_backtest.py $(ARGS)"
+	conda run -n $(ENV) MPLBACKEND=Agg python -u run_backtest.py $(ARGS)
+
+backtest-gui: ensure-env
+	@test -f "$(CSV)" || (echo "Missing $(CSV). Put ES 1m data there." && exit 1)
+	@mkdir -p $(LOGS)
+	@echo ">> running (GUI): python run_backtest.py $(ARGS)"
+	conda run -n $(ENV) python -u run_backtest.py $(ARGS)
+
+check: ensure-env
+	@test -f "$(CSV)" || (echo "Missing $(CSV). Put ES 1m data there." && exit 1)
+	@mkdir -p $(LOGS)
+	@echo ">> smoke (headless): python run_backtest.py --no-gui $(ARGS)"
+	conda run -n $(ENV) MPLBACKEND=Agg python -u run_backtest.py --no-gui $(ARGS)
+	@echo "----- summary.json -----"
+	@python - <<'PY'
+import json, sys
+p = "logs/summary.json"
+try:
+    data = json.load(open(p))
+except Exception as e:
+    print(f"(no summary at {p})", e)
+    sys.exit(1)
+
+print(json.dumps(data, indent=2))
+trades = data.get("Trades", 0)
+if not trades:
+    sys.exit("ERROR: No trades in summary.json")
+PY
+	@echo "Smoke OK"
 
 live: ensure-env
 	@mkdir -p $(LOGS)
@@ -55,22 +85,22 @@ tail:
 	@mkdir -p $(LOGS)
 	@touch $(EXEC_LOG)
 	tail -n 50 -f $(EXEC_LOG)
-y
 
 report: ensure-env
 	@mkdir -p $(LOGS)
 	conda run -n $(ENV) python run_backtest.py --no-gui
-        @test -f $(LOGS)/backtest_trades.csv && open $(LOGS)/backtest_trades.csv || true
-        @test -f $(LOGS)/equity_curve.png && open $(LOGS)/equity_curve.png || true
+	@test -f $(LOGS)/backtest_trades.csv && open $(LOGS)/backtest_trades.csv || true
+	@test -f $(LOGS)/equity_curve.png && open $(LOGS)/equity_curve.png || true
 
 report-fast:
+	conda run -n $(ENV) python scripts/metrics_post.py
 	@test -f $(LOGS)/backtest_trades.csv && open $(LOGS)/backtest_trades.csv || echo "No trades CSV yet."
-	@test -f $(LOGS)/equity_curve.png && open $(LOGS)/equity_curve.png || echo "No equity curve yet."
+	@test -f $(LOGS)/pnl_curve.png && open $(LOGS)/pnl_curve.png || echo "No PnL curve yet."
 
 sweep: ensure-env
 	@mkdir -p $(LOGS)
 	conda run -n $(ENV) env PYTHONPATH=. python scripts/sweep.py
-        test -f $(LOGS)/sweep_results.csv && open $(LOGS)/sweep_results.csv || true
+	@test -f $(LOGS)/sweep_results.csv && open $(LOGS)/sweep_results.csv || true
 
 clean:
 	rm -f logs/*.csv state/*.json 
