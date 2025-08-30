@@ -3,17 +3,22 @@ timezone: America/Chicago
 data:
   csv_path: data/ES_1m.csv
   datetime_col: datetime
+metrics:
+  host: "0.0.0.0"
+  port: 9100
 ibkr:
   host: "127.0.0.1"
-  port: 7497            # paper
+  port: 7497            
   client_id: 101
+  account: "DUM797071"
   use_continuous: false
-  front_month: "202509"
-  exchange: "CME"
+  front_month: "front"
+  exchange: "GLOBEX"
   currency: "USD"
   what_to_show: "TRADES"
   bar_size_secs: 60
-  use_delayed: true 
+  use_delayed: true
+  max_data_lag_sec: 120
 fees:
   commission_per_contract: 0.85
   exchange_fees_per_contract: 1.2
@@ -42,3 +47,6 @@ strategy:
   session_windows:
   - start: 08:35
     end: '15:20'
+execution:
+  avoid_market_orders: true
+  limit_slippage_ticks: 2
