@@ -14,10 +14,10 @@ class IbkrBroker:
         self.account = account or None
         self.contract: Optional[Contract] = None
     async def connect(self):
-        if not self.ib.connected():
+        if not self.ib.isConnected():
             await self.ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=15)
     async def disconnect(self):
-        if self.ib.connected(): self.ib.disconnect()
+        if self.ib.isConnected(): self.ib.disconnect()
     async def resolve_contract(self, symbol: str, exchange: str, currency: str, use_continuous: bool = True, front_month: str = "") -> Contract:
         c = ContFuture(symbol, exchange=exchange) if use_continuous else Future(symbol=symbol, lastTradeDateOrContractMonth=front_month, exchange=exchange, currency=currency)
         q = await self.ib.qualifyContractsAsync(c)
@@ -58,8 +58,7 @@ class IbkrBroker:
             o = Order(action=action, orderType="MKT", totalQuantity=abs(qty), tif="DAY", transmit=True)
             await self.ib.placeOrderAsync(p.contract, o)
     def on_exec_details(self, handler):
-        def _h(trade, fill): handler(trade, fill)
-        self.ib.execDetailsEvent += _h
+        self.ib.execDetailsEvent += handler
     async def start_pnl_stream(self, account: str | None, contract_conId: int | None, handler):
         if account is None: return
         if contract_conId:

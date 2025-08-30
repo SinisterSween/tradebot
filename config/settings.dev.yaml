@@ -6,7 +6,7 @@ data:
 fees:
   commission_per_contract: 0.85
   exchange_fees_per_contract: 1.2
-  tick_value: 1.25
+  tick_value: 12.5
   tick_size: 0.25
   fee_bps: 1.0
   fee_fixed: 0.0
@@ -14,7 +14,7 @@ fees:
   latency_bars: 1
 risk:
   account_equity: 25000
-  risk_pct: 0.004
+  risk_pct: 0.03
   max_daily_loss_R: 1.5
   max_consec_losses: 3
   flat_time: '15:55'

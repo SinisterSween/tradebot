@@ -1,4 +1,5 @@
 import asyncio, yaml, pandas as pd, signal, sys
+import argparse
 from datetime import datetime, timezone
 from trader.brokers.ibkr import IbkrBroker
 from trader.engine.risk import RiskConfig, RiskGovernor
@@ -9,15 +10,15 @@ from trader.telemetry.execution_log import log_submit, log_fill, log_flatten
 from trader.persistence.state_store import StateStore, OpenTradeState, RiskState
 
 class RollingBars:
-    def __init__(self, tz: str, orb_minutes: int, max_rows: int = 2000):
+    def __init__(self, tz: str, orb_minutes: int, symbol: str, max_rows: int = 2000):
         self.df = pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
-        self.tz = tz; self.orb_minutes = orb_minutes; self.max_rows = max_rows
+        self.tz = tz; self.orb_minutes = orb_minutes; self.symbol = symbol; self.max_rows = max_rows
     def add(self, bar_dict):
         self.df.loc[len(self.df)] = bar_dict
         if len(self.df) > self.max_rows: self.df = self.df.iloc[-self.max_rows:]
     def features(self):
         if self.df.empty: return None
-        tmp = self.df.copy(); tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True); tmp["symbol"] = "ES"
+        tmp = self.df.copy(); tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True); tmp["symbol"] = self.symbol
         return prepare_bars(tmp, self.tz, self.orb_minutes)
 
 class TradeTracker:
@@ -32,11 +33,23 @@ class TradeTracker:
         if order_id == self.target_id: return "TARGET"
         return "OTHER"
 
-async def main(cfg_path="config/settings.live.yaml"):
+async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
     cfg = yaml.safe_load(open(cfg_path, "r"))
     start_metrics_server(cfg["metrics"]["host"], cfg["metrics"]["port"])
+     # ----- instrument merge (ES/MES) -----
+    contracts = yaml.safe_load(open("config/contracts.yaml", "r"))
+    ct = contracts[symbol]
 
+    # ensure fees section exists
+    if "fees" not in cfg:
+        cfg["fees"] = {}
+    for k in ("tick_size", "tick_value", "commission_per_contract", "exchange_fees_per_contract"):
+        if k in ct:
+            cfg["fees"][k] = ct[k]
     fees = cfg["fees"]
+   
+    cfg["symbol"] = ct.get("symbol", symbol)
+    
     risk = RiskGovernor(RiskConfig(
         account_equity=cfg["risk"]["account_equity"], risk_pct=cfg["risk"]["risk_pct"],
         max_daily_loss_R=cfg["risk"]["max_daily_loss_R"], max_consec_losses=cfg["risk"]["max_consec_losses"],
@@ -68,7 +81,7 @@ async def main(cfg_path="config/settings.live.yaml"):
         pnl_realized.set(float(realized)); pnl_unrealized.set(float(unrealized))
     await ibc.start_pnl_stream(cfg["ibkr"].get("account") or None, getattr(contract, "conId", None), pnl_handler)
 
-    rb = RollingBars(cfg["timezone"], sc["orb_minutes"])
+    rb = RollingBars(cfg["timezone"], sc["orb_minutes"], symbol=cfg["symbol"])
     asyncio.create_task(ibc.stream_realtime_bars(on_bar=rb.add, what_to_show=cfg["ibkr"]["what_to_show"], bar_size_secs=cfg["ibkr"]["bar_size_secs"]))
 
     tracker = TradeTracker()
@@ -145,4 +158,9 @@ async def main(cfg_path="config/settings.live.yaml"):
                 store.save_risk(RiskState(realized_R=risk.realized_R, consec_losses=risk.consec_losses, halted=risk.halted))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config/settings.dev.yaml", help="Path to environment YAML")
+    ap.add_argument("--symbol", default="MES", choices=["ES","MES"], help="Instrument to use from contracts.yaml")
+    args = ap.parse_args()
+    asyncio.run(main(cfg_path=args.config, symbol=args.symbol))
+

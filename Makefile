@@ -1,11 +1,13 @@
 SHELL := /bin/bash
 
 ENV  := tradebot
+CONFIG_ES  := config/settings.dev.yaml
+CONFIG_MES := config/settings.live.yaml
 CSV  := data/ES_1m.csv
 LOGS := logs
 EXEC_LOG := $(LOGS)/executions.csv
 
-.PHONY: help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check
+.PHONY: help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
 
 
 help:
@@ -45,24 +47,40 @@ check: ensure-env
 	conda run -n $(ENV) MPLBACKEND=Agg python -u run_backtest.py --no-gui $(ARGS)
 	@echo "----- summary.json -----"
 	@python - <<'PY'
-import json, sys
-p = "logs/summary.json"
-try:
-    data = json.load(open(p))
-except Exception as e:
-    print(f"(no summary at {p})", e)
-    sys.exit(1)
+	import json, sys
+	p = "logs/summary.json"
+	try:
+		data = json.load(open(p))
+	except Exception as e:
+		print(f"(no summary at {p})", e)
+		sys.exit(1)
 
-print(json.dumps(data, indent=2))
-trades = data.get("Trades", 0)
-if not trades:
-    sys.exit("ERROR: No trades in summary.json")
-PY
+	print(json.dumps(data, indent=2))
+	trades = data.get("Trades", 0)
+	if not trades:
+		sys.exit("ERROR: No trades in summary.json")
+	PY
 	@echo "Smoke OK"
 
 live: ensure-env
 	@mkdir -p $(LOGS)
 	conda run -n $(ENV) python run_live.py
+
+backtest-es: ensure-env
+	@echo ">> Backtest (dev) ES"
+	conda run -n $(ENV) MPLBACKEND=Agg python -u run_backtest.py --config config/settings.dev.yaml --symbol ES $(ARGS)
+
+backtest-mes: ensure-env
+	@echo ">> Backtest (dev) MES"
+	conda run -n $(ENV) MPLBACKEND=Agg python -u run_backtest.py --config config/settings.dev.yaml --symbol MES $(ARGS)
+
+live-es: ensure-env
+	@echo ">> Live (paper) ES"
+	conda run -n $(ENV) python -u run_live.py --config config/settings.paper.yaml --symbol ES $(ARGS)
+
+live-mes: ensure-env
+	@echo ">> Live (paper) MES"
+	conda run -n $(ENV) python -u run_live.py --config config/settings.paper.yaml --symbol MES $(ARGS)
 
 data: fetch-data 
 fetch-data: ensure-env

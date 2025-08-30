@@ -17,6 +17,14 @@ def main(cfg_path="config/settings.dev.yaml", show_gui=True,
         matplotlib.use("Agg")   # headless backend, no popups
     import matplotlib.pyplot as plt
     cfg = yaml.safe_load(open(cfg_path, "r"))
+    contracts = yaml.safe_load(open("config/contracts.yaml", "r"))
+    ct = contracts[args.symbol]
+    if "fees" not in cfg:
+        cfg["fees"] = {}
+    for k in ("tick_size", "tick_value", "commission_per_contract", "exchange_fees_per_contract"):
+        if k in ct:
+            cfg["fees"][k] = ct[k]
+    cfg["symbol"] = ct.get("symbol", args.symbol)
     df = pd.read_csv(cfg["data"]["csv_path"])
     df = prepare_bars(df, cfg["timezone"], cfg["strategy"]["orb_minutes"])
     fees = cfg["fees"]
@@ -32,6 +40,8 @@ def main(cfg_path="config/settings.dev.yaml", show_gui=True,
     )
     risk = RiskGovernor(risk_cfg)
     dpp = fees["tick_value"] / fees["tick_size"]
+    ap.add_argument("--symbol", default="ES", choices=["ES","MES"], help="Instrument symbol to use from contracts.yaml")
+
 
     om = OrderManager(
         commission_per_contract=fees["commission_per_contract"],
@@ -40,7 +50,7 @@ def main(cfg_path="config/settings.dev.yaml", show_gui=True,
         fee_bps=fee_bps if fee_bps is not None else fees.get("fee_bps", 1.0), 
         fee_fixed=fee_fixed if fee_fixed is not None else fees.get("fee_fixed", 0.0),
         slip_bps=slip_bps if slip_bps is not None else fees.get("slip_bps", 0.5),
-        dollar_per_point=dpp,
+        dollars_per_point=dpp,
     )
     lb = latency_bars if latency_bars is not None else cfg["fees"].get("latency_bars", 0)
     delay = BarDelay(bars=lb)
@@ -172,6 +182,8 @@ if __name__ == "__main__":
     ap.add_argument("--slip-bps", type=float, default=0.5)
     ap.add_argument("--kill-dd", type=float, default=0.15)
     ap.add_argument("--kill-day", type=float, default=0.05)
+    ap.add_argument("--symbol", default="ES", choices=["ES","MES"], help="Instrument symbol to use from contracts.yaml")
+
     args = ap.parse_args()
     main(cfg_path=args.config,
         show_gui=not args.no_gui,
