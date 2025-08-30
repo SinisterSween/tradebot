@@ -75,6 +75,8 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
     # IBKR connect
     ibc = IbkrBroker(cfg["ibkr"]["host"], cfg["ibkr"]["port"], cfg["ibkr"]["client_id"], cfg["ibkr"]["account"])
     await ibc.connect()
+    if cfg["ibkr"].get("use_delayed", False):
+        ibc.set_market_data_type(3) # DELAYED on paper
     contract = await ibc.resolve_contract(cfg["symbol"], cfg["ibkr"]["exchange"], cfg["ibkr"]["currency"], cfg["ibkr"]["use_continuous"], cfg["ibkr"]["front_month"])
 
     async def pnl_handler(realized, unrealized):

@@ -21,7 +21,7 @@ try:
 
     # Optional: resolve a futures contract (continuous or front month)
     # Example: ES (E-mini S&P 500) front month on CME
-    es = Future(symbol='ES', lastTradeDateOrContractMonth='', exchange='CME', currency='USD')
+    es = Future(symbol='ES', lastTradeDateOrContractMonth='202509', exchange='CME', currency='USD')
     es = ib.qualifyContracts(es)[0]
     print("ES contract conId:", es.conId, "localSymbol:", es.localSymbol)
 

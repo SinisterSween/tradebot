@@ -3,6 +3,17 @@ timezone: America/Chicago
 data:
   csv_path: data/ES_1m.csv
   datetime_col: datetime
+ibkr:
+  host: "127.0.0.1"
+  port: 7497            # paper
+  client_id: 101
+  use_continuous: false
+  front_month: "202509"
+  exchange: "CME"
+  currency: "USD"
+  what_to_show: "TRADES"
+  bar_size_secs: 60
+  use_delayed: true 
 fees:
   commission_per_contract: 0.85
   exchange_fees_per_contract: 1.2
