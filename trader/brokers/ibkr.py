@@ -1,7 +1,12 @@
-import asyncio
+import asyncio, inspect
 from dataclasses import dataclass
 from typing import Optional, Callable, List
 from ib_insync import IB, Contract, ContFuture, Future, util, Order, Trade
+from datetime import datetime, timezone, timedelta
+from ib_insync.order import LimitOrder, StopOrder
+from ib_insync import Order
+
+util.patchAsyncio()
 
 @dataclass
 class BracketPrices:
@@ -11,6 +16,7 @@ class BracketPrices:
     target_price: Optional[float] = None
 
 class IbkrBroker:
+    
     def __init__(self, host: str, port: int, client_id: int, account: str = ""):
         self.ib = IB()
         self.host, self.port, self.client_id = host, port, client_id
@@ -20,6 +26,75 @@ class IbkrBroker:
     def set_market_data_type(self, md_type: int):
         # 1=REALTIME, 2=FROZEN, 3=DELAYED, 4=DELAYED_FROZEN
         self.ib.reqMarketDataType(md_type)
+        self._md_type = md_type
+    from ib_insync import LimitOrder, StopOrder
+
+    async def whatif_bracket_limit(self, side: str, qty: int, limit_price: float, stop: float, target: float):
+        """
+        Build a LIMIT parent + LIMIT TP + STOP SL as what-if (no placement).
+        Returns dict with commission/margin estimates if available.
+        """
+        assert getattr(self, "contract", None) is not None, "IbkrBroker.contract not set"
+        action = "BUY" if side.upper() == "BUY" else "SELL"
+        exit_action = "SELL" if action == "BUY" else "BUY"
+
+        parent = LimitOrder(action, qty, float(limit_price), tif="GTC")
+        parent.whatIf = True
+        take = LimitOrder(exit_action, qty, float(target), tif="GTC"); take.whatIf = True
+        stop_o = StopOrder(exit_action, qty, float(stop), tif="GTC"); stop_o.whatIf = True
+
+        # whatIf calls are sync in most ib_insync versions; patchAsyncio makes this fine
+        p = self.ib.whatIfOrder(self.contract, parent)
+        t = self.ib.whatIfOrder(self.contract, take)
+        s = self.ib.whatIfOrder(self.contract, stop_o)
+
+        def _summ(o):
+            if not o: return {}
+            # commission and margin fields differ by TWS version; normalize best-effort
+            return {
+                "initMarginChange": float(getattr(o, "initMarginChange", 0.0) or 0.0),
+                "maintMarginChange": float(getattr(o, "maintMarginChange", 0.0) or 0.0),
+                "equityWithLoanChange": float(getattr(o, "equityWithLoanChange", 0.0) or 0.0),
+                "commission": float(getattr(o, "commission", 0.0) or 0.0),
+                "minCommission": float(getattr(o, "minCommission", 0.0) or 0.0),
+                "maxCommission": float(getattr(o, "maxCommission", 0.0) or 0.0),
+                "warningText": getattr(o, "warningText", "") or "",
+            }
+
+        return {"parent": _summ(p), "take": _summ(t), "stop": _summ(s)}
+
+
+    async def place_bracket_limit(self, side: str, qty: int, limit_price: float, stop: float, target: float,
+                              tif: str = "GTC", outsideRth: bool = False):
+        """
+        Parent LIMIT + child LIMIT target + child STOP.
+        Returns [parentTrade, takeProfitTrade, stopLossTrade].
+        Requires self.contract to be set.
+        """
+        assert getattr(self, "contract", None) is not None, "IbkrBroker.contract not set"
+        action = "BUY" if side.upper() == "BUY" else "SELL"
+        exit_action = "SELL" if action == "BUY" else "BUY"
+
+        parent = LimitOrder(action, qty, float(limit_price), tif=tif, outsideRth=outsideRth)
+        parent.transmit = False
+
+        take = LimitOrder(exit_action, qty, float(target), tif=tif, outsideRth=outsideRth)
+        take.transmit = False
+
+        stop_o = StopOrder(exit_action, qty, float(stop), tif=tif, outsideRth=outsideRth)
+        # last child transmits the chain by default
+
+        pTrade = self.ib.placeOrder(self.contract, parent)
+        await self.ib.waitOnUpdate()                 # get parent orderId
+        pid = pTrade.order.orderId
+
+        take.parentId = pid
+        stop_o.parentId = pid
+
+        tTrade = self.ib.placeOrder(self.contract, take)
+        sTrade = self.ib.placeOrder(self.contract, stop_o)
+
+        return [pTrade, tTrade, sTrade]
 
     async def connect(self):
         if not self.ib.isConnected():
@@ -34,60 +109,151 @@ class IbkrBroker:
         if self.ib.isConnected():
             self.ib.disconnect()
 
-    async def resolve_contract(self, symbol: str, exchange: str, currency: str,
-                               use_continuous: bool, front_month: str | None):
-        if use_continuous:
-            c = ContFuture(symbol=symbol, exchange=exchange)
-        else:
-            if not front_month:
-                raise ValueError("front_month is required when use_continuous is False (eg '202509').")
-            c = Future(symbol=symbol, lastTradeDateOrContractMonth=front_month,
-                       exchange=exchange, currency=currency)
-        qs = await self.ib.qualifyContractsAsync(c)
-        if not qs:
-            raise RuntimeError(
-                f"IB could not qualify contract for {symbol} "
-                f"(continuous={use_continuous}, month={front_month}) on {exchange}/{currency}."
-            )
-        self.contract = qs[0]
+    from ib_insync import Future, ContFuture, Contract, util
+    from datetime import datetime, timezone, timedelta
+
+    async def resolve_contract(self, symbol, exchange, currency, use_continuous, front_month,
+                            con_id: int | None = None, local_symbol: str | None = None):
+        """
+        Robust resolver for ES/MES. Priority:
+        1) conId
+        2) localSymbol (e.g., ESU5)
+        3) explicit month (YYYYMM or YYYYMMDD)
+        4) 'front' month discovery (CME -> GLOBEX -> '')
+        Sets self.contract and returns it.
+        """
+        exch = (exchange or "CME")
+        ccy = (currency or "USD")
+
+        # 1) conId (fastest, most reliable)
+        if con_id:
+            cds = await self.ib.reqContractDetailsAsync(Contract(conId=int(con_id)))
+            if not cds:
+                raise RuntimeError(f"Could not qualify conId={con_id}")
+            self.contract = cds[0].contract
+            return self.contract
+
+        # 2) localSymbol (like ESU5) with secType FUT
+        if local_symbol:
+            tmpl = Contract(secType="FUT", localSymbol=local_symbol, exchange=exch, currency=ccy)
+            cds = await self.ib.reqContractDetailsAsync(tmpl)
+            if not cds:
+                # try GLOBEX and unspecified if CME fails
+                for ex2 in ("GLOBEX", ""):
+                    tmpl = Contract(secType="FUT", localSymbol=local_symbol, exchange=ex2 or None, currency=ccy)
+                    cds = await self.ib.reqContractDetailsAsync(tmpl)
+                    if cds:
+                        break
+            if not cds:
+                raise RuntimeError(f"Could not qualify localSymbol={local_symbol}")
+            self.contract = cds[0].contract
+            return self.contract
+
+        # 3) explicit month
+        if front_month and front_month != "front":
+            tmpl = Future(symbol=symbol, exchange=exch, currency=ccy, lastTradeDateOrContractMonth=str(front_month))
+            cds = await self.ib.reqContractDetailsAsync(tmpl)
+            if not cds:
+                # retry with GLOBEX / unspecified
+                for ex2 in ("GLOBEX", ""):
+                    tmpl = Future(symbol=symbol, exchange=ex2 or None, currency=ccy,
+                                lastTradeDateOrContractMonth=str(front_month))
+                    cds = await self.ib.reqContractDetailsAsync(tmpl)
+                    if cds:
+                        break
+            if not cds:
+                raise RuntimeError(f"IB could not qualify explicit {symbol} ({front_month}).")
+            self.contract = cds[0].contract
+            return self.contract
+
+        # 4) 'front' month discovery
+        # list all months and pick nearest non-expired
+        for ex2 in ("CME", "GLOBEX", ""):
+            cds = await self.ib.reqContractDetailsAsync(Future(symbol=symbol, exchange=ex2 or None, currency=ccy))
+            if cds:
+                break
+        if not cds:
+            raise RuntimeError(f"No futures returned for {symbol} on any exchange.")
+
+        now = datetime.now(timezone.utc)
+        def expiry_dt(s: str):
+            if len(s) == 6:
+                y, m = int(s[:4]), int(s[4:6])
+                return datetime(y, m, 1, tzinfo=timezone.utc) + timedelta(days=35)
+            y, m, d = int(s[:4]), int(s[4:6]), int(s[6:8])
+            return datetime(y, m, d, tzinfo=timezone.utc)
+
+        candidates = [cd for cd in cds if cd.contract.lastTradeDateOrContractMonth]
+        future = min(
+            [cd for cd in candidates if expiry_dt(cd.contract.lastTradeDateOrContractMonth) > now + timedelta(days=2)] or candidates,
+            key=lambda cd: expiry_dt(cd.contract.lastTradeDateOrContractMonth)
+        )
+        self.contract = future.contract
         return self.contract
 
-    async def stream_realtime_bars(self, on_bar, what_to_show: str = "TRADES", bar_size_secs: int = 60):
-        if self.contract is None:
-            raise RuntimeError("Contract not set.")
-        bar_size = "1 min" if bar_size_secs >= 60 else "5 secs"
-        duration = "1800 S" # seed window
-        
-        bars = self.ib.reqHistoricalData(
-            self.contract,
-            endDateTime='',
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow=what_to_show,
-            useRTH=True,
-            keepUpToDate=True,
-            formatDate=1
-        )
+    async def stream_realtime_bars(self, *, on_bar, what_to_show="TRADES", bar_size_secs=60):
+        assert getattr(self, "contract", None) is not None, "IbkrBroker.contract not set"
 
-        def on_update(blist, hasNewBar):
-            if not blist: return
-            b = blist[-1]
-            on_bar({
-                "datetime": b.date,
-                "open": b.open, "high": b.high, "low": b.low, "close": b.close,
-                "volume": b.volume,
-            })
-        bars.updateEvent += on_update
-        try:
-            while True:
-                await asyncio.sleep(1.0)
-        finally:
+        def _bar_to_dict(b):
+            dt = util.parseIBDatetime(b.date) if isinstance(b.date, str) else b.date
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return {
+                "datetime": dt.isoformat().replace("+00:00", "Z"),
+                "open": float(b.open), "high": float(b.high),
+                "low": float(b.low), "close": float(b.close),
+                "volume": int(getattr(b, "volume", 0) or 0),
+            }
+
+        async def _emit(d):
             try:
-                bars.updateEvent -= on_update
-                bars.cancel()
-            except Exception:
-                pass
+                if inspect.iscoroutinefunction(on_bar):
+                    await on_bar(d)
+                else:
+                    on_bar(d)
+            except Exception as e:
+                print(f"[STREAM] on_bar error: {e}")
 
+        use_delayed = getattr(self, "_md_type", None) == 3
+        if use_delayed:
+            bars = self.ib.reqHistoricalData(
+                self.contract, endDateTime="", durationStr="2 D",
+                barSizeSetting=("1 min" if bar_size_secs == 60 else f"{bar_size_secs} secs"),
+                whatToShow=what_to_show, useRTH=False, formatDate=1, keepUpToDate=True,
+            )
+
+            # seed (skip last partial)
+            seed = list(bars)[:-1] if len(bars) else []
+            for b in seed[-3:]:
+                await _emit(_bar_to_dict(b))
+            print(f"[STREAM] initial bars loaded: {len(bars)}")
+
+            q = asyncio.Queue()
+            last_iso = None
+
+            def _on_update(_bars, hasNewBar):
+                if hasNewBar and _bars:
+                    try:
+                        q.put_nowait(_bars[-1])
+                    except Exception:
+                        pass
+
+            bars.updateEvent += _on_update
+
+            async def _pump():
+                nonlocal last_iso
+                while True:
+                    b = await q.get()
+                    d = _bar_to_dict(b)
+                    if d["datetime"] != last_iso:
+                        await _emit(d)
+                        last_iso = d["datetime"]
+
+            asyncio.create_task(_pump())
+            return
+
+        raise RuntimeError("Real-time bar streaming not implemented; use delayed (marketDataType=3).")
+    
     async def place_bracket_market(self, side: str, qty: int, stop_price: float, target_price: float) -> List[Trade]:
         if self.contract is None:
             raise RuntimeError("Contract not set.")
@@ -115,12 +281,89 @@ class IbkrBroker:
     def on_exec_details(self, handler):
         self.ib.execDetailsEvent += handler
 
-    async def start_pnl_stream(self, account: str | None, contract_conId: int | None, handler):
-        if account is None:
+    def _pick_account(self, account_hint: str | None) -> str:
+        if account_hint:
+            return account_hint
+        accts = self.ib.managedAccounts()
+        if not accts:
+            raise RuntimeError("No managed accounts available from IB.")
+        return accts[0]
+
+
+    
+    async def start_pnl_stream(self, account: str | None, conId: int | None, handler):
+        acct = account or (self.ib.managedAccounts()[0] if self.ib.managedAccounts() else None)
+        if not acct:
+            raise RuntimeError("No managed accounts available from IB.")
+
+        if getattr(self, "_pnl_task", None):
+            self._pnl_task.cancel()
+            self._pnl_task = None
+
+        def _emit(realized, unreal):
+            try:
+                if inspect.iscoroutinefunction(handler):
+                    asyncio.create_task(handler(realized, unreal))
+                else:
+                    handler(realized, unreal)
+            except Exception as e:
+                print(f"[PNL-POLL] handler error: {e}")
+
+        async def _poll():
+            while True:
+                try:
+                    summary = self.ib.accountSummary()
+                    realized = unreal = 0.0
+                    for v in summary:
+                        if v.account == acct:
+                            if v.tag == "RealizedPnL":
+                                try: realized = float(v.value or 0.0)
+                                except: pass
+                            elif v.tag == "UnrealizedPnL":
+                                try: unreal = float(v.value or 0.0)
+                                except: pass
+                    _emit(realized, unreal)
+                except Exception as e:
+                    print(f"[PNL-POLL] error: {e}")
+                await asyncio.sleep(5.0)
+
+        self._pnl_task = asyncio.create_task(_poll())
+        return None
+
+    async def stop_pnl_stream(self):
+        # Cancel polling task (fallback mode)
+        task = getattr(self, "_pnl_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._pnl_task = None
+
+        # Cancel event-based subs (if ever used)
+        try:
+            if getattr(self, "_pnl_obj", None):
+                self.ib.cancelPnL(self._pnl_obj)
+                self._pnl_obj = None
+            if getattr(self, "_pnl_single", None):
+                self.ib.cancelPnLSingle(self._pnl_single)
+                self._pnl_single = None
+        except Exception:
+            pass
+    
+    def is_connected(self) -> bool:
+        return bool(getattr(self.ib, "isConnected", lambda: False)())
+
+    async def ensure_connected(self):
+        if self.is_connected():
             return
-        if contract_conId:
-            pnl = self.ib.pnlSingle(account, "", contract_conId)
-            pnl.updateEvent += lambda p: handler(p.realizedPnL or 0.0, p.unrealizedPnL or 0.0)
-        else:
-            pnla = self.ib.pnl(account)
-            pnla.updateEvent += lambda p: handler(p.dailyPnL or 0.0, p.unrealizedPnL or 0.0)
+        try:
+            await self.connect()
+            # reapply data mode
+            if getattr(self, "_md_type", None) is not None:
+                self.ib.reqMarketDataType(self._md_type)
+        except Exception as e:
+            print(f"[IB] reconnect failed: {e}")
+
+    

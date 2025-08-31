@@ -1,6 +1,7 @@
 import asyncio, yaml, pandas as pd, signal, sys, argparse
 from datetime import datetime, timezone
-
+from contextlib import suppress
+from trader.telemetry.metrics import data_age_seconds
 # --- make ib_insync play nicely with asyncio ---
 try:
     from ib_insync import util as ib_util
@@ -64,6 +65,18 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
     fees = cfg["fees"]
     cfg["symbol"] = ct.get("symbol", symbol)
 
+    # --- execution knobs (compute once) ---
+    ib_cfg   = cfg.get("ibkr", {})
+    exec_cfg = cfg.get("execution", {})
+    avoid_mkt = bool(exec_cfg.get("avoid_market_orders", ib_cfg.get("use_delayed", False)))
+    slp_ticks = int(exec_cfg.get("limit_slippage_ticks", 2))
+    tick_size = float(cfg.get("fees", {}).get("tick_size", 0.0))
+    if tick_size <= 0:
+        raise ValueError("fees.tick_size missing/invalid")
+
+    def tick_round(px: float) -> float:
+        return round(px / tick_size) * tick_size
+
     # risk / strategy
     risk = RiskGovernor(RiskConfig(
         account_equity=cfg["risk"]["account_equity"], risk_pct=cfg["risk"]["risk_pct"],
@@ -97,19 +110,46 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
     else:
         print("[INFO] IBKR market data: REAL-TIME")
 
+    # Resolve and **set** the contract (use con_id/local_symbol if provided)
     contract = await ibc.resolve_contract(
         cfg["symbol"], cfg["ibkr"]["exchange"], cfg["ibkr"]["currency"],
-        cfg["ibkr"]["use_continuous"], cfg["ibkr"]["front_month"]
+        cfg["ibkr"]["use_continuous"], cfg["ibkr"]["front_month"],
+        con_id=cfg["ibkr"].get("con_id"), local_symbol=cfg["ibkr"].get("local_symbol")
     )
+    ibc.contract = contract  # critical for streamer/orders
 
-    # PnL stream
-    async def pnl_handler(realized, unrealized):
-        pnl_realized.set(float(realized)); pnl_unrealized.set(float(unrealized))
-    await ibc.start_pnl_stream(cfg["ibkr"].get("account") or None, getattr(contract, "conId", None), pnl_handler)
+    def _expiry_dt(ltm: str):
+        if not ltm: return None
+        y, m, d = int(ltm[:4]), int(ltm[4:6]), int(ltm[6:8])
+        return datetime(y, m, d, tzinfo=timezone.utc)
 
-    # Bars stream (your broker should already do keepUpToDate when delayed)
+    roll_warn_days = int(cfg.get("ibkr", {}).get("roll_warn_days", 7))
+    expiry = _expiry_dt(getattr(contract, "lastTradeDateOrContractMonth", ""))
+
+    async def roll_watch():
+        while True:
+            await asyncio.sleep(3600)
+            if not expiry: continue
+            days = (expiry - datetime.now(timezone.utc)).days
+            if days <= roll_warn_days:
+                print(f"[ROLL] {cfg['symbol']} {getattr(contract,'localSymbol','?')} expires in {days}d; update conId before that.")
+                break
+    asyncio.create_task(roll_watch())
+
+
+    # PnL stream (sync handler)
+    def pnl_handler(realized, unrealized):
+        pnl_realized.set(float(realized))
+        pnl_unrealized.set(float(unrealized))
+    try:
+        await ibc.start_pnl_stream(cfg["ibkr"].get("account") or None, getattr(contract, "conId", None), pnl_handler)
+        print("[INFO] PnL stream started")
+    except Exception as e:
+        print(f"[WARN] PnL stream unavailable ({e}); continuing without it")
+
+    # Bars stream (delayed path should use historical keepUpToDate in broker)
     rb = RollingBars(cfg["timezone"], sc["orb_minutes"], symbol=cfg["symbol"])
-    asyncio.create_task(ibc.stream_realtime_bars(
+    bar_task = asyncio.create_task(ibc.stream_realtime_bars(
         on_bar=rb.add,
         what_to_show=cfg["ibkr"]["what_to_show"],
         bar_size_secs=cfg["ibkr"]["bar_size_secs"]
@@ -153,26 +193,65 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
 
     ibc.on_exec_details(on_exec)
 
-    # Kill-switch
+    # ---- Kill-switch / graceful shutdown ----
+    watchdog_task = None
     async def shutdown(*_):
         try:
             log_flatten(log_path, symbol=cfg["symbol"], notes="killswitch")
-            await ibc.flatten_all()
+            if hasattr(ibc, "flatten_all"):
+                await ibc.flatten_all()
         finally:
+            # stop PnL polling/subs before breaking the socket
+            try:
+                await ibc.stop_pnl_stream()
+            except Exception as e:
+                print(f"[WARN] stop_pnl_stream: {e}")
+
+            # cancel bar stream task
+            try:
+                bar_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await bar_task
+            except Exception:
+                pass
+
+            try:
+                watchdog_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watchdog_task
+            except Exception:
+                pass
+
             store.clear_open_trade()
             store.save_risk(RiskState(realized_R=risk.realized_R, consec_losses=risk.consec_losses, halted=True))
-            await ibc.disconnect(); sys.exit(0)
+
+            await ibc.disconnect()
+            sys.exit(0)
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))
 
+    async def watchdog():
+        while True:
+            await asyncio.sleep(10)
+            try:
+                await ibc.ensure_connected()
+            except Exception as e:
+                print(f"[WATCHDOG] {e}")
+    watchdog_task = asyncio.create_task(watchdog())
+
     # ---- live loop ----
     prev_date = None
     max_lag = cfg.get("ibkr", {}).get("max_data_lag_sec", 120)
-    avoid_mkt = cfg.get("execution", {}).get("avoid_market_orders", cfg["ibkr"].get("use_delayed", False))
-    slp_ticks = cfg.get("execution", {}).get("limit_slippage_ticks", 2)
-    tick_size = float(fees["tick_size"])
+    if cfg.get("ibkr", {}).get("use_delayed", False) and max_lag < 900:
+        max_lag = 1200  # 20 minutes is safe for CME delayed
+    print(f"[INFO] data staleness gate = {max_lag}s (delayed={cfg['ibkr'].get('use_delayed', False)})")
+    heartbeat_next = 0.0
+    # before the while loop
+    last_signal_dt_iso = None
+    last_sig_idx = -10_000
+    cooldown_bars = int(cfg.get("execution", {}).get("cooldown_bars", 12))  # default 12
 
     while True:
         await asyncio.sleep(0.3)
@@ -186,14 +265,21 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
         try:
             last_dt = pd.to_datetime(rb.df.iloc[-1]["datetime"], utc=True)
             age_sec = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            data_age_seconds.set(age_sec)
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if now_ts >= heartbeat_next:
+                print(f"[HEARTBEAT] last_bar={last_dt.isoformat()} age={age_sec:.1f}s max_lag={max_lag}")
+                heartbeat_next = now_ts + 30  # every 30s
+
             if age_sec > max_lag:
-                # too stale -> don’t generate signals / place orders
-                continue
+                continue  # too stale -> skip signals/orders
         except Exception:
             pass
 
         bar = fdf.iloc[-1]
-
+        bar_ts_iso = str(rb.df.iloc[-1]["datetime"])
+        if bar_ts_iso == last_signal_dt_iso:
+            continue
         # day reset
         if prev_date is None or bar["date"] != prev_date:
             risk.reset_day(); prev_date = bar["date"]
@@ -206,6 +292,9 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
             sig = strat.maybe_signal(bar, windows, risk)
             if not sig:
                 continue
+                
+            if (len(fdf) - 1) - last_sig_idx < cooldown_bars:
+                continue
 
             qty = sig["order"].qty
             side = sig["order"].side
@@ -213,20 +302,19 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
             target = float(sig["bracket"].target_price)
             t0 = datetime.now(timezone.utc)
 
-            # Prefer limit bracket when delayed (or explicitly configured)
-            trades = None
-            if avoid_mkt and hasattr(ibc, "place_bracket_limit"):
-                last_close = float(bar["close"])
-                if side.upper() == "BUY":
-                    limit_px = last_close + slp_ticks * tick_size
-                else:
-                    limit_px = last_close - slp_ticks * tick_size
-                try:
+            # === ENTRY PLACEMENT (limit on delayed; market otherwise) ===
+            last_close = float(bar["close"])
+            dx = slp_ticks * tick_size
+            limit_px = tick_round(last_close + dx if side.upper() == "BUY" else last_close - dx)
+
+            use_limit = avoid_mkt and hasattr(ibc, "place_bracket_limit")
+            try:
+                if use_limit:
                     trades = await ibc.place_bracket_limit(side, qty, limit_px, stop, target)
-                except Exception:
-                    # fallback to market if your broker wrapper doesn’t support limit bracket
+                else:
                     trades = await ibc.place_bracket_market(side, qty, stop, target)
-            else:
+            except Exception as e:
+                print(f"[WARN] place_bracket_limit failed ({e}); falling back to market")
                 trades = await ibc.place_bracket_market(side, qty, stop, target)
 
             parent_id = trades[0].order.orderId; tp_id = trades[1].order.orderId; sl_id = trades[2].order.orderId
@@ -240,7 +328,8 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES"):
             log_submit(log_path, symbol=cfg["symbol"], side=side, qty=qty, stop=stop, target=target,
                        parent_id=parent_id, tp_id=tp_id, sl_id=sl_id)
             store.save_risk(RiskState(realized_R=risk.realized_R, consec_losses=risk.consec_losses, halted=risk.halted))
-
+            last_signal_dt_iso = bar_ts_iso
+            last_sig_idx = len(fdf) - 1
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/settings.dev.yaml", help="Path to environment YAML")
