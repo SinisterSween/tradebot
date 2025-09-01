@@ -1,13 +1,13 @@
 ES:
   symbol: "ES"
   tick_size: 0.25
-  tick_value: 12.5       # $ per tick (=> $50/pt)
+  tick_value: 12.5      
   commission_per_contract: 2.25
   exchange_fees_per_contract: 2.00
 
 MES:
   symbol: "MES"
   tick_size: 0.25
-  tick_value: 1.25       # $ per tick (=> $5/pt)
-  commission_per_contract: 0.85
-  exchange_fees_per_contract: 1.20
+  tick_value: 1.25       
+  commission_per_contract: 0.50
+  exchange_fees_per_contract: 0.00

@@ -6,7 +6,7 @@ async def main():
     util.patchAsyncio()
     cfg = yaml.safe_load(open("config/settings.dev.yaml"))
     ibc = IbkrBroker(cfg["ibkr"]["host"], cfg["ibkr"]["port"], cfg["ibkr"]["client_id"], cfg["ibkr"]["account"])
-    await ibc.connect()
+    await ibc.connect(readonly=True)
     try:
         ibc.set_market_data_type(3 if cfg["ibkr"].get("use_delayed", False) else 1)
         c = await ibc.resolve_contract(

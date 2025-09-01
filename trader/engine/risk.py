@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 @dataclass
 class RiskConfig:
     account_equity: float
@@ -32,14 +33,42 @@ class RiskGovernor:
         else:
             self.peak_equity = max(self.peak_equity, float(equity_now))
     def position_size(self, stop_distance_points: float, tick_size: float) -> int:
-        import math
-        if stop_distance_points <= 0: 
+        """
+        Contracts to trade for a stop distance in POINTS.
+        Floors (never rounds up) and applies optional max_contracts_per_trade clamp.
+        Works whether RiskGovernor has flat attrs or a nested cfg/config object.
+        """
+        if stop_distance_points <= 0 or tick_size <= 0: 
             return 0
-        risk_dollars = self.cfg.account_equity * self.cfg.risk_pct
-        stop_ticks = stop_distance_points / tick_size
-        risk_per_contract = max(1.0, stop_ticks) * self.cfg.tick_value
-        qty = math.floor(risk_dollars / risk_per_contract)
-        return max(0, qty)
+        def _get(field, default=None):
+            if hasattr(self, field):
+                return getattr(self, field)
+            cfg = getattr(self, "cfg", None) or getattr(self, "config", None)
+            return getattr(cfg, field, default) if cfg is not None else default
+        tick_value = float(_get("tick_value", 0.0))
+        account_equity = float(_get("account_equity", 0.0))
+        risk_pct = float(_get("risk_pct", 0.0))
+        if tick_value <= 0 or account_equity <= 0 or risk_pct <= 0:
+            return 0
+        usd_per_point = tick_value / float(tick_size)
+        per_contract = float(stop_distance_points) * usd_per_point
+        if per_contract <= 0:
+            return 0
+        buffer = float(getattr(self, "risk_buffer_pct", 1.0) or 1.0)
+        allowed = account_equity * risk_pct * buffer
+        qty = math.floor(allowed / per_contract)
+        mcap = getattr(self, "max_contracts_per_trade", None)
+        if mcap:
+            qty = min(qty, int(mcap))
+        self._last_ps = {
+            "usd_per_point": usd_per_point,
+            "stop_dist_pts": stop_distance_points,
+            "risk_per_ct": per_contract,
+            "allowed": account_equity * risk_pct * float(getattr(self, "risk_buffer_pct", 1.0) or 1.0),
+            "qty": qty,
+            "ts": getattr(self, "_dbg_ts", None),
+        }
+        return max(0,qty)
     def record_trade_outcome_R(self, R: float):
         self.realized_R += R
         self.consec_losses = self.consec_losses + 1 if R < 0 else 0

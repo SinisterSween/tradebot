@@ -1,9 +1,10 @@
 import asyncio, inspect
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Optional, Callable, List
 from ib_insync import IB, Contract, ContFuture, Future, util, Order, Trade
 from datetime import datetime, timezone, timedelta
-from ib_insync.order import LimitOrder, StopOrder
+from ib_insync.order import LimitOrder, StopOrder, MarketOrder
 from ib_insync import Order
 
 util.patchAsyncio()
@@ -29,7 +30,17 @@ class IbkrBroker:
         self._md_type = md_type
     from ib_insync import LimitOrder, StopOrder
 
-    async def whatif_bracket_limit(self, side: str, qty: int, limit_price: float, stop: float, target: float):
+    def _apply_exec_flags(self, order, tif=None, outsideRth=None):
+        if tif is not None:
+            order.tif = str(tif)
+        if outsideRth is not None:
+            order.outsideRth = bool(outsideRth)
+        return order
+
+
+    async def whatif_bracket_limit(self, side: str, qty: int, limit_price: float, 
+                                   stop: float, target: float, *,
+                                   tif: str | None = None, outsideRth: bool | None = None):
         """
         Build a LIMIT parent + LIMIT TP + STOP SL as what-if (no placement).
         Returns dict with commission/margin estimates if available.
@@ -42,6 +53,10 @@ class IbkrBroker:
         parent.whatIf = True
         take = LimitOrder(exit_action, qty, float(target), tif="GTC"); take.whatIf = True
         stop_o = StopOrder(exit_action, qty, float(stop), tif="GTC"); stop_o.whatIf = True
+
+        self._apply_exec_flags(parent, tif, outsideRth); parent.whatIf = True
+        self._apply_exec_flags(take,   tif, outsideRth); take.whatIf   = True
+        self._apply_exec_flags(stop_o, tif, outsideRth); stop_o.whatIf = True
 
         # whatIf calls are sync in most ib_insync versions; patchAsyncio makes this fine
         p = self.ib.whatIfOrder(self.contract, parent)
@@ -64,8 +79,9 @@ class IbkrBroker:
         return {"parent": _summ(p), "take": _summ(t), "stop": _summ(s)}
 
 
-    async def place_bracket_limit(self, side: str, qty: int, limit_price: float, stop: float, target: float,
-                              tif: str = "GTC", outsideRth: bool = False):
+    async def place_bracket_limit(self, side: str, qty: int, limit_price: float,
+                                stop: float, target: float, *,
+                              tif: str | None = None, outsideRth: bool | None = None):
         """
         Parent LIMIT + child LIMIT target + child STOP.
         Returns [parentTrade, takeProfitTrade, stopLossTrade].
@@ -84,8 +100,13 @@ class IbkrBroker:
         stop_o = StopOrder(exit_action, qty, float(stop), tif=tif, outsideRth=outsideRth)
         # last child transmits the chain by default
 
+        self._apply_exec_flags(parent, tif, outsideRth)
+        self._apply_exec_flags(take,   tif, outsideRth)
+        self._apply_exec_flags(stop_o, tif, outsideRth)
+
+
         pTrade = self.ib.placeOrder(self.contract, parent)
-        await self.ib.waitOnUpdate()                 # get parent orderId
+        #await self.ib.waitOnUpdate()                 # get parent orderId
         pid = pTrade.order.orderId
 
         take.parentId = pid
@@ -96,10 +117,11 @@ class IbkrBroker:
 
         return [pTrade, tTrade, sTrade]
 
-    async def connect(self):
+    async def connect(self, *, readonly: bool = False):
+        """Connect to TWS/IBG. Use readonly=True for what-if/data-only flows."""
         if not self.ib.isConnected():
             try:
-                await self.ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=15, readonly=True)
+                await self.ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=15, readonly=readonly)
             except Exception as e:
                 print(f"API connection failed: {e}")
                 print("Hint: TWS > Global Configuration > API > Settings: enable API, and make sure Socket Port matches.")
@@ -191,18 +213,31 @@ class IbkrBroker:
         self.contract = future.contract
         return self.contract
 
-    async def stream_realtime_bars(self, *, on_bar, what_to_show="TRADES", bar_size_secs=60):
+    
+    async def stream_realtime_bars(
+        self, *, on_bar, what_to_show="TRADES", bar_size_secs=60, preload_days=2, prefill_n=2000):
+        """
+        Historical + keepUpToDate feed that works in both delayed and real-time.
+        Prefills last `prefill_n` bars into `on_bar(...)`, then pushes live updates.
+        Keeps this coroutine alive so callers can cancel it cleanly.
+        """
         assert getattr(self, "contract", None) is not None, "IbkrBroker.contract not set"
 
         def _bar_to_dict(b):
-            dt = util.parseIBDatetime(b.date) if isinstance(b.date, str) else b.date
-            if dt.tzinfo is None:
+            # b.date can be str or datetime depending on formatDate
+            dt = util.parseIBDatetime(b.date) if isinstance(getattr(b, "date", None), str) else getattr(b, "date", None)
+            if dt is None:
+                dt = getattr(b, "time", None)
+            if hasattr(dt, "tzinfo") and dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.isoformat().replace("+00:00", "Z") if hasattr(dt, "isoformat") else str(dt)
             return {
-                "datetime": dt.isoformat().replace("+00:00", "Z"),
-                "open": float(b.open), "high": float(b.high),
-                "low": float(b.low), "close": float(b.close),
-                "volume": int(getattr(b, "volume", 0) or 0),
+                "datetime": ts,
+                "open": float(b.open),
+                "high": float(b.high),
+                "low": float(b.low),
+                "close": float(b.close),
+                "volume": float(getattr(b, "volume", 0.0) or 0.0),
             }
 
         async def _emit(d):
@@ -214,32 +249,49 @@ class IbkrBroker:
             except Exception as e:
                 print(f"[STREAM] on_bar error: {e}")
 
-        use_delayed = getattr(self, "_md_type", None) == 3
-        if use_delayed:
-            bars = self.ib.reqHistoricalData(
-                self.contract, endDateTime="", durationStr="2 D",
-                barSizeSetting=("1 min" if bar_size_secs == 60 else f"{bar_size_secs} secs"),
-                whatToShow=what_to_show, useRTH=False, formatDate=1, keepUpToDate=True,
-            )
+        # Historical series that keeps itself up to date
+        bars = self.ib.reqHistoricalData(
+            self.contract,
+            endDateTime="",
+            durationStr=f"{int(preload_days)} D",
+            barSizeSetting=("1 min" if int(bar_size_secs) == 60 else f"{int(bar_size_secs)} secs"),
+            whatToShow=what_to_show,
+            useRTH=False,
+            formatDate=2,       # deliver datetimes
+            keepUpToDate=True,
+        )
 
-            # seed (skip last partial)
-            seed = list(bars)[:-1] if len(bars) else []
-            for b in seed[-3:]:
-                await _emit(_bar_to_dict(b))
-            print(f"[STREAM] initial bars loaded: {len(bars)}")
+        # ---- Prefill RollingBars with historical buffer ----
+        try:
+            n_total = len(bars)
+            if n_total:
+                start = max(0, n_total - int(prefill_n))
+                seed = list(bars)[start:]  # include last bar; your live gates handle staleness
+                for b in seed:
+                    await _emit(_bar_to_dict(b))
+            print(f"[STREAM] initial bars loaded: {n_total}")
+        except Exception as e:
+            print(f"[STREAM] prefill error: {e}")
 
-            q = asyncio.Queue()
-            last_iso = None
+        # ---- Live updates via updateEvent ----
+        q = asyncio.Queue()
+        last_iso = None
 
-            def _on_update(_bars, hasNewBar):
-                if hasNewBar and _bars:
-                    try:
-                        q.put_nowait(_bars[-1])
-                    except Exception:
-                        pass
+        def _on_update(_bars, hasNewBar):
+            if not _bars:
+                return
+            try:
+                q.put_nowait(_bars[-1])  # last bar (new or updated)
+            except Exception:
+                pass
 
+        try:
             bars.updateEvent += _on_update
+        except Exception as e:
+            print(f"[STREAM] failed to attach updateEvent: {e}")
 
+        pump_task = None
+        try:
             async def _pump():
                 nonlocal last_iso
                 while True:
@@ -249,12 +301,25 @@ class IbkrBroker:
                         await _emit(d)
                         last_iso = d["datetime"]
 
-            asyncio.create_task(_pump())
-            return
+            pump_task = asyncio.create_task(_pump())
 
-        raise RuntimeError("Real-time bar streaming not implemented; use delayed (marketDataType=3).")
+            # keep this coroutine alive so callers can cancel it (shutdown path)
+            while True:
+                await asyncio.sleep(5)
+        finally:
+            with suppress(Exception):
+                bars.updateEvent -= _on_update
+            if pump_task:
+                pump_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pump_task
+
+
+
+
     
-    async def place_bracket_market(self, side: str, qty: int, stop_price: float, target_price: float) -> List[Trade]:
+    async def place_bracket_market(self, side: str, qty: int, stop_price: float, target_price: float, *,
+                                   tif: str | None = None, outsideRth: bool | None = None):
         if self.contract is None:
             raise RuntimeError("Contract not set.")
         action = "BUY" if side.upper() == "BUY" else "SELL"
@@ -264,6 +329,12 @@ class IbkrBroker:
         target = Order(action=("SELL" if action == "BUY" else "BUY"), totalQuantity=qty, orderType="LMT",
                        lmtPrice=float(target_price), parentId=0, transmit=True)
         trades = self.ib.bracketOrder(self.contract, parent, takeProfitOrder=target, stopLossOrder=stop)
+
+        self._apply_exec_flags(parent, tif, outsideRth)
+        self._apply_exec_flags(target,   tif, outsideRth)
+        self._apply_exec_flags(stop, tif, outsideRth)
+
+
         return trades
 
     async def flatten_all(self):
