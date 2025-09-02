@@ -2,10 +2,10 @@ import asyncio, inspect
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Optional, Callable, List
-from ib_insync import IB, Contract, ContFuture, Future, util, Order, Trade
+from ib_insync import IB, Contract, ContFuture, Future, util, Order, Trade, Stock
 from datetime import datetime, timezone, timedelta
 from ib_insync.order import LimitOrder, StopOrder, MarketOrder
-from ib_insync import Order
+from ib_insync import Order, RealTimeBar
 
 util.patchAsyncio()
 
@@ -170,21 +170,20 @@ class IbkrBroker:
         if self.ib.isConnected():
             self.ib.disconnect()
 
-    from ib_insync import Future, ContFuture, Contract, util
-    from datetime import datetime, timezone, timedelta
 
-    async def resolve_contract(self, symbol, exchange, currency, use_continuous, front_month,
-                            con_id: int | None = None, local_symbol: str | None = None):
+    async def resolve_contract(self, symbol: str, exchange: str, currency: str, use_continuous: bool, front_month: str | None = None,
+                           con_id: int | None = None, local_symbol: str | None = None):
         """
-        Robust resolver for ES/MES. Priority:
+        Robust resolver for ES/MES **and** equities (SPY/QQQ).
+        Priority:
         1) conId
-        2) localSymbol (e.g., ESU5)
-        3) explicit month (YYYYMM or YYYYMMDD)
-        4) 'front' month discovery (CME -> GLOBEX -> '')
+        2) localSymbol (try Stock first, then FUT)
+        3) explicit month (futures)
+        4) front month discovery (futures)
         Sets self.contract and returns it.
         """
-        exch = (exchange or "CME")
-        ccy = (currency or "USD")
+        exch = (exchange or "CME")   # we'll override to SMART in the equity path
+        ccy  = (currency or "USD")
 
         # 1) conId (fastest, most reliable)
         if con_id:
@@ -194,12 +193,20 @@ class IbkrBroker:
             self.contract = cds[0].contract
             return self.contract
 
-        # 2) localSymbol (like ESU5) with secType FUT
+        # 2) localSymbol (could be equity like "SPY" or future like "MESU5")
         if local_symbol:
+            # Try equity first
+            try:
+                cds = await self.ib.reqContractDetailsAsync(Stock(local_symbol, exchange=exchange or "SMART", currency=ccy))
+                if cds:
+                    self.contract = cds[0].contract
+                    return self.contract
+            except Exception:
+                pass
+            # Try futures (your original logic)
             tmpl = Contract(secType="FUT", localSymbol=local_symbol, exchange=exch, currency=ccy)
             cds = await self.ib.reqContractDetailsAsync(tmpl)
             if not cds:
-                # try GLOBEX and unspecified if CME fails
                 for ex2 in ("GLOBEX", ""):
                     tmpl = Contract(secType="FUT", localSymbol=local_symbol, exchange=ex2 or None, currency=ccy)
                     cds = await self.ib.reqContractDetailsAsync(tmpl)
@@ -207,6 +214,15 @@ class IbkrBroker:
                         break
             if not cds:
                 raise RuntimeError(f"Could not qualify localSymbol={local_symbol}")
+            self.contract = cds[0].contract
+            return self.contract
+
+        # === EQUITY PATH (SMART/NYSE/NASDAQ/etc.) ===
+        eq_exchanges = {"SMART","NYSE","NASDAQ","ARCA","ISLAND","IEX","BATS","EDGX"}
+        if (exchange or "").upper() in eq_exchanges:
+            cds = await self.ib.reqContractDetailsAsync(Stock(symbol, exchange=exchange or "SMART", currency=ccy))
+            if not cds:
+                raise RuntimeError(f"No stock contract returned for {symbol}@{exchange or 'SMART'}")
             self.contract = cds[0].contract
             return self.contract
 
@@ -237,6 +253,7 @@ class IbkrBroker:
             raise RuntimeError(f"No futures returned for {symbol} on any exchange.")
 
         now = datetime.now(timezone.utc)
+
         def expiry_dt(s: str):
             if len(s) == 6:
                 y, m = int(s[:4]), int(s[4:6])
@@ -260,6 +277,8 @@ class IbkrBroker:
         Prefills last `prefill_n` bars into `on_bar(...)`, then pushes live updates.
         Keeps this coroutine alive so callers can cancel it cleanly.
         """
+        
+
         assert getattr(self, "contract", None) is not None, "IbkrBroker.contract not set"
 
         def _bar_to_dict(b):
@@ -278,7 +297,6 @@ class IbkrBroker:
                 "close": float(b.close),
                 "volume": float(getattr(b, "volume", 0.0) or 0.0),
             }
-
         async def _emit(d):
             try:
                 if inspect.iscoroutinefunction(on_bar):
@@ -287,6 +305,61 @@ class IbkrBroker:
                     on_bar(d)
             except Exception as e:
                 print(f"[STREAM] on_bar error: {e}")
+
+        c = self.contract
+        md_actual = getattr(self, "_md_type", 0)
+        # ---------- EQUITIES LIVE BRANCH (place THIS block BEFORE your hist/keepUpToDate code) ----------
+        if getattr(c, "secType", "") == "STK" and md_actual in (1, 2):
+            assert int(bar_size_secs) == 60, "Equity RT aggregator assumes 60s bars"
+            print("[STREAM] equities real-time path engaged (5s -> 60s)")
+
+            # 1) backfill recent 1-min bars WITHOUT keepUpToDate
+            bars = await self.ib.reqHistoricalDataAsync(
+                c, endDateTime="", durationStr="2 D",
+                barSizeSetting="1 min", whatToShow=what_to_show,
+                useRTH=True, formatDate=2, keepUpToDate=False
+            )
+            # emit backfill
+            for b in bars[-int(prefill_n or 2000):]:
+                await _emit(_bar_to_dict(b))
+            print(f"[STREAM] initial bars loaded: {len(bars)} (equity backfill)")
+
+            # 2) subscribe to true real-time 5s bars and aggregate to 60s
+            rtb = self.ib.reqRealTimeBars(c, barSize=5, whatToShow=what_to_show, useRTH=True)
+
+            bucket = None; o = h = l = cl = None; vol = 0
+
+            def on_rtb(b: RealTimeBar):
+                nonlocal bucket, o, h, l, cl, vol
+                ts = util.dt_to_datetime(b.time).replace(tzinfo=timezone.utc)
+                bkt = ts.replace(second=0, microsecond=0)
+                px = float(b.close); v = int(b.volume or 0)
+
+                if bucket is None:
+                    bucket = bkt; o = h = l = cl = px; vol = v; return
+
+                if bkt == bucket:
+                    cl = px; vol += v; h = max(h, px); l = min(l, px)
+                else:
+                    asyncio.create_task(_emit({
+                        "datetime": bucket.isoformat(), 
+                        "open": o, "high": h, "low": l, "close": cl, "volume": vol
+                    }))
+                    bucket = bkt; o = h = l = cl = px; vol = v
+
+            rtb.updateEvent += on_rtb
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass  # allows cancellation
+            finally:
+                rtb.updateEvent -= on_rtb
+                self.ib.cancelRealTimeBars(rtb)
+
+            return 
+
+        
 
         # Historical series that keeps itself up to date
         bars = self.ib.reqHistoricalData(

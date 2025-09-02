@@ -1,0 +1,21 @@
+ibkr:
+  use_delayed: false
+  what_to_show: TRADES
+  bar_size_secs: 60
+execution:
+  avoid_market_orders: true
+  limit_slippage_ticks: 2
+  tif: DAY
+  outside_rth: false
+  use_rtb_for_equities: false
+strategy:
+  orb_minutes: 5
+  atr_len: 14
+  atr_mult: 0.7
+  target_R: 1.0
+  slope_min: 0.06
+  break_eps_ticks: 1
+  stop_pad_ticks: 1
+  trail_pad_ticks: 1
+  session_windows:
+    - ["08:31", "15:55"]

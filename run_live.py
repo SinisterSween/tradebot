@@ -85,9 +85,21 @@ def write_daily_summary(day_str: str, stats: dict, csv_path="logs/daily_summarie
     with open(snap_path, "w") as f:
         json.dump({"date": day_str, **row}, f, indent=2)
 
-async def main(cfg_path="config/settings.live.yaml", symbol="MES", 
+def _deep_merge(a,b):
+    for k, v in (b or {}).items():
+        if isinstance(v, dict) and isinstance(a.get(k), dict):
+            _deep_merge(a[k], v)
+        else:
+            a[k] = v
+    return a
+
+async def main(cfg_paths, symbol="MES", 
                dry_run=False, dry_run_replay=0, dry_run_ignore_gates=False):
-    cfg = yaml.safe_load(open(cfg_path, "r"))
+    cfg = {}
+    for p in (cfg_paths or []):
+        with open(p, "r") as f:
+            _deep_merge(cfg, yaml.safe_load(f) or {})
+
     # --- safety guard: account vs data mode ---
     acct = str(cfg.get("ibkr", {}).get("account", "") or "")
     is_paper = acct.upper().startswith(("D", "DU"))  # paper accounts usually start with D/DU
@@ -110,7 +122,8 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
     if not is_paper and port not in (7496, 4001):
         print(f"[WARN] Live account {acct} but port={port} (expected 7496 TWS / 4001 IBG)")
 
-    start_metrics_server(cfg["metrics"]["host"], cfg["metrics"]["port"])
+    mcfg = cfg.get("metrics", {"host": "127.0.0.1", "port": 9100})
+    start_metrics_server(mcfg["host"], mcfg["port"])
 
     # ----- instrument merge (ES/MES) -----
     contracts = yaml.safe_load(open("config/contracts.yaml", "r"))
@@ -167,7 +180,9 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
 
     # IBKR connect
     ibc = IbkrBroker(cfg["ibkr"]["host"], cfg["ibkr"]["port"], cfg["ibkr"]["client_id"], cfg["ibkr"]["account"])
-    await ibc.connect(readonly=dry_run)
+    await ibc.connect()
+    ibc.use_rtb_for_equities = bool(cfg.get("ibkr", {}).get("use_rtb_for_equities", False))
+    print(f"[STREAM] equities mode: {'RTB 5s->60s' if ibc.use_rtb_for_equities else 'Ticks->60s'}")
 
     if cfg["ibkr"].get("use_delayed", False):
         ibc.set_market_data_type(3)  # 3=DELAYED
@@ -182,9 +197,18 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
         allow_mismatch=bool((cfg.get("safety", {}) or {}).get("allow_data_mismatch", False)),
     )
     # Resolve and **set** the contract (use con_id/local_symbol if provided)
+    ct_exch = ct.get("exchange")
+    ct_curr = ct.get("currency")
+
+    ib_exch = cfg.get("ibkr", {}).get("exchange", ct_exch or "SMART")
+    ib_curr = cfg.get("ibkr", {}).get("currency", ct_curr or "USD")
+    use_cont = bool(cfg.get("ibkr", {}).get("use_continuous", False))
+    front_month = cfg.get("ibkr", {}).get("front_month", None)
+
+
     contract = await ibc.resolve_contract(
-        cfg["symbol"], cfg["ibkr"]["exchange"], cfg["ibkr"]["currency"],
-        cfg["ibkr"]["use_continuous"], cfg["ibkr"]["front_month"],
+        cfg["symbol"], ib_exch, ib_curr,
+        use_cont, front_month,
         con_id=cfg["ibkr"].get("con_id"), local_symbol=cfg["ibkr"].get("local_symbol")
     )
     print(f"[CONTRACT] localSymbol={getattr(contract,'localSymbol','?')} conId={getattr(contract,'conId','?')}")
@@ -475,10 +499,23 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
 
     # ---- live loop ----
     prev_date = None
-    max_lag = cfg.get("ibkr", {}).get("max_data_lag_sec", 120)
-    if cfg.get("ibkr", {}).get("use_delayed", False) and max_lag < 900:
-        max_lag = 1200  # 20 minutes is safe for CME delayed
-    print(f"[INFO] data staleness gate = {max_lag}s (delayed={cfg['ibkr'].get('use_delayed', False)})")
+    def _effective_md_type(ibc_obj, cfg_obj):
+        raw = getattr(getattr(ibc_obj.ib, "client", None), "marketDataType", None)
+        try:
+            code = int(raw)
+        except Exception:
+            code = 0
+        if code in (1, 2, 3, 4):
+            return code
+        return getattr(ibc_obj, "_md_type", 3 if cfg_obj["ibkr"].get("use_delayed", False) else 1)
+    
+    md_actual = _effective_md_type(ibc, cfg)
+    max_lag = int(cfg.get("ibkr", {}).get("max_data_lag_sec", 120))
+    if md_actual in (3, 4):           # delayed feed in practice
+        max_lag = max(max_lag, 1200)  # bump to 20 min so you don't choke
+    else:
+        max_lag = max(60, max_lag)    # keep at least 60–120s for 1m bars
+    print(f"[INFO] data staleness gate = {max_lag}s (requested_delayed={cfg['ibkr'].get('use_delayed', False)} actual_md={md_actual})")
     if dry_run:
         print("[DRY-RUN] enabled: no orders will be sent")
     if dry_run and dry_run_ignore_gates:
@@ -647,8 +684,9 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config/settings.dev.yaml", help="Path to environment YAML")
-    ap.add_argument("--symbol", default="MES", choices=["ES","MES"], help="Instrument to use from contracts.yaml")
+    ap.add_argument("--config", required=True, help="Base YAML (env or profile)")
+    ap.add_argument("--config-extra", action="append", default=[], help="Additional YAMLs to merge (later wins)")
+    ap.add_argument("--symbol", default="MES", choices=["ES","MES","SPY","QQQ"], help="Instrument to use from contracts.yaml")
     ap.add_argument("--dry-run", action="store_true", help="Log orders that would be placed; do not touch IB/account state")
     ap.add_argument("--dry-run-replay", type=int, default=0,
                 help="In dry-run, replay last N bars and print 'would place' lines, then exit")
@@ -657,7 +695,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
     asyncio.run(
         main(
-            cfg_path=args.config, 
+            cfg_paths=[args.config] + list(args.config_extra),
             symbol=args.symbol, 
             dry_run=args.dry_run,
             dry_run_replay=args.dry_run_replay,
