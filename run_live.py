@@ -96,10 +96,12 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
     if use_delayed and not is_paper:
         print(f"[ABORT] use_delayed=true but account looks LIVE: {acct}")
         sys.exit(2)
-
-    if not use_delayed and is_paper:
+    allow_mismatch = bool((cfg.get("safety", {}) or {}).get("allow_data_mismatch", False))
+    if not use_delayed and is_paper and not allow_mismatch:
         print(f"[ABORT] use_delayed=false (real-time) but account looks PAPER: {acct}")
         sys.exit(2)
+    elif not use_delayed and is_paper and allow_mismatch:
+        print("[WARN] use_delayed=false on PAPER; proceeding due to allow_data_mismatch=True")
 
     # (optional) sanity warn on port mismatch (doesn't abort)
     port = int(cfg.get("ibkr", {}).get("port", 0))
@@ -165,13 +167,20 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
 
     # IBKR connect
     ibc = IbkrBroker(cfg["ibkr"]["host"], cfg["ibkr"]["port"], cfg["ibkr"]["client_id"], cfg["ibkr"]["account"])
-    await ibc.connect()
+    await ibc.connect(readonly=dry_run)
+
     if cfg["ibkr"].get("use_delayed", False):
         ibc.set_market_data_type(3)  # 3=DELAYED
         print("[INFO] IBKR market data: DELAYED")
     else:
+        ibc.set_market_data_type(1)  # 1=REALTIME
         print("[INFO] IBKR market data: REAL-TIME")
 
+    await asyncio.sleep(0.10)
+    ibc.enforce_market_data_guard(
+        use_delayed=bool(cfg["ibkr"].get("use_delayed", False)),
+        allow_mismatch=bool((cfg.get("safety", {}) or {}).get("allow_data_mismatch", False)),
+    )
     # Resolve and **set** the contract (use con_id/local_symbol if provided)
     contract = await ibc.resolve_contract(
         cfg["symbol"], cfg["ibkr"]["exchange"], cfg["ibkr"]["currency"],
@@ -295,7 +304,7 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
                 prev_date = bar_i["date"]
 
             # optionally honor session window unless --dry-run-ignore-gates
-            if not dry_run_ignore_gates and not risk.can_trade_now(bar_i["t_local"]):
+            if not dry_run_ignore_gates and not risk_replay.can_trade_now(bar_i["t_local"]):
                 continue
 
             # cooldown
@@ -343,7 +352,7 @@ async def main(cfg_path="config/settings.live.yaml", symbol="MES",
             
             stop_dist_pts     = abs(limit_px - stop)
             risk_per_contract = stop_dist_pts * usd_per_point
-            allowed_risk      = float(cfg["risk"]["account_equity"]) * float(cfg["risk"]["risk_pct"])
+            allowed_risk      = float(cfg["risk"]["account_equity"]) * float(cfg["risk"]["risk_pct"]) * float(cfg["risk"].get("risk_buffer_pct", 1.0))
             risk_total        = risk_per_contract * qty
             ratio             = (risk_total / allowed_risk) if allowed_risk > 0 else 0.0
 

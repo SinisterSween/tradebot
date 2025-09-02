@@ -28,7 +28,45 @@ class IbkrBroker:
         # 1=REALTIME, 2=FROZEN, 3=DELAYED, 4=DELAYED_FROZEN
         self.ib.reqMarketDataType(md_type)
         self._md_type = md_type
+        name = {1: "REALTIME", 2: "FROZEN", 3: "DELAYED", 4: "DELAYED_FROZEN"}.get(md_type, str(md_type))
+        print(f"[IBKR] requested market data type: {name}")
     from ib_insync import LimitOrder, StopOrder
+
+    def _md_type_name(self, md: int) -> str:
+        return {1: "REALTIME", 2: "FROZEN", 3: "DELAYED", 4: "DELAYED_FROZEN"}.get(md, str(md))
+
+    def enforce_market_data_guard(self, *, use_delayed: bool, allow_mismatch: bool = False):
+        """
+        Compare desired (from config) vs actual (from IB/TWS) market data type.
+        Warn or abort based on allow_mismatch.
+        """
+        desired = 3 if use_delayed else 1
+        # ib.client.marketDataType: 1=live, 2=frozen, 3=delayed, 4=delayed_frozen; 0 if unset
+        actual_raw = getattr(getattr(self.ib, "client", None), "marketDataType", 0) or 0
+        try:
+            actual = int(actual_raw)
+        except Exception:
+            actual = 0
+        if actual == 0:
+            actual = desired  # fall back so we don't false-alarm on first connect tick
+
+        print(f"[IBKR] market data: requested={self._md_type_name(desired)} actual={self._md_type_name(actual)}")
+
+        if use_delayed and actual in (1, 2):
+            msg = "Config wants DELAYED but IB is LIVE/FROZEN."
+            if allow_mismatch:
+                print(f"[WARN] {msg} Proceeding due to allow_data_mismatch=True.")
+            else:
+                raise RuntimeError(msg)
+
+        elif not use_delayed and actual in (3, 4):
+            msg = "Config wants LIVE but IB is DELAYED/DELAYED_FROZEN."
+            if allow_mismatch:
+                print(f"[WARN] {msg} Proceeding due to allow_data_mismatch=True.")
+            else:
+                raise RuntimeError(msg)
+
+
 
     def _apply_exec_flags(self, order, tif=None, outsideRth=None):
         if tif is not None:
@@ -126,6 +164,7 @@ class IbkrBroker:
                 print(f"API connection failed: {e}")
                 print("Hint: TWS > Global Configuration > API > Settings: enable API, and make sure Socket Port matches.")
                 raise
+
 
     async def disconnect(self):
         if self.ib.isConnected():
