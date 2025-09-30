@@ -1,5 +1,4 @@
-ibkr:
-  use_delayed: true        # flip to false later; auto-lag handles reality anyway
+ibkr:       # flip to false later; auto-lag handles reality anyway
   what_to_show: TRADES
   bar_size_secs: 60
 execution:

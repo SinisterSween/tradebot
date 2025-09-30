@@ -2,10 +2,10 @@ import asyncio, inspect
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Optional, Callable, List
-from ib_insync import IB, Contract, ContFuture, Future, util, Order, Trade, Stock
+from ib_insync import IB, Contract, ContFuture, Future, util, Order, Trade, Stock, RealTimeBar,LimitOrder, StopOrder, MarketOrder 
 from datetime import datetime, timezone, timedelta
-from ib_insync.order import LimitOrder, StopOrder, MarketOrder
-from ib_insync import Order, RealTimeBar
+
+
 
 util.patchAsyncio()
 
@@ -271,14 +271,13 @@ class IbkrBroker:
 
     
     async def stream_realtime_bars(
-        self, *, on_bar, what_to_show="TRADES", bar_size_secs=60, preload_days=2, prefill_n=2000):
+    self, *, on_bar, what_to_show="TRADES", bar_size_secs=60, preload_days=2, prefill_n=2000
+    ):
         """
         Historical + keepUpToDate feed that works in both delayed and real-time.
         Prefills last `prefill_n` bars into `on_bar(...)`, then pushes live updates.
         Keeps this coroutine alive so callers can cancel it cleanly.
         """
-        
-
         assert getattr(self, "contract", None) is not None, "IbkrBroker.contract not set"
 
         def _bar_to_dict(b):
@@ -297,6 +296,7 @@ class IbkrBroker:
                 "close": float(b.close),
                 "volume": float(getattr(b, "volume", 0.0) or 0.0),
             }
+
         async def _emit(d):
             try:
                 if inspect.iscoroutinefunction(on_bar):
@@ -307,25 +307,157 @@ class IbkrBroker:
                 print(f"[STREAM] on_bar error: {e}")
 
         c = self.contract
-        md_actual = getattr(self, "_md_type", 0)
-        # ---------- EQUITIES LIVE BRANCH (place THIS block BEFORE your hist/keepUpToDate code) ----------
-        if getattr(c, "secType", "") == "STK" and md_actual in (1, 2):
-            assert int(bar_size_secs) == 60, "Equity RT aggregator assumes 60s bars"
-            print("[STREAM] equities real-time path engaged (5s -> 60s)")
+        md_actual = getattr(self, "_md_type", 0)              # 1=REALTIME, 2=FROZEN, 3/4 delayed
+        use_rtb   = bool(getattr(self, "use_rtb_for_equities", False))
 
-            # 1) backfill recent 1-min bars WITHOUT keepUpToDate
+        # ---- EQUITIES (STK) live: choose RT-bars or tick stream based on flag ----
+        if getattr(c, "secType", "") == "STK" and md_actual in (1, 2) and int(bar_size_secs) == 60:
+            if use_rtb:
+                # =========================== RT-BARS BRANCH ===========================
+                print("[STREAM] equities real-time path engaged (5s -> 60s)")
+
+                # 1) backfill 1-min (NO keepUpToDate)
+                bars = await self.ib.reqHistoricalDataAsync(
+                    c, endDateTime="", durationStr=f"{int(preload_days) if preload_days else 2} D",
+                    barSizeSetting="1 min", whatToShow=what_to_show,
+                    useRTH=True, formatDate=2, keepUpToDate=False
+                )
+                for b in bars[-int(prefill_n or 2000):]:
+                    await _emit(_bar_to_dict(b))
+                print(f"[STREAM] initial bars loaded: {len(bars)} (equity backfill)")
+
+                # 2) stream 5s bars and aggregate to 60s
+                rtb = self.ib.reqRealTimeBars(c, barSize=5, whatToShow=what_to_show, useRTH=True)
+
+                bucket = None; o = h = l = cl = None; vol = 0
+
+                def on_rtb(b: RealTimeBar):
+                    nonlocal bucket, o, h, l, cl, vol
+                    ts = util.dt_to_datetime(b.time).replace(tzinfo=timezone.utc)
+                    bkt = ts.replace(second=0, microsecond=0)
+                    px = float(b.close); v = int(b.volume or 0)
+
+                    if bucket is None:
+                        bucket = bkt; o = h = l = cl = px; vol = v; return
+
+                    if bkt == bucket:
+                        cl = px; vol += v
+                        if px > h: h = px
+                        if px < l: l = px
+                    else:
+                        asyncio.create_task(_emit({
+                            "datetime": bucket.isoformat(),
+                            "open": o, "high": h, "low": l, "close": cl, "volume": vol
+                        }))
+                        bucket = bkt; o = h = l = cl = px; vol = v
+
+                rtb.updateEvent += on_rtb
+                try:
+                    while True:
+                        await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    rtb.updateEvent -= on_rtb
+                    self.ib.cancelRealTimeBars(rtb)
+                return
+            else:
+                # ============================ TICKS BRANCH ============================
+                # No api.ibkr.com dependency; aggregates SMART consolidated ticks to 60s
+                print("[STREAM] equities tick path engaged (reqMktData -> 60s)")
+
+                # 1) backfill 1-min (NO keepUpToDate)
+                bars = await self.ib.reqHistoricalDataAsync(
+                    c, endDateTime="", durationStr=f"{int(preload_days) if preload_days else 2} D",
+                    barSizeSetting="1 min", whatToShow=what_to_show,
+                    useRTH=True, formatDate=2, keepUpToDate=False
+                )
+                for b in bars[-int(prefill_n or 2000):]:
+                    await _emit(_bar_to_dict(b))
+                print(f"[STREAM] initial bars loaded: {len(bars)} (equity backfill)")
+
+                # 2) streaming L1 ticks (SMART consolidated NBBO; avoid ARCA/TOP entitlement)
+                conid = getattr(c, "conId", None)
+                if conid:
+                    md_contract = Contract(conId=conid, exchange="SMART")
+                else:
+                    sym = getattr(c, "symbol", None) or getattr(c, "localSymbol", None) or "SPY"
+                    md_contract = Stock(sym, "SMART", getattr(c, "currency", "USD") or "USD")
+
+                from ib_insync import Ticker
+                from datetime import datetime, timezone as _tz
+
+                bucket = None; o = h = l = cl = None; vol = 0
+                first_emit_logged = {"done": False}
+
+                def on_tkr(t: Ticker):
+                    nonlocal bucket, o, h, l, cl, vol
+                    now = datetime.now(_tz.utc)
+                    bkt = now.replace(second=0, microsecond=0)
+
+                    # prefer last trade; fall back to marketPrice()/close
+                    px = t.last if t.last is not None else (t.marketPrice() if t.marketPrice() is not None else t.close)
+                    if px is None:
+                        return
+                    px = float(px)
+                    sz = int(t.lastSize or 0)
+
+                    if bucket is None:
+                        bucket = bkt; o = h = l = cl = px; vol = sz; return
+
+                    if bkt == bucket:
+                        cl = px; vol += sz
+                        if px > h: h = px
+                        if px < l: l = px
+                    else:
+                        asyncio.create_task(_emit({
+                            "datetime": bucket.isoformat(),
+                            "open": o, "high": h, "low": l, "close": cl, "volume": vol
+                        }))
+                        if not first_emit_logged["done"]:
+                            print("[STREAM] first 60s bar emitted from tick stream")
+                            first_emit_logged["done"] = True
+                        bucket = bkt; o = h = l = cl = px; vol = sz
+                        
+                print(f"[DBG] reqMktData md_contract: secType={getattr(md_contract,'secType',None)} "
+                    f"conId={getattr(md_contract,'conId',None)} exch={getattr(md_contract,'exchange',None)} "
+                    f"primary={getattr(md_contract,'primaryExchange',None)} symbol={getattr(md_contract,'symbol',None)}")
+
+                tkr = self.ib.reqMktData(md_contract, "", False, False)
+                print(f"[DBG] tickerId={getattr(tkr,'tickerId',None)} (watch api.log for same id)")
+
+
+                tkr.updateEvent += on_tkr
+                try:
+                    while True:
+                        await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    tkr.updateEvent -= on_tkr
+                    # cancel by the same contract we subscribed with
+                    try:
+                        self.ib.cancelMktData(md_contract)
+                    except Exception:
+                        pass
+                return 
+
+        # ---------- FUTURES LIVE BRANCH (5s -> 60s) ----------
+        if getattr(c, "secType", "") == "FUT" and md_actual in (1, 2) and int(bar_size_secs) == 60:
+            print("[STREAM] futures real-time path engaged (5s -> 60s)")
+
+            # 1) backfill 1-min WITHOUT keepUpToDate (avoid HMDS freeze)
             bars = await self.ib.reqHistoricalDataAsync(
-                c, endDateTime="", durationStr="2 D",
+                c, endDateTime="", durationStr=f"{int(preload_days) if preload_days else 2} D",
                 barSizeSetting="1 min", whatToShow=what_to_show,
-                useRTH=True, formatDate=2, keepUpToDate=False
+                useRTH=False, formatDate=2, keepUpToDate=False
             )
-            # emit backfill
             for b in bars[-int(prefill_n or 2000):]:
                 await _emit(_bar_to_dict(b))
-            print(f"[STREAM] initial bars loaded: {len(bars)} (equity backfill)")
+            print(f"[STREAM] initial bars loaded: {len(bars)} (futures backfill)")
 
             # 2) subscribe to true real-time 5s bars and aggregate to 60s
-            rtb = self.ib.reqRealTimeBars(c, barSize=5, whatToShow=what_to_show, useRTH=True)
+            rtb = self.ib.reqRealTimeBars(c, barSize=5, whatToShow=what_to_show, useRTH=False)
 
             bucket = None; o = h = l = cl = None; vol = 0
 
@@ -339,10 +471,12 @@ class IbkrBroker:
                     bucket = bkt; o = h = l = cl = px; vol = v; return
 
                 if bkt == bucket:
-                    cl = px; vol += v; h = max(h, px); l = min(l, px)
+                    cl = px; vol += v; 
+                    if px > h: h = px
+                    if px < l: l = px
                 else:
                     asyncio.create_task(_emit({
-                        "datetime": bucket.isoformat(), 
+                        "datetime": bucket.isoformat(),
                         "open": o, "high": h, "low": l, "close": cl, "volume": vol
                     }))
                     bucket = bkt; o = h = l = cl = px; vol = v
@@ -350,15 +484,13 @@ class IbkrBroker:
             rtb.updateEvent += on_rtb
             try:
                 while True:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1)  # keep coroutine alive; allows cancellation
             except asyncio.CancelledError:
-                pass  # allows cancellation
+                pass
             finally:
                 rtb.updateEvent -= on_rtb
                 self.ib.cancelRealTimeBars(rtb)
-
-            return 
-
+            return
         
 
         # Historical series that keeps itself up to date

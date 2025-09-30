@@ -93,12 +93,66 @@ def _deep_merge(a,b):
             a[k] = v
     return a
 
-async def main(cfg_paths, symbol="MES", 
-               dry_run=False, dry_run_replay=0, dry_run_ignore_gates=False):
+
+def _expected_profile_for_symbol(sym: str) -> str:
+    s = (sym or "").upper()
+    FUT = {"ES","MES","NQ","MNQ","YM","MYM","RTY","M2K","CL","NG","GC","SI","ZB","ZN","ZF","ZT","6E","6B","6J"}
+    return "futures" if s in FUT else "equities"
+
+async def main(*, args):
+    # after cfg is built and before the rest of your logic
+    symbol = getattr(args, "symbol", "MES")
+
+    # alias CLI flags into locals so existing code works
+    dry_run = bool(getattr(args, "dry_run", False))
+    dry_run_replay = int(getattr(args, "dry_run_replay", 0) or 0)
+    dry_run_ignore_gates = bool(getattr(args, "dry_run_ignore_gates", False))
+
+    cfg_files = []
+
+    # env (highest-priority choice)
+    if getattr(args, "env", None):
+        cfg_files.append(f"config/env/{args.env}.yaml")
+    else:
+        cfg_files.append(getattr(args, "config", None) or "config/settings.dev.yaml")  # legacy --config path
+
+    # profile (next)
+    if getattr(args, "profile", None):
+        cfg_files.append(f"config/profile/{args.profile}.yaml")
+
+    # optional extra (last override)
+    if getattr(args, "config_extra", None):
+        cfg_files.append(args.config_extra)
+
     cfg = {}
-    for p in (cfg_paths or []):
-        with open(p, "r") as f:
-            _deep_merge(cfg, yaml.safe_load(f) or {})
+    loaded = []
+    for p in cfg_files:
+        try:
+            with open(p, "r") as f:
+                part = yaml.safe_load(f) or {}
+            _deep_merge(cfg, part)
+            loaded.append(p)
+        except FileNotFoundError:
+            print(f"[WARN] config file not found: {p}")
+
+    print(f"[CFG] loaded: {', '.join(loaded) if loaded else '<none>'}")
+    
+    cfg.setdefault("metrics", {"host": "127.0.0.1", "port": 9100})
+    cfg.setdefault("fees", {})
+    cfg.setdefault("ibkr", {})
+    cfg.setdefault("risk", {})
+    cfg.setdefault("execution", {})
+    cfg.setdefault("safety", {})
+
+    # profile-vs-symbol sanity
+    symbol = getattr(args, "symbol", "MES")
+    exp = _expected_profile_for_symbol(symbol)
+    sel = (getattr(args, "profile", None) or exp)
+    if sel != exp:
+        msg = f"[{'ABORT' if getattr(args,'strict_profile',False) else 'WARN'}] symbol={symbol} looks like {exp} but profile={sel}"
+        print(msg)
+        if getattr(args, "strict_profile", False):
+            sys.exit(2)
 
     # --- safety guard: account vs data mode ---
     acct = str(cfg.get("ibkr", {}).get("account", "") or "")
@@ -213,6 +267,13 @@ async def main(cfg_paths, symbol="MES",
     )
     print(f"[CONTRACT] localSymbol={getattr(contract,'localSymbol','?')} conId={getattr(contract,'conId','?')}")
     ibc.contract = contract  # critical for streamer/orders
+    print(
+        f"[DBG] secType={getattr(contract,'secType','?')} "
+        f"exch={getattr(contract,'exchange','?')} "
+        f"primary={getattr(contract,'primaryExchange','?')} "
+        f"conId={getattr(contract,'conId','?')}"
+)
+
 
     def _expiry_dt(ltm: str):
         if not ltm: return None
@@ -684,22 +745,29 @@ async def main(cfg_paths, symbol="MES",
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True, help="Base YAML (env or profile)")
-    ap.add_argument("--config-extra", action="append", default=[], help="Additional YAMLs to merge (later wins)")
-    ap.add_argument("--symbol", default="MES", choices=["ES","MES","SPY","QQQ"], help="Instrument to use from contracts.yaml")
-    ap.add_argument("--dry-run", action="store_true", help="Log orders that would be placed; do not touch IB/account state")
+
+    # legacy (optional): direct file; ignored if --env is used
+    ap.add_argument("--config", help="Path to environment YAML (legacy)")
+
+    # new structure
+    ap.add_argument("--env", choices=["paper","live"], help="Loads config/env/<env>.yaml")
+    ap.add_argument("--profile", choices=["futures","equities"], help="Loads config/profile/<profile>.yaml")
+    ap.add_argument("--config-extra", dest="config_extra",
+                    help="Optional extra YAML to merge last (overrides all)")
+    ap.add_argument("--strict-profile", action="store_true",
+                    help="Abort if profile doesn’t match symbol")
+
+    # your existing run flags
+    ap.add_argument("--symbol", default="MES", help="Instrument")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Log orders that would be placed; do not touch IB/account state")
     ap.add_argument("--dry-run-replay", type=int, default=0,
-                help="In dry-run, replay last N bars and print 'would place' lines, then exit")
+                    help="In dry-run, replay last N bars and print 'would place' lines, then exit")
     ap.add_argument("--dry-run-ignore-gates", action="store_true",
-                help="In dry-run, ignore staleness and session windows")
+                    help="In dry-run, ignore staleness and session windows")
+
     args = ap.parse_args()
-    asyncio.run(
-        main(
-            cfg_paths=[args.config] + list(args.config_extra),
-            symbol=args.symbol, 
-            dry_run=args.dry_run,
-            dry_run_replay=args.dry_run_replay,
-            dry_run_ignore_gates=args.dry_run_ignore_gates,
-        )
-    )
+    asyncio.run(main(args=args))
+
+    
 
