@@ -1,0 +1,3 @@
+strategy:
+  atr_mult: 0.55   # from 0.7
+  stop_pad_ticks: 0

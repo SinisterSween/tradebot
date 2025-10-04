@@ -1,0 +1,3 @@
+strategy:
+  target_R: 1.2   # from 1.0; modest bump
+  break_eps_ticks: 0   # enter a hair closer to breakout

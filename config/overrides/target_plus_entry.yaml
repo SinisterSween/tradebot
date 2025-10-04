@@ -1,0 +1,3 @@
+strategy:
+  target_R: 0.8           # from 1.0 → easier to hit
+  break_eps_ticks: 0      # enter closer to breakout (less “enter-late” tax)

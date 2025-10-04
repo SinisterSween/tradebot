@@ -52,6 +52,16 @@ class TradeTracker:
         if order_id == self.target_id: return "TARGET"
         return "OTHER"
 
+def _norm_windows(windows):
+    out = []
+    for w in (windows or []):
+        if isinstance(w, dict):
+            out.append({"start": str(w.get("start")), "end": str(w.get("end"))})
+        elif isinstance(w, (list, tuple)) and len(w) == 2:
+            out.append({"start": str(w[0]), "end": str(w[1])})
+        else:
+            raise ValueError(f"Bad session_windows entry: {w!r}")
+    return out
 
 def _ensure_dir(p):
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -222,7 +232,7 @@ async def main(*, args):
         stop_pad_ticks=sc["stop_pad_ticks"], trail_pad_ticks=sc["trail_pad_ticks"],
         tick_size=fees["tick_size"], tick_value=fees["tick_value"],
     ))
-    windows = sc["session_windows"]
+    windows = _norm_windows(sc.get("session_windows", []))
 
     # persistence
     log_path = cfg.get("logging_path", "logs/executions.csv")

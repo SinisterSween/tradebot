@@ -1,0 +1,21 @@
+strategy:
+  # trade only when it matters; skip lunch chop
+  session_windows:
+    - { start: "08:45", end: "10:45" }
+    - { start: "13:00", end: "15:20" }
+
+  # tighten stops and enter closer
+  atr_mult: 0.50
+  stop_pad_ticks: 0
+  break_eps_ticks: 0
+
+  # easier target to hit
+  target_R: 1.0
+
+  # stronger trend filter — uncomment if you want it now
+  slope_min: 0.08
+
+
+execution:
+  # (optional) avoid clustering when slope_min is higher
+  cooldown_bars: 12

@@ -1,0 +1,9 @@
+strategy:
+  # ban lunch + start a touch later
+  session_windows:
+    - { start: "08:45", end: "10:45" }
+    - { start: "13:00", end: "15:20" }
+  # tighten stops
+  atr_mult: 0.55
+  stop_pad_ticks: 0
+
