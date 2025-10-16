@@ -1,0 +1,6 @@
+# config/overrides/clean_v1_lock.yaml
+execution:
+  be_lock_min: 12
+  be_req_profit_ticks: 2
+  max_hold_min: 35
+  min_minutes_to_window_end: 30

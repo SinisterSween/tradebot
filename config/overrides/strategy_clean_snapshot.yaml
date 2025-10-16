@@ -1,0 +1,10 @@
+# config/overrides/strategy_clean_snapshot.yaml
+strategy:
+  session_windows:
+    - { start: "08:45", end: "10:45" }
+    - { start: "13:00", end: "15:20" }
+
+  atr_mult: 0.55
+  break_eps_ticks: 1
+  target_R: 1.0
+  slope_min: 0.10

@@ -9,9 +9,6 @@ from trader.engine.latency import BarDelay
 from trader.engine.metrics_ext import summarize_equity, write_artifacts
 import matplotlib
 
-MAX_HOLD_MIN = 25
-BE_LOCK_MIN  = 10
-
 def _deep_merge(a, b):
     out = dict(a or {})
     for k, v in (b or {}).items():
@@ -128,6 +125,24 @@ def main(args):
         tick_value=fees["tick_value"],
     ))
     windows = _norm_windows(sc.get("session_windows", []))
+    # ---- Execution knobs (from YAML 'execution') ----
+    exe = cfg.setdefault("execution", {})
+    BE_LOCK_MIN      = int(exe.get("be_lock_min", 12))
+    BE_REQ_TICKS     = int(exe.get("be_req_profit_ticks", 2))
+    MAX_HOLD_MIN     = int(exe.get("max_hold_min", 40))
+    HARD_CUTOFF_R    = float(exe.get("hard_cutoff_R", -0.25))
+    HARD_CUTOFF_MIN  = int(exe.get("hard_cutoff_min", 10))
+    MIN_WIN_END      = int(exe.get("min_minutes_to_window_end", 20))
+
+    print(
+        f"[EXEC KNOBS] "
+        f"BE_LOCK_MIN={BE_LOCK_MIN}  "
+        f"BE_REQ_TICKS={BE_REQ_TICKS}  "
+        f"MAX_HOLD_MIN={MAX_HOLD_MIN}  "
+        f"HARD_CUTOFF_R={HARD_CUTOFF_R}  "
+        f"HARD_CUTOFF_MIN={HARD_CUTOFF_MIN}  "
+        f"MIN_WIN_END={MIN_WIN_END}"
+        )
 
     # ---- Sim loop ----
     open_position = False
@@ -138,6 +153,7 @@ def main(args):
     open_entry_px = None
     open_entry_ts = None
     open_be_locked = False
+    open_risk_pts = None
 
     for i, (_, bar) in enumerate(df.iterrows()):
         # new day
@@ -151,6 +167,7 @@ def main(args):
             open_entry_px = None
             open_entry_ts = None
             open_be_locked = False
+            open_risk_pts = None
 
         # latency queue
         for due in delay.due(i):
@@ -206,6 +223,17 @@ def main(args):
                         "pnl": pnl,
                         "fees_total": 0.0,
                     })
+                    try:
+                        if open_risk_pts and float(open_risk_pts) > 0:
+                            pnl_pts = (exit_px - entry_px) * (1.0 if side == "BUY" else -1.0)
+                            R = pnl_pts / float(open_risk_pts)
+                            risk.record_trade_outcome_R(R)
+                            try:
+                                om.trades[-1]["R"] = float(R)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
             # reset open state either way
             open_position = False
@@ -215,15 +243,12 @@ def main(args):
             open_entry_px = None
             open_entry_ts = None
             open_be_locked = False
+            open_risk_pts = None
             continue
-
-
-
-
 
         # --- manage OPEN position ---
 
-        # 1a) Consume normal STOP/TARGET exits first
+        # 1a) Consume normal STOP/TARGET exits first via the bracket
         if open_position and current_bracket:
             before = len(om.trades)
             exit_info = om.simulate_bracket(bar, current_bracket)
@@ -258,40 +283,29 @@ def main(args):
                 open_be_locked = False
                 continue
 
-        # 1b) Break-even scratch after BE_LOCK_MIN minutes (hard-flat $0 PnL)
-        # NOTE: ensure BE_LOCK_MIN is defined (e.g., BE_LOCK_MIN = 12) near top of file.
+        # 1b) Guarded BE lock: only after BE_LOCK_MIN minutes AND after price moved ≥ BE_REQ_TICKS in our favor
         if open_position and current_bracket and open_entry_ts is not None and not open_be_locked:
             if _minutes_between(open_entry_ts, bar["t_local"]) >= BE_LOCK_MIN:
-                qty = int(open_qty or getattr(current_bracket, "qty", 0) or 0)
-                px  = float(open_entry_px if open_entry_px is not None else bar["close"])
-                om.trades.append({
-                    "t_local": bar["t_local"],
-                    "action": "EXIT",
-                    "side": open_side,
-                    "qty": qty,
-                    # force entry == exit so PnL is exactly 0
-                    "entry_price": px,
-                    "price": px,
-                    "exit_price": px,
-                    "reason": "BE",
-                    "pnl": 0.0,
-                    "fees_total": 0.0,   # keep zero in backtests; add fees later if desired
-                })
-                risk.record_trade_outcome_R(0.0)
+                tick = float(fees["tick_size"])
+                entry_px = float(open_entry_px)
+                px_now  = float(bar["close"])
 
-                # clear state
-                open_position = False
-                current_bracket = None
-                open_side = None
-                open_qty = 0
-                open_entry_px = None
-                open_entry_ts = None
-                open_be_locked = False
-                continue
+                moved_favorably = (
+                    (open_side == "BUY"  and px_now >= entry_px + BE_REQ_TICKS * tick) or
+                    (open_side == "SELL" and px_now <= entry_px - BE_REQ_TICKS * tick)
+                )
 
-        # 1c) Time-based exit to avoid WINDOW later
-        if open_position and current_bracket:
-            if open_entry_ts is not None and _minutes_between(open_entry_ts, bar["t_local"]) >= MAX_HOLD_MIN:
+                if moved_favorably:
+                    if open_side == "BUY":
+                        current_bracket.stop_price = max(float(current_bracket.stop_price), entry_px)
+                    else:
+                        current_bracket.stop_price = min(float(current_bracket.stop_price), entry_px)
+                    open_be_locked = True
+                    # no trade appended; bracket will realize BE later if hit
+
+        # 1c) Time-based exit once MAX_HOLD_MIN is exceeded
+        if open_position and current_bracket and open_entry_ts is not None:
+            if _minutes_between(open_entry_ts, bar["t_local"]) >= MAX_HOLD_MIN:
                 before = len(om.trades)
                 exit_info = om.simulate_bracket(bar, current_bracket)
                 exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
@@ -315,6 +329,15 @@ def main(args):
                         "pnl": pnl,
                         "fees_total": 0.0,
                     })
+                    # NEW: record R for the TIME exit using the stored initial risk
+                    try:
+                        if open_risk_pts and float(open_risk_pts) > 0:
+                            pnl_pts = (exit_px - entry_px) * (1.0 if side == "BUY" else -1.0)
+                            R = pnl_pts / float(open_risk_pts)
+                            risk.record_trade_outcome_R(R)
+                            om.trades[-1]["R"] = float(R)   # stash R on the row for auditing
+                    except Exception:
+                        pass
 
                 # clear state
                 open_position = False
@@ -325,61 +348,15 @@ def main(args):
                 open_entry_ts = None
                 open_be_locked = False
                 continue
-
-
-
-        # 2) Time-based exit to avoid WINDOW later
-        if open_position and current_bracket:
-            if open_entry_ts is not None and _minutes_between(open_entry_ts, bar["t_local"]) >= MAX_HOLD_MIN:
-                before = len(om.trades)
-                exit_info = om.simulate_bracket(bar, current_bracket)
-                exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
-
-                if not exited:
-                    exit_px = float(bar["close"])
-                    side = (open_side or "BUY")
-                    qty = int(open_qty or getattr(current_bracket, "qty", 0) or 0)
-                    entry_px = float(open_entry_px if open_entry_px is not None else bar["close"])
-                    dpp = float(fees["tick_value"]) / float(fees["tick_size"])
-                    pnl = (exit_px - entry_px) * dpp * (1.0 if side == "BUY" else -1.0)
-
-                    om.trades.append({
-                        "t_local": bar["t_local"],
-                        "action": "EXIT",
-                        "side": side,
-                        "qty": qty,
-                        "price": entry_px,
-                        "reason": "TIME",
-                        "exit_price": exit_px,
-                        "pnl": pnl,
-                        "fees_total": 0.0,
-                    })
-
-                open_position = False
-                current_bracket = None
-                open_side = None
-                open_qty = 0
-                open_entry_px = None
-                open_entry_ts = None
-                open_be_locked = False
-                continue
-
-
-
-
-
-
-
-
 
         # new signal
         if not open_position and not risk.halted:
             sig = strat.maybe_signal(bar, windows, risk)
             if sig:
                 # skip entries too close to a window close
-                if _minutes_to_window_end(bar["t_local"], windows) < 20:
+                if _minutes_to_window_end(bar["t_local"], windows) < MIN_WIN_END:
                     continue
-                
+
                 tick_size = float(fees["tick_size"])
                 entry = float(getattr(sig["order"], "entry", bar["close"]))
                 stop  = float(sig["bracket"].stop_price)
@@ -390,16 +367,11 @@ def main(args):
                         sig["bracket"].stop_price = entry - tick_size
                     else:
                         sig["bracket"].stop_price = entry + tick_size
+                    stop = float(sig["bracket"].stop_price)
 
                 if delay.bars > 0:
-                    payload = {
-                        "order":   sig["order"],
-                        "bracket": sig["bracket"],
-                        "entry":   entry,  # numeric entry price we computed
-                    }
-                    delay.submit(i, payload) 
+                    delay.submit(i, sig["order"])
                 else:
-                    # immediate; mark open now
                     om.place_and_simulate(bar, sig["order"])
                     current_bracket = sig["bracket"]
                     open_position = True
@@ -407,9 +379,7 @@ def main(args):
                     open_qty = int(sig["order"].qty)
                     open_entry_px = entry
                     open_entry_ts = bar["t_local"]
-                    open_be_locked = False
-
-
+                    open_risk_pts = max(tick_size, abs(entry - stop))
 
     # ---- Results ----
     cleaned = []
@@ -456,27 +426,17 @@ def main(args):
     print(trades_df.head(10))
 
 
-    # --- Exit-based sanity metrics (attach to summary + print) ---
-    exits = trades_df[trades_df["action"]=="EXIT"].copy()
+    # --- Exit-based sanity metrics (print now) ---
+    exits = trades_df[trades_df["action"] == "EXIT"].copy()
     if not exits.empty:
         dollar_expectancy = exits["pnl"].mean()
-        pf_exit = exits.loc[exits["pnl"]>0,"pnl"].sum() / max(1, -exits.loc[exits["pnl"]<=0,"pnl"].sum())
+        pf_exit = exits.loc[exits["pnl"] > 0, "pnl"].sum() / max(1, -exits.loc[exits["pnl"] <= 0, "pnl"].sum())
         wins = (exits["pnl"] > 0).sum()
         losses = (exits["pnl"] <= 0).sum()
-        winrate_exit = wins / max(1, wins+losses)
-
-        # show it
+        winrate_exit = wins / max(1, wins + losses)
         print(f"\n[EXIT METRICS] N={len(exits)}  Win%={winrate_exit:.1%}  PF={pf_exit:.2f}  $Exp/exit={dollar_expectancy:.2f}")
 
-        # also drop into the summary we write
-        try:
-            summary["PF_ExitBased"] = float(pf_exit)
-            summary["DollarExpectancyPerExit"] = float(dollar_expectancy)
-        except Exception:
-            pass
-
-    # Plots
-    
+    # --- Plots ---
     if args.no_gui:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -498,14 +458,23 @@ def main(args):
             plt.show()
         plt.close(fig2)
 
+    # --- Summary & artifacts (attach exit metrics here so they land in summary.json) ---
     summary = summarize_equity(equity_full, trades_df)
+
+    if not exits.empty:
+        # Put these into the summary *after* it's created
+        summary["PF_ExitBased"] = float(pf_exit)
+        summary["DollarExpectancyPerExit"] = float(dollar_expectancy)
+
     write_artifacts(equity_full, trades_df, summary, logs_dir="logs")
+
     print("\n=== SUMMARY ===")
     print(f"Trades: {summary.get('Trades', 0)} | WinRate: {summary.get('WinRate', 0):.1f}% "
           f"| PF: {summary.get('ProfitFactor')} | Expectancy: ${summary.get('Expectancy', 0):.2f}")
     print(f"NetPnL: ${summary.get('NetPnL', 0):.2f} | Fees: ${summary.get('FeesTotal', 0):.2f} "
           f"| NetRet: {summary.get('NetReturnPct', 0):.2f}% | MDD: {summary.get('MaxDrawdown', 0):.2%}")
     print("Saved logs/summary.json")
+
 
 
 if __name__ == "__main__":

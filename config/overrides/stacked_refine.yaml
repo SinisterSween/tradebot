@@ -1,0 +1,13 @@
+strategy:
+  # same windows you already use
+  session_windows:
+    - { start: "08:45", end: "10:45" }
+    - { start: "13:00", end: "15:20" }
+
+  # nudge to reduce whipsaw and early stops
+  atr_mult: 0.55            # +0.05 from 0.50
+  break_eps_ticks: 1        # allow 1-tick wiggle on break
+  target_R: 1.0             # keep
+
+execution:
+  cooldown_bars: 15         # only has effect if your strategy reads it; harmless otherwise
