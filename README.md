@@ -63,7 +63,10 @@ grep -n "NOOP" logs/shadow.out | tail
 # Backtest outputs (after manual runs or OOS loop triggers)
 ls -1 logs/ | egrep "pnl_curve|equity_curve|summary.json|backtest_trades.csv" || true
 ```
-
+#Health Checks SH file
+To run the health checks file use this:
+scripts/health_check.sh
+STRICT=1 STALE_SEC=1200 scripts/health_check.sh
 ## Expected Files & Dirs
 
 - `data/MES_live_1m.csv` — live-delayed 1m bars from IBKR (feeder output)

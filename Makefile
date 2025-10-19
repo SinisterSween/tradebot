@@ -7,8 +7,11 @@ CSV  := data/ES_1m.csv
 LOGS := logs
 EXEC_LOG := $(LOGS)/executions.csv
 
-.PHONY: help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
+.PHONY: health help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
 
+health:
+	@echo ">> Running health check (STRICT=1, STALE_SEC=1200)"
+	@STRICT=1 STALE_SEC=1200 scripts/health_check.sh
 
 help:
 	@echo "make setup        # install deps into '$(ENV)'" ; \
@@ -22,6 +25,7 @@ help:
 	@echo "make report	 # run backtest (no GUI) then open outputs" ; \
 	@echo "make report-fast	 # open last backtest outputs if present" ; \
 	@echo "make sweep 	 # run parameter sweep and open results" ; \
+	@echo "make health       # run Tradebot health check (STRICT=1, STALE_SEC=1200)"
 	
 
 setup: ensure-env
