@@ -421,20 +421,41 @@ def main(args):
 
     os.makedirs("logs", exist_ok=True)
     trades_df = pd.DataFrame(om.trades)
+
+    # ensure consistent columns even if no trades
+    if trades_df.empty:
+        trades_df = pd.DataFrame(columns=[
+            "ts","t_local","action","side","qty","entry_price","price",
+            "reason","exit_price","pnl","fees_total","R"
+        ])
+
     trades_df.to_csv("logs/backtest_trades.csv", index=False)
     print("\nSaved trades to logs/backtest_trades.csv")
     print(trades_df.head(10))
 
 
-    # --- Exit-based sanity metrics (print now) ---
-    exits = trades_df[trades_df["action"] == "EXIT"].copy()
-    if not exits.empty:
-        dollar_expectancy = exits["pnl"].mean()
-        pf_exit = exits.loc[exits["pnl"] > 0, "pnl"].sum() / max(1, -exits.loc[exits["pnl"] <= 0, "pnl"].sum())
-        wins = (exits["pnl"] > 0).sum()
-        losses = (exits["pnl"] <= 0).sum()
+    # --- Exit-based sanity metrics (safe for zero-trade runs) ---
+    exits = None
+    if not trades_df.empty and "action" in trades_df.columns:
+        exits = trades_df.loc[trades_df["action"] == "EXIT"].copy()
+
+    extra_summary = {}
+    if exits is not None and not exits.empty:
+        dollar_expectancy = float(exits["pnl"].mean())
+        pf_exit = float(
+            exits.loc[exits["pnl"] > 0, "pnl"].sum() /
+            max(1, -exits.loc[exits["pnl"] <= 0, "pnl"].sum())
+        )
+        wins = int((exits["pnl"] > 0).sum())
+        losses = int((exits["pnl"] <= 0).sum())
         winrate_exit = wins / max(1, wins + losses)
+
         print(f"\n[EXIT METRICS] N={len(exits)}  Win%={winrate_exit:.1%}  PF={pf_exit:.2f}  $Exp/exit={dollar_expectancy:.2f}")
+        extra_summary["PF_ExitBased"] = pf_exit
+        extra_summary["DollarExpectancyPerExit"] = dollar_expectancy
+    else:
+        print("\n[EXIT METRICS] No exits this run (likely too few bars or outside session windows).")
+      
 
     # --- Plots ---
     if args.no_gui:
@@ -460,11 +481,10 @@ def main(args):
 
     # --- Summary & artifacts (attach exit metrics here so they land in summary.json) ---
     summary = summarize_equity(equity_full, trades_df)
+    if extra_summary:
+        summary.update(extra_summary)
 
-    if not exits.empty:
-        # Put these into the summary *after* it's created
-        summary["PF_ExitBased"] = float(pf_exit)
-        summary["DollarExpectancyPerExit"] = float(dollar_expectancy)
+    
 
     write_artifacts(equity_full, trades_df, summary, logs_dir="logs")
 
