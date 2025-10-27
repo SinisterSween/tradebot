@@ -1,17 +1,53 @@
+# --- Vars ---
 SHELL := /bin/bash
-
 ENV  := tradebot
 CONFIG_ES  := config/settings.dev.yaml
 CONFIG_MES := config/settings.live.yaml
 CSV  := data/ES_1m.csv
+CSV_LIVE := data/MES_live_1m.csv
 LOGS := logs
 EXEC_LOG := $(LOGS)/executions.csv
 
-.PHONY: health help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
+PY := conda run -n $(ENV) python -u
+
+.PHONY: dash open start stop restart status oos-status health help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
+
+dash: ensure-env
+	@echo "Opening live dashboard at http://127.0.0.1:5055/"
+	@conda run -n $(ENV) python -u scripts/live_dashboard.py --csv $(CSV_LIVE) --host 127.0.0.1 --port 5055
+
+open:
+	@bash scripts/tmux_watch.sh
+
+start: ensure-env
+	@mkdir -p $(LOGS)
+	@nohup $(PY) scripts/shadow_mes_delayed.py > $(LOGS)/shadow.out 2>&1 &
+	@nohup $(PY) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
+	  --csv $(CSV_LIVE) --config config/overrides/clean_v1_be10_tick1.yaml \
+	  > $(LOGS)/oos_loop.out 2>&1 &
+	@echo "Started feeder + OOS loop"
+
+stop:
+	@pkill -f shadow_mes_delayed.py || true
+	@pkill -f run_oos_loop.py || true
+	@echo "Stopped feeder + OOS loop"
+
+restart: stop start
+
+status:
+	@echo "PIDs:"; pgrep -fl shadow_mes_delayed.py || echo "feeder: none"; \
+	pgrep -fl run_oos_loop.py || echo "oos: none"; \
+	echo ""; echo "Last bar:"; tail -n 1 $(CSV_LIVE) || true; \
+	echo ""; echo "Last OOS row:"; tail -n 1 $(LOGS)/oos_log.csv || true
+
+oos-status:
+	@pgrep -fl run_oos_loop.py || echo "oos: none"
+	@tail -n 20 $(LOGS)/oos_loop.out || true
+	@tail -n 3  $(LOGS)/oos_log.csv  || true
 
 health:
 	@echo ">> Running health check (STRICT=1, STALE_SEC=1200)"
-	@STRICT=1 STALE_SEC=1200 scripts/health_check.sh
+	@STRICT=1 STALE_SEC=1200 bash scripts/health_check.sh
 
 help:
 	@echo "make setup        # install deps into '$(ENV)'" ; \
@@ -90,13 +126,14 @@ data: fetch-data
 fetch-data: ensure-env
 	conda run -n $(ENV) python scripts/get_es_ib.py
 
-metrics-up: 
+metrics-up:
 	@if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then \
-		docker compose up -d
+		docker compose up -d; \
 	else \
-		echo "docker compse not available on this machine. Skipping."; \
+		echo "docker compose not available on this machine. Skipping."; \
 	fi
-metrics-down: 
+
+metrics-down:
 	@if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then \
 		docker compose down; \
 	else \
