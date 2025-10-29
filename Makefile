@@ -7,10 +7,28 @@ CSV  := data/ES_1m.csv
 CSV_LIVE := data/MES_live_1m.csv
 LOGS := logs
 EXEC_LOG := $(LOGS)/executions.csv
+HOSTNAME := $(shell hostname)
 
 PY := conda run -n $(ENV) python -u
 
-.PHONY: dash open start stop restart status oos-status health help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
+.PHONY: alerts notify-start notify-stop notify-health dash open start stop restart status oos-status health help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
+
+alerts: ensure-env
+	@mkdir -p $(LOGS)
+	@echo ">> running alerts $(ARGS)"
+	@conda run -n $(ENV) python -u scripts/slack_alerts.py $(ARGS)
+
+notify-start:
+	@conda run -n $(ENV) python -u scripts/notify_slack.py "🚀 Tradebot STARTED on $(HOSTNAME). Feeder & OOS launching… (CSV=data/MES_live_1m.csv)"
+
+notify-stop:
+	@conda run -n $(ENV) python -u scripts/notify_slack.py "🛑 Tradebot STOPPED on $(HOSTNAME)."
+
+notify-health:
+	@out=$$(STRICT=1 STALE_SEC=1200 scripts/health_check.sh 2>&1); \
+	echo "$$out"; \
+	msg=$$(echo "$$out" | awk 'NR<=60' | sed 's/"/'\''/g'); \
+	conda run -n $(ENV) python -u scripts/notify_slack.py "🩺 Tradebot Health on $(HOSTNAME): $${msg}"
 
 dash: ensure-env
 	@echo "Opening live dashboard at http://127.0.0.1:5055/"
@@ -25,11 +43,13 @@ start: ensure-env
 	@nohup $(PY) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
 	  --csv $(CSV_LIVE) --config config/overrides/clean_v1_be10_tick1.yaml \
 	  > $(LOGS)/oos_loop.out 2>&1 &
+	@$(MAKE) notify-start
 	@echo "Started feeder + OOS loop"
 
 stop:
 	@pkill -f shadow_mes_delayed.py || true
 	@pkill -f run_oos_loop.py || true
+	@$(MAKE) notify-stop
 	@echo "Stopped feeder + OOS loop"
 
 restart: stop start
