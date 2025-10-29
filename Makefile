@@ -11,7 +11,46 @@ HOSTNAME := $(shell hostname)
 
 PY := conda run -n $(ENV) python -u
 
-.PHONY: alerts notify-start notify-stop notify-health dash open start stop restart status oos-status health help setup backtest live data fetch-data metrics-up metrics-down tail clean report report-fast sweep ensure-env check backtest-es backtest-mes live-es live-mes
+.PHONY: alerts-log alerts-with-chart upload-chart charts alerts-summary \
+alerts-rebuild watchdog analyze alerts notify-start notify-stop \
+notify-health dash open start stop restart status oos-status health \
+help setup backtest live data fetch-data metrics-up metrics-down \
+tail clean report report-fast sweep ensure-env check backtest-es \
+backtest-mes live-es live-mes rotate-logs
+
+alerts-log:
+	@tail -n 200 logs/slack_alerts.out || echo "No log yet."
+
+rotate-logs:
+	@find logs -type f -name "*.out" -size +5M -exec mv {} {}.$(shell date +%Y%m%d) \;
+	@gzip -f logs/*.out.* || true
+
+alerts-with-chart: ensure-env
+	@mkdir -p $(LOGS)
+	@UPLOAD_CHART=1 conda run -n $(ENV) python -u scripts/slack_alerts.py --summary
+
+charts: ensure-env
+	@conda run -n $(ENV) python -u scripts/slack_alerts.py --rebuild-daily
+	@test -f logs/daily_perf.png && echo "daily_perf.png ✓" || echo "daily_perf.png missing"
+	@test -f logs/streaks_history.png && echo "streaks_history.png ✓" || echo "streaks_history.png missing"
+
+alerts-summary: ensure-env
+	@mkdir -p $(LOGS)
+	@echo ">> running alerts --summary $(ARGS)"
+	@conda run -n $(ENV) python -u scripts/slack_alerts.py --summary $(ARGS)
+
+alerts-rebuild: ensure-env
+	@UPLOAD_CHART=1 conda run -n $(ENV) python -u scripts/slack_alerts.py --rebuild-daily
+
+
+watchdog:
+	@./scripts/watchdog_feeder.sh 300
+
+analyze: ensure-env
+	@mkdir -p $(LOGS)
+	@conda run -n $(ENV) python -u scripts/analyze_run.py
+	@echo "---- live_summary.txt ----"
+	@sed -n '1,120p' logs/live_summary.txt || true
 
 alerts: ensure-env
 	@mkdir -p $(LOGS)

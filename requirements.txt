@@ -16,6 +16,7 @@ python-dateutil==2.9.0.post0
 pytz==2025.2
 PyYAML==6.0.2
 six==1.17.0
+slack_sdk>=3.27.1
 trader==0.0.0
 tzdata==2025.2
 Flask>=3.0,<4.0
