@@ -20,10 +20,11 @@ def _acquire_lock():
         print("[SKIP] another alerts run is active"); sys.exit(0)
     return f  # keep handle open
 
+SYMBOL = os.getenv("SYMBOL", "MES").upper()
 # --- Paths ---
 DATA_CSV   = Path("data/MES_live_1m.csv")
 OOS_LOG    = Path("logs/oos_log.csv")
-TRADES_CSV = Path("logs/backtest_trades.csv")
+TRADES_CSV = Path(f"logs/backtest_trades.csv") if SYMBOL != "MES" else Path("logs/backtest_trades.csv")
 FEED_LOG   = Path("logs/shadow.out")
 NOTIFY     = Path("scripts/notify_slack.py")
 

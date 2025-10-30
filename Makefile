@@ -15,8 +15,11 @@ RUN := conda run -n $(ENV) env PYTHONPATH=. python -u
 OOS_LOG    := $(LOGS)/oos_log.csv
 ALERTS_OUT := $(LOGS)/slack_alerts.out
 
-.PHONY: help setup ensure-env rotate-logs alerts alerts-upload alerts-summary charts \
-        start stop restart status oos-status health clean status-dash
+.PHONY: status-all start-mnq stop-mnq status-mnq alerts-mnq alerts-upload-mnq \
+		alerts-summary-mnq help setup ensure-env rotate-logs alerts-mes \
+		alerts-upload alerts-summary charts \
+        start-mes stop-mes restart status-mes oos-status health \
+		clean status-dash
 
 help:
 	@echo "make alerts            # run alerts (no auto-upload)"
@@ -29,6 +32,73 @@ help:
 	@echo "make status-dash       # compact terminal dashboard"
 	@echo "make rotate-logs       # rotate/compress *.out logs"
 	@echo "make clean             # purge generated csv/json (safe)"
+
+status-all:
+	@$(MAKE) -s status-mes
+	@echo ""
+	@$(MAKE) -s status-mnq
+
+#-------- MNQ-specific targets --------
+start-mnq:
+	@mkdir -p logs
+	@nohup $(RUN) scripts/shadow_mes_delayed.py --symbol MNQ --clientId 10 --out data/MNQ_live_1m.csv > logs/shadow_mnq.out 2>&1 &
+	@nohup $(RUN) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
+	  --csv data/MNQ_live_1m.csv --config config/overrides/clean_v1_be10_tick1.yaml \
+	  --log logs/oos_log_MNQ.csv --trades-csv logs/backtest_trades_MNQ.csv --tag MNQ \
+	  > logs/oos_loop_mnq.out 2>&1 &
+	@$(RUN) scripts/notify_slack.py "🚀 MNQ STARTED on $(HOSTNAME)."
+	@echo "MNQ feeder + OOS loop started"
+
+stop-mnq:
+	@pkill -f "shadow_mes_delayed.py --symbol MNQ" || true
+	@pkill -f "run_oos_loop.py --csv data/MNQ_live_1m.csv" || true
+	@$(RUN) scripts/notify_slack.py "🛑 MNQ STOPPED on $(HOSTNAME)."
+	@echo "MNQ feeder + OOS loop stopped"
+
+status-mnq:
+	@echo "PIDs:"; pgrep -fl "shadow_mes_delayed.py --symbol MNQ" || echo "feeder: none"; \
+	pgrep -fl "run_oos_loop.py --csv data/MNQ_live_1m.csv" || echo "oos: none"; \
+	echo ""; echo "Last bar:"; tail -n 1 data/MNQ_live_1m.csv || true; \
+	echo ""; echo "Last OOS row:"; tail -n 1 logs/oos_log_MNQ.csv || true
+
+alerts-mnq:
+	@SYMBOL=MNQ $(MAKE) -s alerts-summary
+
+alerts-upload-mnq:
+	@SYMBOL=MNQ $(MAKE) -s alerts-upload
+
+alerts-summary-mnq:
+	@SYMBOL=MNQ $(MAKE) -s alerts-summary
+
+###======================================###
+
+#-------- MES-specific targets --------
+start-mes:
+	@mkdir -p logs
+	@nohup $(RUN) scripts/shadow_mes_delayed.py --symbol MES --clientId 9 --out data/MES_live_1m.csv > logs/shadow_mes.out 2>&1 &
+	@nohup $(RUN) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
+	  --csv data/MES_live_1m.csv --config config/overrides/clean_v1_be10_tick1.yaml \
+	  --log logs/oos_log.csv --trades-csv logs/backtest_trades.csv --tag MES \
+	  > logs/oos_loop_mes.out 2>&1 &
+	@$(RUN) scripts/notify_slack.py "🚀 MES STARTED on $(HOSTNAME)."
+	@echo "MES feeder + OOS loop started"
+
+stop-mes:
+	@pkill -f "shadow_mes_delayed.py --symbol MES" || pkill -f shadow_mes_delayed.py || true
+	@pkill -f "run_oos_loop.py --csv data/MES_live_1m.csv" || true
+	@$(RUN) scripts/notify_slack.py "🛑 MES STOPPED on $(HOSTNAME)."
+	@echo "MES feeder + OOS loop stopped"
+
+status-mes:
+	@echo "PIDs:"; pgrep -fl "shadow_mes_delayed.py --symbol MES" || echo "feeder: none"; \
+	pgrep -fl "run_oos_loop.py --csv data/MES_live_1m.csv" || echo "oos: none"; \
+	echo ""; echo "Last bar:"; tail -n 1 data/MES_live_1m.csv || true; \
+	echo ""; echo "Last OOS row:"; tail -n 1 logs/oos_log.csv || true
+
+alerts-mes:
+	@SYMBOL=MES $(MAKE) -s alerts-summary
+
+###======================================###
 
 setup: ensure-env
 	conda run -n $(ENV) pip install --upgrade pip
@@ -47,7 +117,7 @@ rotate-logs:
 alerts:
 	@mkdir -p $(LOGS)
 	@echo ">> alerts $(ARGS)"
-	@$(RUN) scripts/slack_alerts.py $(ARGS)
+	@conda run -n $(ENV) env PYTHONPATH=. python -u scripts/slack_alerts.py $(ARGS)
 
 alerts-upload:
 	@mkdir -p $(LOGS)

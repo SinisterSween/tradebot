@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import subprocess, time, argparse, datetime as dt, os, sys, json, csv
+import subprocess, time, argparse, datetime as dt, os, sys, json, csv, shutil
+from pathlib import Path
 
 def run(cmd):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -37,11 +38,16 @@ def main():
     ap.add_argument("--fees", nargs=3, type=float, default=[0,0,0], metavar=("FEE_BPS","SLIP_BPS","FEE_FIXED"))
     ap.add_argument("--min-bars", type=int, default=150, help="skip run if fewer than this many rows in CSV")
     ap.add_argument("--once", action="store_true", help="run a single backtest then exit")
+    ap.add_argument("--log", default="logs/oos_log.csv", help="Where to append OOS summary rows (per-symbol).")
+    ap.add_argument("--trades-csv", default="logs/backtest_trades.csv", help="Per-symbol trades CSV to write/overwrite each run.")
+    ap.add_argument("--tag", default="MES", help="Symbol/tag used in filenames or summary labeling.")
     args = ap.parse_args()
 
     os.makedirs("logs", exist_ok=True)
     loop_log = "logs/oos_loop.out"
-    oos_csv  = "logs/oos_log.csv"
+    oos_csv  = args.log
+    trades_out = Path(args.trades_csv)
+    trades_out.parent.mkdir(parents=True, exist_ok=True)
 
     last_mtime = 0.0
 
@@ -118,6 +124,21 @@ def main():
         ]
         with open(oos_csv, "a", newline="") as f:
             csv.writer(f).writerow(row)
+
+        # after the run, we may have logs/trades_<tag>.csv; copy/rename to the requested trades-csv
+        src_trades = Path(f"logs/backtest_trades_{args.tag}.csv")
+        if src_trades.exists():
+            dst = Path(args.trades_csv)
+            if src_trades.resolve() != dst.resolve():
+                try:
+                    dst.write_text(src_trades.read_text())
+                    print(f"Saved trades to {dst}")
+                except Exception as e:
+                    print(f"[WARN] failed to copy trades to CSV to {dst}: {e}")
+            else:
+                # same file, don't warn
+                pass
+
 
         # cadence sleep
         time.sleep(max(60, args.cadence_min * 60))
