@@ -2,6 +2,7 @@
 .ONESHELL:
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
+SYMBOL ?= MES
 
 ENV        ?= tradebot
 HOSTNAME   := $(shell hostname)
@@ -19,7 +20,8 @@ ALERTS_OUT := $(LOGS)/slack_alerts.out
 		alerts-summary-mnq help setup ensure-env rotate-logs alerts-mes \
 		alerts-upload alerts-summary charts \
         start-mes stop-mes restart status-mes oos-status health \
-		clean status-dash
+		clean status-dash alerts-rebuild alerts-all stop_all start-all \
+		start-qqq stop-qqq start-spy stop-spy
 
 help:
 	@echo "make alerts            # run alerts (no auto-upload)"
@@ -33,25 +35,46 @@ help:
 	@echo "make rotate-logs       # rotate/compress *.out logs"
 	@echo "make clean             # purge generated csv/json (safe)"
 
+
+stop-all:
+	@echo "Hard stopping all tradebot python procs..."
+	@ps aux | egrep "run_oos_loop.py|shadow_mes_delayed.py" | egrep -v egrep | awk '{print $$2}' | xargs -I{} kill -9 {} 2>/dev/null || true
+	@$(RUN) scripts/notify_slack.py "🛑 All Stopped on $(HOSTNAME)."
+	@echo "All stopped."
+
 status-all:
 	@$(MAKE) -s status-mes
 	@echo ""
 	@$(MAKE) -s status-mnq
+
+alerts-all: ensure-env
+	@conda run -n $(ENV) env PYTHONPATH=. SYMBOL=MES python -u scripts/slack_alerts.py --summary
+	@conda run -n $(ENV) env PYTHONPATH=. SYMBOL=MNQ python -u scripts/slack_alerts.py --summary
+
+
+alerts-rebuild: ensure-env
+	@UPLOAD_CHART=1 SYMBOL=$(SYMBOL) conda run -n $(ENV) env PYTHONPATH=. python -u scripts/slack_alerts.py --rebuild-daily
+
 
 #-------- MNQ-specific targets --------
 start-mnq:
 	@mkdir -p logs
 	@nohup $(RUN) scripts/shadow_mes_delayed.py --symbol MNQ --clientId 10 --out data/MNQ_live_1m.csv > logs/shadow_mnq.out 2>&1 &
 	@nohup $(RUN) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
-	  --csv data/MNQ_live_1m.csv --config config/overrides/clean_v1_be10_tick1.yaml \
-	  --log logs/oos_log_MNQ.csv --trades-csv logs/backtest_trades_MNQ.csv --tag MNQ \
-	  > logs/oos_loop_mnq.out 2>&1 &
+	  --csv data/MNQ_live_1m.csv \
+	  --config config/overrides/mnq_clean_v1.yaml \
+	  --log logs/oos_log_MNQ.csv \
+	  --trades-csv logs/backtest_trades_MNQ.csv \
+	  --tag MNQ \
+	  --symbol MNQ \
+	  > logs/oos_loop_MNQ.out 2>&1 &
 	@$(RUN) scripts/notify_slack.py "🚀 MNQ STARTED on $(HOSTNAME)."
 	@echo "MNQ feeder + OOS loop started"
 
 stop-mnq:
-	@pkill -f "shadow_mes_delayed.py --symbol MNQ" || true
-	@pkill -f "run_oos_loop.py --csv data/MNQ_live_1m.csv" || true
+	@echo "Stopping MNQ feeder + OOS loop..."
+	@pkill -f "scripts/shadow_mes_delayed.py --symbol MNQ" 2>/dev/null || true
+	@pgrep -fl "scripts/run_oos_loop.py --csv data/MNQ_live_1m.csv" | awk '{print $$1}' | xargs -r kill
 	@$(RUN) scripts/notify_slack.py "🛑 MNQ STOPPED on $(HOSTNAME)."
 	@echo "MNQ feeder + OOS loop stopped"
 
@@ -77,15 +100,20 @@ start-mes:
 	@mkdir -p logs
 	@nohup $(RUN) scripts/shadow_mes_delayed.py --symbol MES --clientId 9 --out data/MES_live_1m.csv > logs/shadow_mes.out 2>&1 &
 	@nohup $(RUN) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
-	  --csv data/MES_live_1m.csv --config config/overrides/clean_v1_be10_tick1.yaml \
-	  --log logs/oos_log.csv --trades-csv logs/backtest_trades.csv --tag MES \
-	  > logs/oos_loop_mes.out 2>&1 &
+	  --csv data/MES_live_1m.csv \
+	  --config config/overrides/clean_v1_be10_tick1.yaml \
+	  --log logs/oos_log.csv \
+	  --trades-csv logs/backtest_trades.csv \
+	  --tag MES \
+	  --symbol MES \
+	  > logs/oos_loop_MES.out 2>&1 &
 	@$(RUN) scripts/notify_slack.py "🚀 MES STARTED on $(HOSTNAME)."
 	@echo "MES feeder + OOS loop started"
 
 stop-mes:
-	@pkill -f "shadow_mes_delayed.py --symbol MES" || pkill -f shadow_mes_delayed.py || true
-	@pkill -f "run_oos_loop.py --csv data/MES_live_1m.csv" || true
+	@echo "Stopping MES feeder + OOS loop..."
+	@pkill -f "scripts/shadow_mes_delayed.py --symbol MES" 2>/dev/null || true
+	@pgrep -fl "scripts/run_oos_loop.py --csv data/MES_live_1m.csv" | awk '{print $$1}' | xargs -r kill
 	@$(RUN) scripts/notify_slack.py "🛑 MES STOPPED on $(HOSTNAME)."
 	@echo "MES feeder + OOS loop stopped"
 
@@ -97,6 +125,51 @@ status-mes:
 
 alerts-mes:
 	@SYMBOL=MES $(MAKE) -s alerts-summary
+
+
+# --- SPY ---------------------------------------------------------
+start-spy:
+	@mkdir -p logs data
+	@nohup $(RUN) scripts/shadow_mes_delayed.py --symbol SPY --exchange SMART --clientId 10 --out data/SPY_live_1m.csv > logs/shadow_spy.out 2>&1 &
+	@nohup $(RUN) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
+	  --csv data/SPY_live_1m.csv \
+	  --config config/overrides/spy_default.yaml \
+	  --log logs/oos_log_spy.csv \
+	  --trades-csv logs/backtest_trades_spy.csv \
+	  --tag SPY \
+	  --symbol SPY \
+	  > logs/oos_loop_SPY.out 2>&1 &
+	@$(RUN) scripts/notify_slack.py "📈 SPY STARTED on $(HOSTNAME)."
+	@echo "SPY feeder + OOS loop started"
+
+stop-spy:
+	@echo "Stopping SPY feeder + OOS loop..."
+	@pkill -f "scripts/shadow_mes_delayed.py --symbol SPY" 2>/dev/null || true
+	@pgrep -fl "scripts/run_oos_loop.py --csv data/SPY_live_1m.csv" | awk '{print $$1}' | xargs -r kill
+	@$(RUN) scripts/notify_slack.py "🛑 SPY STOPPED on $(HOSTNAME)."
+	@echo "SPY feeder + OOS loop stopped"
+
+# --- QQQ ---------------------------------------------------------
+start-qqq:
+	@mkdir -p logs data
+	@nohup $(RUN) scripts/shadow_mes_delayed.py --symbol QQQ --exchange SMART --clientId 11 --out data/QQQ_live_1m.csv > logs/shadow_qqq.out 2>&1 &
+	@nohup $(RUN) scripts/run_oos_loop.py --cadence-min 10 --min-bars 150 \
+	  --csv data/QQQ_live_1m.csv \
+	  --config config/overrides/qqq_default.yaml \
+	  --log logs/oos_log_qqq.csv \
+	  --trades-csv logs/backtest_trades_qqq.csv \
+	  --tag QQQ \
+	  --symbol QQQ \
+	  > logs/oos_loop_QQQ.out 2>&1 &
+	@$(RUN) scripts/notify_slack.py "📊 QQQ STARTED on $(HOSTNAME)."
+	@echo "QQQ feeder + OOS loop started"
+
+stop-qqq:
+	@echo "Stopping QQQ feeder + OOS loop..."
+	@pkill -f "scripts/shadow_mes_delayed.py --symbol QQQ" 2>/dev/null || true
+	@pgrep -fl "scripts/run_oos_loop.py --csv data/QQQ_live_1m.csv" | awk '{print $$1}' | xargs -r kill
+	@$(RUN) scripts/notify_slack.py "🛑 QQQ STOPPED on $(HOSTNAME)."
+	@echo "QQQ feeder + OOS loop stopped"
 
 ###======================================###
 
@@ -145,6 +218,9 @@ start:
 	@$(RUN) scripts/notify_slack.py "🚀 Tradebot STARTED on $(HOSTNAME)."
 	@echo "Started feeder + OOS loop"
 
+start-all: start-mes start-mnq start-qqq start-spy
+	@echo "All feeders + OOS loops started"
+
 stop:
 	@pkill -f shadow_mes_delayed.py || true
 	@pkill -f run_oos_loop.py || true
@@ -154,10 +230,14 @@ stop:
 restart: stop start
 
 status:
-	@echo "PIDs:"; pgrep -fl shadow_mes_delayed.py || echo "feeder: none"; \
-	pgrep -fl run_oos_loop.py || echo "oos: none"; \
-	echo ""; echo "Last bar:"; tail -n 1 $(CSV_LIVE) || true; \
-	echo ""; echo "Last OOS row:"; tail -n 1 $(OOS_LOG) || true
+	@echo "== FEEDERS =="
+	@ps aux | grep shadow_mes_delayed.py | grep -v grep || true
+	@echo "\n== LOOPS =="
+	@ps aux | grep run_oos_loop.py | grep -v grep || true
+	@echo "\n== MES OOS =="
+	@tail -n 5 logs/oos_log.csv 2>/dev/null || true
+	@echo "\n== MNQ OOS =="
+	@tail -n 5 logs/oos_log_MNQ.csv 2>/dev/null || true
 
 oos-status:
 	@pgrep -fl run_oos_loop.py || echo "oos: none"

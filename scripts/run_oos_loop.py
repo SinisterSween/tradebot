@@ -41,12 +41,17 @@ def main():
     ap.add_argument("--log", default="logs/oos_log.csv", help="Where to append OOS summary rows (per-symbol).")
     ap.add_argument("--trades-csv", default="logs/backtest_trades.csv", help="Per-symbol trades CSV to write/overwrite each run.")
     ap.add_argument("--tag", default="MES", help="Symbol/tag used in filenames or summary labeling.")
+    ap.add_argument("--starting-equity", type=float, default=1000.0)
+    ap.add_argument("--risk-pct", type=float, default=0.01)
+    ap.add_argument("--max-size", type=int, default=3)
+    ap.add_argument("--min-equity", type=float, default=500.0)
+
     args = ap.parse_args()
 
     os.makedirs("logs", exist_ok=True)
-    loop_log = "logs/oos_loop.out"
+    loop_log = f"logs/oos_loop_{args.tag}.out"
     oos_csv  = args.log
-    trades_out = Path(args.trades_csv)
+    trades_out = Path(args.trades_csv) if False else Path(args.trades_csv) 
     trades_out.parent.mkdir(parents=True, exist_ok=True)
 
     last_mtime = 0.0
@@ -58,7 +63,8 @@ def main():
             w.writerow([
                 "ts","rc","csv","config",
                 "Trades","WinRate","ProfitFactor","Expectancy",
-                "NetPnL","FeesTotal","NetReturnPct","MaxDrawdown"
+                "NetPnL","FeesTotal","NetReturnPct","MaxDrawdown",
+                "EndEquity",
             ])
 
     while True:
@@ -99,7 +105,11 @@ def main():
             "--fee-bps", str(args.fees[0]),
             "--slip-bps", str(args.fees[1]),
             "--fee-fixed", str(args.fees[2]),
-            "--config", args.config
+            "--config", args.config,
+            "--starting-equity", str(args.starting_equity),
+            "--risk-pct", str(args.risk_pct),
+            "--max-size", str(args.max_size),
+            "--min-equity", str(args.min_equity),
         ]
 
         rc, out = run(cmd)
@@ -111,6 +121,11 @@ def main():
 
         # Try to pull summary.json -> oos_log.csv
         summary = read_summary("logs/summary.json")
+
+        end_equity = ""
+        if summary:
+            end_equity = summary.get("EndEquity", "")
+
         row = [
             start, rc, args.csv, args.config,
             safe_int(summary.get("Trades")),
@@ -121,6 +136,7 @@ def main():
             summary.get("FeesTotal"),
             summary.get("NetReturnPct"),
             summary.get("MaxDrawdown"),
+            end_equity,
         ]
         with open(oos_csv, "a", newline="") as f:
             csv.writer(f).writerow(row)

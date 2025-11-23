@@ -1,52 +1,72 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, csv, time, subprocess, json, hashlib
+import os, sys, csv, time, subprocess, json, hashlib, math, socket
 from pathlib import Path
 from datetime import datetime, timezone
 import pytz
-import socket
-import math
+import fcntl
 import matplotlib
 matplotlib.use("Agg")
-from matplotlib import pyplot as plt
-from scripts.charts import render_daily_chart, render_streak_chart, render_weekly_chart
+from scripts.charts import (
+    render_daily_chart,
+    render_streak_chart,
+    render_weekly_chart,
+    render_equity_chart,
+    render_trades_chart
+)
 
-import fcntl
+# ---------------------------------------------------------------------
+# locking so launchd / cron doesn't run two at once
+# ---------------------------------------------------------------------
 def _acquire_lock():
     Path("logs").mkdir(exist_ok=True)
     f = open("logs/.alerts.lock", "w")
-    try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError: 
-        print("[SKIP] another alerts run is active"); sys.exit(0)
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("[SKIP] another alerts run is active")
+        sys.exit(0)
     return f  # keep handle open
 
-SYMBOL = os.getenv("SYMBOL", "MES").upper()
-# --- Paths ---
-DATA_CSV   = Path("data/MES_live_1m.csv")
-OOS_LOG    = Path("logs/oos_log.csv")
-TRADES_CSV = Path(f"logs/backtest_trades.csv") if SYMBOL != "MES" else Path("logs/backtest_trades.csv")
-FEED_LOG   = Path("logs/shadow.out")
-NOTIFY     = Path("scripts/notify_slack.py")
-
-# --- Config (kept from your file, with sane defaults for delayed data ops) ---
-STALE_SEC = int(os.getenv("STALE_SEC", "1200"))   # 20m default (delayed data gate)
-PF_WARN   = float(os.getenv("PF_WARN", "1.2"))
-EXP_WARN  = float(os.getenv("EXP_WARN", "10.0"))
-HIST_RUNS = int(os.getenv("HIST_RUNS", "3"))
-PF_DROP_WINDOW = int(os.getenv("PF_DROP_WINDOW", "10"))
-PF_DROP_PCT    = float(os.getenv("PF_DROP_PCT", "0.40"))  # 40%
-
+# ---------------------------------------------------------------------
+# config / globals
+# ---------------------------------------------------------------------
 CT = pytz.timezone("America/Chicago")
-STATE = Path("logs/.alerts_state.json")
 
-# --- Column indexes for your no-header oos_log.csv ---
+# single-symbol env override (still useful)
+ENV_SYMBOL = os.getenv("SYMBOL", "MES").upper()
+
+# Multi-symbol map – THIS is what we walk over
+# MES keeps the old filenames, others get suffixed
+SYMBOLS = [
+    ("MES", Path("logs/oos_log.csv")),
+    ("MNQ", Path("logs/oos_log_MNQ.csv")),
+    # ("M2K", Path("logs/oos_log_M2K.csv")),
+]
+
+# these are “global” MES defaults – we’ll rebind per-symbol
+DATA_CSV = Path("data/MES_live_1m.csv")
+FEED_LOG = Path("logs/shadow.out")
+NOTIFY   = Path("scripts/notify_slack.py")
+STATE    = Path("logs/.alerts_state.json")
+
+STALE_SEC      = int(os.getenv("STALE_SEC", "1200"))
+PF_WARN        = float(os.getenv("PF_WARN", "1.2"))
+EXP_WARN       = float(os.getenv("EXP_WARN", "10.0"))
+HIST_RUNS      = int(os.getenv("HIST_RUNS", "3"))
+PF_DROP_WINDOW = int(os.getenv("PF_DROP_WINDOW", "10"))
+PF_DROP_PCT    = float(os.getenv("PF_DROP_PCT", "0.40"))
+
+# no-header oos_log col order
 IDX = {
     "timestamp": 0, "rc": 1, "csv": 2, "config": 3,
     "Trades": 4, "WinRate": 5, "ProfitFactor": 6, "Expectancy": 7,
     "NetPnL": 8, "FeesTotal": 9, "NetReturnPct": 10, "MaxDrawdown": 11,
 }
 
-# ---------- Helpers ----------
+# ---------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------
 def _changed(key: str, payload: str) -> bool:
     """Return True if payload is new for this key; persist hash to suppress dupes."""
     try:
@@ -62,27 +82,21 @@ def _changed(key: str, payload: str) -> bool:
     return True
 
 def run_notify(msg: str):
-    """Send Slack message (pass message as CLI arg to match your notify_slack.py)."""
     try:
         subprocess.run([sys.executable, str(NOTIFY), msg], check=False)
     except Exception as e:
         print(f"[WARN] notify_slack failed: {e}")
 
 def is_rth_now() -> bool:
-    """
-    CME equities (ES/MES) simplified session guard:
-    Sun 5:00pm CT → Fri 4:00pm CT, daily maintenance ~4–5pm.
-    Gates stale-feed alerts so weekends/maintenance don't spam.
-    """
     now = datetime.now(CT)
-    if now.hour == 16:  # maintenance-ish
+    if now.hour == 16:
         return False
-    wd = now.weekday()  # Mon=0 .. Sun=6
-    if wd == 6:  # Sunday
+    wd = now.weekday()
+    if wd == 6:  # Sun
         return now.hour >= 17
-    if 0 <= wd <= 3:  # Mon–Thu
+    if 0 <= wd <= 3:
         return True
-    if wd == 4:  # Friday
+    if wd == 4:
         return now.hour < 16
     return False
 
@@ -108,19 +122,22 @@ def _tail_rows(path: Path, n: int) -> list[list[str]]:
             rows.append(ln.split(","))
     return rows[-n:] if n > 0 else rows
 
-def _to_float(x) -> float | None:
+def _to_float(x):
     try:
         return float(x)
     except Exception:
         return None
 
-def load_last_bar_age():
-    if not DATA_CSV.exists():
+# ---------------------------------------------------------------------
+# per-symbol loaders
+# ---------------------------------------------------------------------
+def load_last_bar_age(csv_path: Path):
+    if not csv_path.exists():
         return None
     try:
-        age = max(0, time.time() - DATA_CSV.stat().st_mtime)
+        age = max(0, time.time() - csv_path.stat().st_mtime)
         ts = None
-        with DATA_CSV.open("r", encoding="utf-8", errors="ignore") as f:
+        with csv_path.open("r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 pass
             if line:
@@ -129,182 +146,51 @@ def load_last_bar_age():
     except Exception:
         return None
 
-def load_trades(limit: int = 500):
-    """Return list[dict] from backtest_trades.csv (or [] if missing)."""
-    if not TRADES_CSV.exists():
+def load_trades_csv(symbol: str) -> Path:
+    # MES keeps old name to avoid breaking old dashboards
+    if symbol == "MES":
+        return Path("logs/backtest_trades.csv")
+    return Path(f"logs/backtest_trades_{symbol}.csv")
+
+def load_trades(symbol: str, limit: int = 500):
+    p = load_trades_csv(symbol)
+    if not p.exists():
         return []
     rows = []
-    with TRADES_CSV.open("r", newline="", encoding="utf-8", errors="ignore") as f:
+    with p.open("r", newline="", encoding="utf-8", errors="ignore") as f:
         r = csv.DictReader(f)
         for row in r:
             rows.append(row)
     return rows[-limit:]
 
-# ---------- Checks ----------
-def check_feed_stale():
-    # Only alert on staleness during RTH
-    if not is_rth_now():
-        return None
-    bar = load_last_bar_age()
-    if not bar:
-        return "⚠️ Feed missing — no CSV found."
-    if bar["age"] > STALE_SEC:
-        mins = int(bar["age"] // 60)
-        return f"⚠️ Feed stale — no new bars for {mins}m (last bar {bar['ts']})."
-    return None
-
-def check_oos_failure():
-    if not OOS_LOG.exists():
-        return "⚠️ OOS log missing."
-    try:
-        last = _read_last_line(OOS_LOG)
-        if not last:
-            return "⚠️ OOS log empty."
-        parts = last.split(",")
-        rc = 0
-        if len(parts) > IDX["rc"]:
-            try:
-                rc = int(float(parts[IDX['rc']]))
-            except Exception:
-                rc = 0
-        if rc != 0:
-            return f"🛑 OOS loop crashed (rc={rc}). Check logs/oos_loop.out"
-    except Exception:
-        return "⚠️ OOS parse error."
-    return None
-
-def check_performance_warning():
-    if not OOS_LOG.exists():
-        return None
-    try:
-        rows = _tail_rows(OOS_LOG, max(HIST_RUNS, PF_DROP_WINDOW))
-        if not rows:
-            return None
-
-        # A) relative PF drop over PF_DROP_WINDOW
-        pf_window = []
-        for r in rows[-PF_DROP_WINDOW:]:
-            if len(r) <= IDX["ProfitFactor"]:
-                continue
-            v = _to_float(r[IDX["ProfitFactor"]])
-            if v is not None:
-                pf_window.append(v)
-        if len(pf_window) >= 5:
-            peak = max(pf_window)
-            curr = pf_window[-1]
-            if peak > 0 and (peak - curr) / peak >= PF_DROP_PCT:
-                return f"🔻 PF drop: {curr:.2f} from peak {peak:.2f} (>{int(PF_DROP_PCT*100)}% decline)"
-
-        # B) avg PF / Expect over last HIST_RUNS
-        tail = rows[-HIST_RUNS:]
-        pf_vals, exp_vals = [], []
-        for r in tail:
-            if len(r) > IDX["ProfitFactor"]:
-                v = _to_float(r[IDX["ProfitFactor"]])
-                if v is not None:
-                    pf_vals.append(v)
-            if len(r) > IDX["Expectancy"]:
-                v = _to_float(r[IDX["Expectancy"]])
-                if v is not None:
-                    exp_vals.append(v)
-
-        if pf_vals and exp_vals:
-            pf_avg  = sum(pf_vals) / len(pf_vals)
-            exp_avg = sum(exp_vals) / len(exp_vals)
-            if pf_avg < PF_WARN or exp_avg < EXP_WARN:
-                return f"⚠️ Performance dip: PF={pf_avg:.2f}, Expect=${exp_avg:.2f} (avg of {len(pf_vals)} runs)"
-
-        # C) consecutive losing EXITs from backtest_trades.csv (optional)
-        try:
-            trows = load_trades(limit=500)
-            exits = [r for r in trows if (r.get("action") or "").upper() == "EXIT"]
-            pnl_key = next((k for k in ("pnl","PnL","pnl_net","net_pnl","profit")
-                            if exits and k in exits[0].keys()), None)
-            if pnl_key:
-                streak = 0
-                for r in exits:
-                    v = _to_float(r.get(pnl_key))
-                    v = v if v is not None else 0.0
-                    if v <= 0:
-                        streak += 1
-                    else:
-                        streak = 0
-                if streak >= 3:
-                    return f"⚠️ Loss streak: {streak} consecutive losing exits"
-        except Exception:
-            pass
-
-    except Exception:
-        return None
-    return None
-
-def daily_summary():
-    """One-line summary using the *latest* OOS row."""
-    if not OOS_LOG.exists():
-        return None
-    try:
-        last = _read_last_line(OOS_LOG)
-        if not last:
-            return None
-        parts = last.split(",")
-        if len(parts) <= IDX["MaxDrawdown"]:
-            return None
-        trades = parts[IDX["Trades"]]
-        win    = parts[IDX["WinRate"]]
-        pf     = parts[IDX["ProfitFactor"]]
-        exp    = parts[IDX["Expectancy"]]
-        pnl    = parts[IDX["NetPnL"]]
-        now_ct = datetime.now(CT).strftime('%a %m/%d %I:%M %p CT')
-        return f"📊 Daily Summary — {now_ct}\nTrades={trades} | Win%={win} | PF={pf} | Expect=${exp} | NetPnL=${pnl}"
-    except Exception:
-        return None
-
-# ---------- Daily analytics ----------
-def rebuild_daily_perf_and_streaks():
+def load_daily_from_oos(oos_path: Path) -> list[dict]:
     """
-    Build logs/daily_perf.csv (UTC date-bucket) and logs/streaks.txt (win/loss streaks by daily NetPnL sign).
-    Returns (daily_rows, streaks_dict)
+    Convert <logs/oos_log_*.csv> into the same 'daily' structure rebuild_daily_perf_and_streaks() returns.
     """
-    if not OOS_LOG.exists():
-        return [], {"current": 0, "current_type": "none", "best_win": 0, "best_loss": 0}
-
-    # Load all rows
-    rows = _tail_rows(OOS_LOG, 0)
+    rows = _tail_rows(oos_path, 0)
     if not rows:
-        return [], {"current": 0, "current_type": "none", "best_win": 0, "best_loss": 0}
-
-    # Group by UTC date from timestamp col
+        return []
     buckets = {}
     for r in rows:
         if len(r) <= IDX["MaxDrawdown"]:
             continue
         ts_str = r[IDX["timestamp"]]
         try:
-            # e.g., 2025-10-28T20:54:52
-            ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
         except Exception:
-            # best-effort: treat as naive UTC
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                else:
-                    ts = ts.astimezone(timezone.utc)
-            except Exception:
-                continue
+            continue
         day = ts.date().isoformat()
-
         buckets.setdefault(day, []).append(r)
 
     daily = []
     for day in sorted(buckets.keys()):
         rs = buckets[day]
-        trades = 0
-        wins = 0
-        losses = 0
-        pnl_sum = 0.0
-        gross_win = 0.0
-        gross_loss = 0.0
+        trades = wins = losses = 0
+        pnl_sum = gross_win = gross_loss = 0.0
         for r in rs:
             t = _to_float(r[IDX["Trades"]]) or 0
             trades += int(t)
@@ -318,7 +204,7 @@ def rebuild_daily_perf_and_streaks():
                 gross_loss += abs(pnl)
         winrate = round(100.0 * wins / max(1, wins + losses), 2)
         if gross_loss == 0 and gross_win > 0:
-            pf = float('inf')
+            pf = float("inf")
         elif gross_loss == 0 and gross_win == 0:
             pf = 0.0
         else:
@@ -333,158 +219,242 @@ def rebuild_daily_perf_and_streaks():
             "profit_factor": pf,
             "net_pnl": round(pnl_sum, 2),
         })
+    return daily
 
-    # Write logs/daily_perf.csv
-    out_csv = Path("logs/daily_perf.csv")
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = ["date","runs","trades","wins","losses","winrate_pct","profit_factor","net_pnl"]
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in daily:
-            w.writerow(r)
+# ---------------------------------------------------------------------
+# per-symbol checks (take symbol + paths!)
+# ---------------------------------------------------------------------
+def check_feed_stale_for(symbol: str) -> str | None:
+    csv_path = Path(f"data/{symbol}_live_1m.csv") if symbol != "MES" else DATA_CSV
+    if not is_rth_now():
+        return None
+    bar = load_last_bar_age(csv_path)
+    if not bar:
+        return f"⚠️ {symbol}: Feed missing — no CSV found."
+    if bar["age"] > STALE_SEC:
+        mins = int(bar["age"] // 60)
+        return f"⚠️ {symbol}: Feed stale — no new bars for {mins}m (last bar {bar['ts']})."
+    return None
 
-    # Compute streaks from daily net_pnl sign
-    def sign(x: float) -> int:
-        return 1 if x > 0 else (-1 if x < 0 else 0)
+def check_oos_failure_for(symbol: str, oos_path: Path) -> str | None:
+    if not oos_path.exists():
+        return f"⚠️ {symbol}: OOS log missing."
+    try:
+        last = _read_last_line(oos_path)
+        if not last:
+            return f"⚠️ {symbol}: OOS log empty."
+        parts = last.split(",")
+        rc = 0
+        if len(parts) > IDX["rc"]:
+            try:
+                rc = int(float(parts[IDX["rc"]]))
+            except Exception:
+                rc = 0
+        if rc != 0:
+            return f"🛑 {symbol}: OOS loop crashed (rc={rc}). Check logs/oos_loop.out"
+    except Exception:
+        return f"⚠️ {symbol}: OOS parse error."
+    return None
 
-    current = 0
-    current_type = 0
-    best_win = 0
-    best_loss = 0
-    for d in sorted(daily, key=lambda x: x["date"]):
-        s = sign(float(d["net_pnl"]))
-        if s == 0:
-            current = 0
-            current_type = 0
+def check_performance_warning_for(symbol: str, oos_path: Path) -> str | None:
+    if not oos_path.exists():
+        return None
+    rows = _tail_rows(oos_path, max(HIST_RUNS, PF_DROP_WINDOW))
+    if not rows:
+        return None
+
+    # A) PF drop
+    pf_window = []
+    for r in rows[-PF_DROP_WINDOW:]:
+        if len(r) <= IDX["ProfitFactor"]:
             continue
-        if current == 0:
-            current = 1
-            current_type = s
-        elif s == current_type:
-            current += 1
+        v = _to_float(r[IDX["ProfitFactor"]])
+        if v is not None:
+            pf_window.append(v)
+    if len(pf_window) >= 5:
+        peak = max(pf_window)
+        curr = pf_window[-1]
+        if peak > 0 and (peak - curr) / peak >= PF_DROP_PCT:
+            return f"🔻 {symbol}: PF drop {curr:.2f} from peak {peak:.2f} (>{int(PF_DROP_PCT*100)}% decline)"
+
+    # B) avg PF/Expect
+    tail = rows[-HIST_RUNS:]
+    pf_vals, exp_vals = [], []
+    for r in tail:
+        if len(r) > IDX["ProfitFactor"]:
+            v = _to_float(r[IDX["ProfitFactor"]])
+            if v is not None:
+                pf_vals.append(v)
+        if len(r) > IDX["Expectancy"]:
+            v = _to_float(r[IDX["Expectancy"]])
+            if v is not None:
+                exp_vals.append(v)
+
+    if pf_vals and exp_vals:
+        pf_avg  = sum(pf_vals) / len(pf_vals)
+        exp_avg = sum(exp_vals) / len(exp_vals)
+        if pf_avg < PF_WARN or exp_avg < EXP_WARN:
+            return f"⚠️ {symbol}: Performance dip: PF={pf_avg:.2f}, Expect=${exp_avg:.2f} (avg {len(pf_vals)})"
+
+    # C) loss streak from trades CSV
+    try:
+        trows = load_trades(symbol, limit=500)
+        exits = [r for r in trows if (r.get("action") or "").upper() == "EXIT"]
+        if exits:
+            pnl_key = next(
+                (k for k in ("pnl","PnL","pnl_net","net_pnl","profit") if k in exits[0]),
+                None
+            )
         else:
-            if current_type == 1:
-                best_win = max(best_win, current)
-            elif current_type == -1:
-                best_loss = max(best_loss, current)
-            current = 1
-            current_type = s
-    # flush tail
-    if current_type == 1:
-        best_win = max(best_win, current)
-    elif current_type == -1:
-        best_loss = max(best_loss, current)
+            pnl_key = None
+        if pnl_key:
+            streak = 0
+            for r in exits:
+                v = _to_float(r.get(pnl_key))
+                v = v if v is not None else 0.0
+                if v <= 0:
+                    streak += 1
+                else:
+                    streak = 0
+            if streak >= 3:
+                return f"⚠️ {symbol}: Loss streak {streak} consecutive losing exits"
+    except Exception:
+        pass
 
-    streaks = {"current": current, "current_type": "win" if current_type == 1 else ("loss" if current_type == -1 else "none"),
-               "best_win": best_win, "best_loss": best_loss}
+    return None
 
-    # Write logs/streaks.txt
-    out_txt = Path("logs/streaks.txt")
-    out_txt.parent.mkdir(parents=True, exist_ok=True)
-    out_txt.write_text(
-        f"Current streak: {streaks['current']} ({streaks['current_type']})\n"
-        f"Best win streak: {streaks['best_win']}\n"
-        f"Best loss streak: {streaks['best_loss']}\n"
-        f"Last date: {daily[-1]['date'] if daily else 'n/a'}\n",
-        encoding="utf-8",
+def daily_summary_for(symbol: str, oos_path: Path) -> str | None:
+    if not oos_path.exists():
+        return None
+    last = _read_last_line(oos_path)
+    if not last:
+        return None
+    parts = last.split(",")
+    if len(parts) <= IDX["MaxDrawdown"]:
+        return None
+    trades = parts[IDX["Trades"]]
+    win    = parts[IDX["WinRate"]]
+    pf     = parts[IDX["ProfitFactor"]]
+    exp    = parts[IDX["Expectancy"]]
+    pnl    = parts[IDX["NetPnL"]]
+    now_ct = datetime.now(CT).strftime('%a %m/%d %I:%M %p CT')
+    return (
+        f"📊 {symbol} Daily Summary — {now_ct}\n"
+        f"Trades={trades} | Win%={win} | PF={pf} | Expect=${exp} | NetPnL=${pnl}"
     )
-    return daily, streaks
 
-def _render_and_maybe_upload_charts(daily):
-    # --- Render all charts ---
-    render_daily_chart(daily, Path("logs/daily_perf.png"), days=45)
-    render_streak_chart(daily, Path("logs/streaks_history.png"), days=90)
+# ---------------------------------------------------------------------
+# charts per symbol
+# ---------------------------------------------------------------------
+def _render_and_maybe_upload_charts_for(symbol: str, daily: list[dict]) -> bool:
+    base = Path("logs/charts")
+    base.mkdir(parents=True, exist_ok=True)
 
-    # Friday-only weekly rollup
-    weekly_now = datetime.now(CT).weekday() == 4
-    if weekly_now:
-        render_weekly_chart(daily, Path("logs/weekly_perf.png"), weeks=26)
+    daily_png   = base / f"{symbol}_daily.png"
+    streaks_png = base / f"{symbol}_streaks.png"
+    weekly_png  = base / f"{symbol}_weekly.png"
+    equity_png = base / f"{symbol}_equity.png"
+    trades_png = base / f"{symbol}_trades.png"
 
-    # --- Optional upload ---
+    render_daily_chart(daily, daily_png, days=45, title_prefix=symbol)
+    render_streak_chart(daily, streaks_png, days=90, title_prefix=symbol)
+    render_equity_chart(daily, equity_png, title_prefix=symbol)
+    render_trades_chart(daily, trades_png, days=45, title_prefix=symbol)
+
+    weekly_now = False
+    if datetime.now(CT).weekday() == 4:
+        render_weekly_chart(daily, weekly_png, weeks=26, title_prefix=symbol)
+        weekly_now = True
+
     if os.environ.get("UPLOAD_CHART") == "1":
         to_send = [
-            ("logs/daily_perf.png",      "Daily Performance"),
-            ("logs/streaks_history.png", "Streaks History"),
+            (daily_png,   f"{symbol} Daily Performance"),
+            (streaks_png, f"{symbol} Streaks History"),
+            (equity_png,  f"{symbol} Equity Curve"),
+            (trades_png,  f"{symbol} Trades History"),
         ]
         if weekly_now:
-            to_send.append(("logs/weekly_perf.png", "Weekly NetPnL"))
+            to_send.append((weekly_png, f"{symbol} Weekly NetPnL"))
 
-        for img, title in to_send:
-            p = Path(img)
-            if not p.exists():
-                continue
-            try:
-                size = p.stat().st_size
-                if size < 5_000:  # skip small/corrupt renders
-                    print(f"[upload skip] {img} too small ({size} bytes)")
-                    continue
-            except Exception as e:
-                print(f"[upload error] stat({img}) failed: {e}")
-                continue
-
-            comment = f"{title} ({socket.gethostname()})"
-            rc = subprocess.run(
-                [sys.executable, "scripts/notify_slack_file.py",
-                 str(p), title, comment],
-                capture_output=True, text=True
-            )
-            print(f"[upload rc={rc.returncode}] {rc.stdout or rc.stderr}".strip())
-
+        for png_path, title in to_send:
+            if png_path.exists():
+                comment = f"{title} ({socket.gethostname()})"
+                try:
+                    rc = subprocess.run(
+                        [sys.executable, "scripts/notify_slack_file.py",
+                        str(png_path), title, comment],
+                        capture_output=True, text=True
+                    )
+                    if rc.returncode != 0:
+                        print(f"[upload {symbol} rc={rc.returncode}] {rc.stdout or rc.stderr}".strip())
+                except Exception as e:
+                    print(f"[upload {symbol} ERROR] {e}")
+                print(f"[upload {symbol} rc={rc.returncode}] {rc.stdout or rc.stderr}".strip())
     return weekly_now
 
-# ---------- Main ----------
+# ---------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------
 def main():
     _lock = _acquire_lock()
-    # CLI flags
     do_summary  = "--summary" in sys.argv
-    do_rebuild  = "--rebuild-daily" in sys.argv  # analytics-only mode
+    do_rebuild  = "--rebuild-daily" in sys.argv
 
-    daily, streaks = rebuild_daily_perf_and_streaks()
+    alerts = []
+    weekly_any = False
+
+    # If user said SYMBOL=MNQ make alerts, allow single-symbol mode
+    if ENV_SYMBOL != "ALL":
+        active_symbols = [(s, p) for (s, p) in SYMBOLS if s == ENV_SYMBOL]
+        # if they asked for MNQ but we don't have its log yet, fall back to MES
+        if not active_symbols:
+            active_symbols = [SYMBOLS[0]]
+    else:
+        active_symbols = SYMBOLS
 
     if do_rebuild:
-        #chart + optional upload, then exit
-        weekly_now = _render_and_maybe_upload_charts(daily)
-        if weekly_now:
-            alerts.append("🗓️ Weekly roll-up posted with charts.")
-        print(f"[OK] Rebuilt daily_perf.csv (rows={len(daily)}) and streaks.txt ({streaks})")
+        for sym, oos_path in active_symbols:
+            daily = load_daily_from_oos(oos_path)
+            weekly_now = _render_and_maybe_upload_charts_for(sym, daily)
+            if weekly_now:
+                alerts.append(f"🗓️ {sym}: Weekly roll-up posted.")
+        print(f"[OK] Rebuilt for {[s for s,_ in active_symbols]}")
+        # if they only wanted rebuild, don't spam slack
         return
 
-        
+    # normal alerts path
+    for sym, oos_path in active_symbols:
+        # per-symbol checks
+        m = check_feed_stale_for(sym)
+        if m: alerts.append(m)
 
-    # -------- Normal alerts path --------
-    alerts = []
-    for func in (check_feed_stale, check_oos_failure, check_performance_warning):
-        msg = func()
-        if msg:
-            alerts.append(msg)
+        m = check_oos_failure_for(sym, oos_path)
+        if m: alerts.append(m)
 
-    if do_summary:
-        summary = daily_summary()
-        if summary:
-            alerts.append(summary)
+        m = check_performance_warning_for(sym, oos_path)
+        if m: alerts.append(m)
 
-    # Always rebuild daily metrics + chart on every run
-    weekly_now = _render_and_maybe_upload_charts(daily)
-    if weekly_now:
+        if do_summary:
+            m = daily_summary_for(sym, oos_path)
+            if m: alerts.append(m)
+
+        # charts + maybe upload
+        daily = load_daily_from_oos(oos_path)
+        if daily:
+            if _render_and_maybe_upload_charts_for(sym, daily):
+                weekly_any = True
+
+    if weekly_any:
         alerts.append("📈 Weekly roll-up posted with charts.")
 
-
-    # Append streaks line
-    alerts.append(
-        f"Streaks — current={streaks['current']} ({streaks['current_type']}), "
-        f"best_win={streaks['best_win']}, best_loss={streaks['best_loss']}"
-    )
-
+    # print + send
     print(f"[OK] alerts check @ {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     if not alerts:
         print("[OK] No alerts triggered.")
         return
 
     final_msg = "\n".join(alerts)
-    print(final_msg)
     final_msg = f"[*{socket.gethostname()}*]\n" + final_msg
-    final_msg += "\n(Chart saved: logs/daily_perf.png)"
 
     key = f"alerts_text::{socket.gethostname()}"
     if _changed(key, final_msg):

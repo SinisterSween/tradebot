@@ -9,6 +9,29 @@ from trader.engine.latency import BarDelay
 from trader.engine.metrics_ext import summarize_equity, write_artifacts
 import matplotlib
 
+def _compute_size_from_equity(symbol, equity, risk_pct, stop_ticks, tick_value, last_price, max_size):
+    # equities / ETF path
+    if symbol in ("SPY", "QQQ"):
+        if last_price <= 0:
+            return 0
+        # how many shares can I afford?
+        affordable = int(equity // last_price)
+        return max(0, min(affordable, max_size))
+
+    # futures-style path
+    risk_capital = equity * risk_pct
+    if not stop_ticks or stop_ticks <= 0 or not tick_value:
+        # fallback: 1, but respect max_size
+        return max(0, min(1, max_size))
+
+    risk_per_contract = stop_ticks * tick_value
+    if risk_per_contract <= 0:
+        return max(0, min(1, max_size))
+
+    raw = int(risk_capital // risk_per_contract)
+    return max(0, min(raw, max_size))
+
+
 def _deep_merge(a, b):
     out = dict(a or {})
     for k, v in (b or {}).items():
@@ -76,6 +99,7 @@ def main(args):
         raise FileNotFoundError(
             f"CSV not found. Pass --csv or set data.csv_path in config. Got: {csv_path}"
         )
+    equity = args.starting_equity
 
     # ---- Prep bars ----
     tz = cfg.get("timezone", "America/Chicago")
@@ -85,18 +109,21 @@ def main(args):
 
     # ---- Risk / fees ----
     fees = cfg["fees"]
-    base_eq = cfg["risk"]["account_equity"]
+    yaml_risk = cfg["risk"]
+    
     risk = RiskGovernor(RiskConfig(
-        account_equity=cfg["risk"]["account_equity"],
-        risk_pct=cfg["risk"]["risk_pct"],
-        max_daily_loss_R=cfg["risk"]["max_daily_loss_R"],
-        max_consec_losses=cfg["risk"]["max_consec_losses"],
+        account_equity=yaml_risk["account_equity"],
+        risk_pct=args.risk_pct or yaml_risk["risk_pct"],
+        max_daily_loss_R=yaml_risk["max_daily_loss_R"],
+        max_consec_losses=yaml_risk["max_consec_losses"],
         tick_value=fees["tick_value"],
-        flat_time=cfg["risk"]["flat_time"],
-        news_lockout_minutes=cfg["risk"]["news_lockout_minutes"],
+        flat_time=yaml_risk["flat_time"],
+        news_lockout_minutes=yaml_risk["news_lockout_minutes"],
     ))
     risk.risk_buffer_pct = float(cfg.get("risk", {}).get("risk_buffer_pct", 1.0))
     risk.max_contracts_per_trade = int(cfg["risk"].get("max_contracts_per_trade", 0)) or None
+
+    base_eq = args.starting_equity
 
     dpp = fees["tick_value"] / fees["tick_size"]  # dollars per full point
     om = OrderManager(
@@ -234,7 +261,7 @@ def main(args):
                                 pass
                     except Exception:
                         pass
-
+                    equity += pnl
             # reset open state either way
             open_position = False
             current_bracket = None
@@ -272,6 +299,12 @@ def main(args):
                 side_mult = 1.0 if str(exit_info["side"]).upper() == "BUY" else -1.0
                 R = (pnl_pts / risk_pts) * side_mult
                 risk.record_trade_outcome_R(R)
+
+                if om.trades:
+                    last_exit = om.trades[-1]
+                    pnl_usd = float(last_exit.get("pnl", 0.0) or 0.0)
+                    fees_usd = float(last_exit.get("fees_total", 0.0) or 0.0)
+                    equity += (pnl_usd - fees_usd)
 
                 # clear state
                 open_position = False
@@ -329,6 +362,7 @@ def main(args):
                         "pnl": pnl,
                         "fees_total": 0.0,
                     })
+                    
                     # NEW: record R for the TIME exit using the stored initial risk
                     try:
                         if open_risk_pts and float(open_risk_pts) > 0:
@@ -336,9 +370,10 @@ def main(args):
                             R = pnl_pts / float(open_risk_pts)
                             risk.record_trade_outcome_R(R)
                             om.trades[-1]["R"] = float(R)   # stash R on the row for auditing
+                            
                     except Exception:
                         pass
-
+                    equity += pnl
                 # clear state
                 open_position = False
                 current_bracket = None
@@ -368,6 +403,31 @@ def main(args):
                     else:
                         sig["bracket"].stop_price = entry + tick_size
                     stop = float(sig["bracket"].stop_price)
+
+                # === CAPITAL-AWARE SIZING ===
+                if equity < args.min_equity:
+                    # can't trade, too low
+                    continue
+
+                # how many ticks of risk?
+                stop_ticks = abs(entry - stop) / tick_size if tick_size else 0
+                size = _compute_size_from_equity(
+                    symbol=args.symbol,
+                    equity=equity,
+                    risk_pct=args.risk_pct,
+                    stop_ticks=stop_ticks,
+                    tick_value=fees["tick_value"],
+                    last_price=bar["close"],
+                    max_size=args.max_size,
+                )
+                if size < 1:
+                    # can't afford it
+                    continue
+
+                # override the order/bracket qty to what we computed
+                sig["order"].qty = size
+                if hasattr(sig["bracket"], "qty"):
+                    sig["bracket"].qty = size
 
                 if delay.bars > 0:
                     delay.submit(i, sig["order"])
@@ -406,14 +466,22 @@ def main(args):
 
     curve = equity_curve(om.trades)  # cumulative PnL series
     pnl_series = curve
-    equity_series = base_eq + pnl_series
-
-    if isinstance(equity_series.index, pd.DatetimeIndex) and isinstance(df.index, pd.DatetimeIndex):
-        equity_full = equity_series.reindex(df.index, method="ffill").fillna(base_eq)
+    
+    final_equity = float(equity)
+    if len(df.index) > 0:
+        equity_series = pd.Series([final_equity], index=[df.index[-1]])
+        equity_full = pd.Series(index=df.index, dtype=float)
+        equity_full.iloc[0] = args.starting_equity
+        equity_full = equity_full.ffill().fillna(args.starting_equity)
+        equity_full.iloc[-1] = final_equity
     else:
+        equity_series = pd.Series([final_equity])
         equity_full = equity_series
 
-    total_pnl = float(pnl_series.iloc[-1]) if not pnl_series.empty else 0.0
+    if not pnl_series.empty:
+        total_pnl = float(pnl_series.iloc[-1])
+    else: 
+        total_pnl = 0.0
     winners = [t for t in om.trades if t.get("action") == "EXIT" and t.get("pnl", 0) > 0]
     losers  = [t for t in om.trades if t.get("action") == "EXIT" and t.get("pnl", 0) <= 0]
     hit_rate = (len(winners) / max(1, len(winners) + len(losers))) * 100.0
@@ -479,12 +547,13 @@ def main(args):
             plt.show()
         plt.close(fig2)
 
+
     # --- Summary & artifacts (attach exit metrics here so they land in summary.json) ---
     summary = summarize_equity(equity_full, trades_df)
     if extra_summary:
         summary.update(extra_summary)
 
-    
+    summary["EndEquity"] = float(equity)
 
     write_artifacts(equity_full, trades_df, summary, logs_dir="logs")
 
@@ -503,7 +572,7 @@ if __name__ == "__main__":
     ap.add_argument("--profile", default="config/profile/futures.yaml")
     ap.add_argument("--env", default=None, help="Optional env yaml to merge")
     ap.add_argument("--config", default=None, help="Optional extra yaml to merge last")
-    ap.add_argument("--symbol", default="MES", choices=["ES", "MES", "SPY", "QQQ"])
+    ap.add_argument("--symbol", default="MES", choices=["ES", "MES", "MNQ", "SPY", "QQQ"])
     ap.add_argument("--csv", dest="csv", help="CSV path for backtest (overrides config.data.csv_path)")
     ap.add_argument("--no-gui", action="store_true")
     ap.add_argument("--latency-bars", type=int, default=0)
@@ -511,6 +580,10 @@ if __name__ == "__main__":
     ap.add_argument("--fee-fixed", type=float, default=0.0)
     ap.add_argument("--slip-bps", type=float, default=0.5)
     ap.add_argument("--kill-dd", type=float, default=0.15)   # kept for parity; not wired unless your RiskGovernor reads it
-    ap.add_argument("--kill-day", type=float, default=0.05)  # same note
+    ap.add_argument("--kill-day", type=float, default=0.05)
+    ap.add_argument("--starting-equity", type=float, default=25000.0, help="starting account equity for capital-aware backtests")
+    ap.add_argument("--risk-pct", type=float, default=0.01, help="fraction of equity to risk per trade (futures path)")
+    ap.add_argument("--max-size", type=int, default=3, help="hard cap on contracts/shares")
+    ap.add_argument("--min-equity", type=float, default=0.0, help="skip trades if equity drops below this")  # same note
     args = ap.parse_args()
     main(args)

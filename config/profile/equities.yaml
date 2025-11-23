@@ -1,13 +1,14 @@
+# config/profile/equities.yaml
 ibkr:
-  use_delayed: false
   what_to_show: TRADES
   bar_size_secs: 60
+
 execution:
   avoid_market_orders: true
   limit_slippage_ticks: 2
-  tif: DAY
-  outside_rth: false
-  use_rtb_for_equities: false
+  tif: DAY           # <- different from futures
+  outside_rth: false # <- different from futures
+
 strategy:
   orb_minutes: 5
   atr_len: 14
@@ -18,4 +19,4 @@ strategy:
   stop_pad_ticks: 1
   trail_pad_ticks: 1
   session_windows:
-    - ["08:31", "15:55"]
+    - ["09:30", "16:00"]   # <- equities hours

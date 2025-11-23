@@ -17,21 +17,36 @@ DEF_SLEEP_SEC    = int(os.getenv("SLEEP_SEC", "60"))
 DEF_KEEP_DAYS    = int(os.getenv("KEEP_DAYS", "90"))
 DEF_OUTFILE      = os.getenv("OUTFILE", f"data/{DEF_SYMBOL}_live_1m.csv")
 
+
 import pandas as pd
 
 def to_utc_aware(x):
+    """
+    Make *anything* UTC tz-aware:
+    - Series
+    - DatetimeIndex
+    - single Timestamp
+    - scalar datetime
+    """
     v = pd.to_datetime(x, errors="coerce")
+
+    # Series / Index
     if hasattr(v, "dt"):
+        # v is Series-like
         if v.dt.tz is None:
             return v.dt.tz_localize("UTC")
         else:
             return v.dt.tz_convert("UTC")
+
+    # single Timestamp
     if isinstance(v, pd.Timestamp):
         if v.tz is None:
             return v.tz_localize("UTC")
         else:
             return v.tz_convert("UTC")
+
     return v
+
 
 def log(msg: str, symbol: str):
     p = Path(f"logs/shadow_{symbol.lower()}.out")
@@ -42,10 +57,13 @@ def log(msg: str, symbol: str):
     with p.open("a") as f:
         f.write(line)
 
+
 def ensure_dirs(path: str):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
+
+
 
 def df_from_bars(bars):
     df = util.df(bars)
@@ -56,26 +74,9 @@ def df_from_bars(bars):
     df["datetime"] = to_utc_aware(df["datetime"])
     return df
 
-# === NEW: generic resolver ==================================================
-def resolve_contract(ib: IB, symbol: str, exchange: str):
-    """
-    Futures → your old front-month resolver
-    Equities/ETFs → SMART/USD stock
-    """
-    s = symbol.upper()
-
-    # futures path
-    if s in ("ES", "MES", "NQ", "MNQ", "YM", "MYM", "CL", "MCL"):
-        return resolve_front_month(ib, s, exchange)
-
-    # otherwise treat as stock/ETF
-    stock = Stock(s, "SMART", "USD")
-    cd = ib.reqContractDetails(stock)
-    if not cd:
-        raise RuntimeError(f"Could not resolve stock/ETF for {s}")
-    return cd[0].contract
 
 def resolve_front_month(ib: IB, symbol: str, exchange: str):
+    # try continuous first
     cf = ContFuture(symbol, exchange=exchange)
     cds = ib.reqContractDetails(cf)
     if cds:
@@ -86,12 +87,14 @@ def resolve_front_month(ib: IB, symbol: str, exchange: str):
             fut_cd = ib.reqContractDetails(fut)
             if fut_cd:
                 return fut_cd[0].contract
+    # fallback: get a list of futures and pick the nearest
     f = Future(symbol, exchange=exchange)
     cds2 = ib.reqContractDetails(f)
     if cds2:
         cds2.sort(key=lambda c: c.contract.lastTradeDateOrContractMonth or "999999")
         return cds2[0].contract
     raise RuntimeError(f"Cannot resolve front month for {symbol} on {exchange}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -118,16 +121,11 @@ def main():
     if not ok:
         log("[FATAL] could not connect to IB/TWS", symbol)
         return
-    # 3 = delayed if live not available
     ib.reqMarketDataType(3)
 
-    # --- resolve contract (now supports SPY/QQQ) ---
     try:
-        con = resolve_contract(ib, symbol, args.exchange)
-        # futures have localSymbol; stocks do too but may be just 'SPY'
-        ls = getattr(con, "localSymbol", symbol)
-        ltm = getattr(con, "lastTradeDateOrContractMonth", "")
-        log(f"[CONTRACT] {ls} conId={con.conId} {('LTM='+ltm) if ltm else ''}", symbol)
+        con = resolve_front_month(ib, symbol, args.exchange)
+        log(f"[CONTRACT] {con.localSymbol} conId={con.conId} LTM={con.lastTradeDateOrContractMonth}", symbol)
     except Exception as e:
         log(f"[FATAL] could not resolve {symbol} on {args.exchange}: {e}", symbol)
         return
@@ -166,20 +164,24 @@ def main():
                     keepUpToDate=False,
                 )
 
-                df = df_from_bars(bars)
+                df = df_from_bars(bars)  # this must already call to_utc_aware
                 if df.empty:
                     log("[WARN] Empty slice; will retry…", symbol)
                 else:
+                    # 1) normalize existing
                     if not all_df.empty:
                         all_df["datetime"] = to_utc_aware(all_df["datetime"])
 
+                    # 2) get last_old and last_new using ONLY the helper
                     if all_df.empty:
-                        last_old = to_utc_aware(pd.Timestamp.min)
+                        last_old = pd.Timestamp.min  # <- NAIVE on purpose
+                        last_old = to_utc_aware(last_old)  # <- now UTC aware
                     else:
                         last_old = to_utc_aware(all_df["datetime"].max())
 
                     last_new = to_utc_aware(df["datetime"].max())
 
+                    # 3) compare
                     if last_new <= last_old:
                         log(f"[NOOP] No new bars (last={last_old})", symbol)
                     else:
@@ -194,8 +196,10 @@ def main():
                                 .reset_index(drop=True)
                             )
 
+                        # 4) prune with UTC-aware cutoff
                         if args.keep_days > 0:
-                            cutoff = to_utc_aware(pd.Timestamp.utcnow()) - pd.Timedelta(days=args.keep_days)
+                            cutoff = pd.Timestamp.utcnow()
+                            cutoff = to_utc_aware(cutoff) - pd.Timedelta(days=args.keep_days)
                             all_df = all_df[all_df["datetime"] >= cutoff]
 
                         all_df.to_csv(args.out, index=False)
@@ -206,6 +210,7 @@ def main():
 
             time.sleep(args.sleep_sec)
 
+
     except KeyboardInterrupt:
         log("[STOP] keyboard interrupt; disconnecting", symbol)
     finally:
@@ -213,6 +218,7 @@ def main():
             ib.disconnect()
         except Exception:
             pass
+
 
 if __name__ == "__main__":
     main()

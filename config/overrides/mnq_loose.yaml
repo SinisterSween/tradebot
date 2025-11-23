@@ -1,0 +1,13 @@
+strategy:
+  atr_mult: 0.55        
+  slope_min: 0.035      
+execution:
+  avoid_market_orders: true
+  limit_slippage_ticks: 2
+  tif: GTC
+  outside_rth: true
+fees:
+  tick_size: 0.25
+  tick_value: 0.50
+  commission_per_contract: 0.50
+  exchange_fees_per_contract: 0.00

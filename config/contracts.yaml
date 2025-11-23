@@ -16,12 +16,22 @@ MES:
   commission_per_contract: 0.50
   exchange_fees_per_contract: 0.00
 
+MNQ:
+  symbol: "MNQ"
+  exchange: CME
+  currency: USD
+  tick_size: 0.25
+  tick_value: 0.50
+  commission_per_contract: 0.50
+  exchange_fees_per_contract: 0.00
+
+
 SPY:
   symbol: SPY
   exchange: SMART
   currency: USD
   tick_size: 0.01
-  tick_value: 0.01           
+  tick_value: 1.00           
   commission_per_contract: 0.005
   exchange_fees_per_contract: 0.00
 
@@ -30,7 +40,7 @@ QQQ:
   exchange: SMART
   currency: USD
   tick_size: 0.01
-  tick_value: 0.01
+  tick_value: 1.00
   commission_per_contract: 0.005
   exchange_fees_per_contract: 0.00
 
