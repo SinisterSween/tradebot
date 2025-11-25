@@ -1,0 +1,4 @@
+symbols: ["BTC/USDC","ETH/USDC","SOL/USDC","MATIC/USDC"]
+tick_size: 0.01
+point_value: 1
+trade_min_qty: 0.001   # 0.001 BTC ~ $30

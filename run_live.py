@@ -4,6 +4,11 @@ from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from contextlib import suppress
 from trader.telemetry.metrics import data_age_seconds
+import asyncio, yaml, pandas as pd, signal, sys, argparse, os, json, csv
+from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+from contextlib import suppress
+from typing import List, Dict, Any
 # --- make ib_insync play nicely with asyncio ---
 try:
     from ib_insync import util as ib_util
@@ -12,6 +17,8 @@ except Exception:
     pass
 
 from trader.brokers.ibkr import IbkrBroker
+from trader.brokers.ibkr_fractional import IbkrFractional
+from trader.brokers.ccxt_binanceus import CcxtBinanceus
 from trader.engine.risk import RiskConfig, RiskGovernor
 from trader.engine.backtest import prepare_bars
 from trader.strategies.hybrid_orb_vwap import HybridOrbVwap, StratConfig
@@ -110,6 +117,8 @@ def _expected_profile_for_symbol(sym: str) -> str:
     return "futures" if s in FUT else "equities"
 
 async def main(*, args):
+    if args.portfolio:
+        return await run_portfolio(args)
     # after cfg is built and before the rest of your logic
     symbol = getattr(args, "symbol", "MES")
 
@@ -399,6 +408,8 @@ async def main(*, args):
                 prev_date = bar_i["date"]
 
             # optionally honor session window unless --dry-run-ignore-gates
+            ap.add_argument("--portfolio", default=None,
+                help="Run a multi-asset micro-lot portfolio (config/portfolios/<name>.yaml)")
             if not dry_run_ignore_gates and not risk_replay.can_trade_now(bar_i["t_local"]):
                 continue
 
@@ -752,6 +763,137 @@ async def main(*, args):
         last_sig_idx = len(fdf) - 1
     await shutdown()
     return 
+# ------------------------------------------------------------------
+# Portfolio-mode launcher
+# ------------------------------------------------------------------
+async def run_portfolio(args):
+    import signal
+    def ask_exit(*_):
+        for t in tasks:
+            t.cancel()
+    signal.signal(signal.SIGINT, ask_exit)
+    
+    portfolio_file = f"config/portfolios/{args.portfolio}.yaml"
+    if not os.path.exists(portfolio_file):
+        print(f"[PORTFOLIO] file not found: {portfolio_file}")
+        sys.exit(2)
+
+    with open(portfolio_file) as f:
+        pf = yaml.safe_load(f)
+
+    tasks: List[asyncio.Task] = []
+    for i, lot in enumerate(pf.get("microlots", [])):
+        tasks.append(asyncio.create_task(run_microlot(lot, args.dry_run,
+                                                      client_id=2+i)))
+
+    print(f"[PORTFOLIO] started {len(tasks)} microlots")
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int):
+    """
+    Run a *single* microlot (EQ-SWI, CRYPTO, etc.) in its own event-loop task.
+    Each gets its own broker instance, risk governor, rolling bars, etc.
+    """
+    stop = asyncio.Event()
+    name = lot["name"]
+    print(f"[{name}] starting")
+
+    # 1. pick broker class
+    broker_map = {
+        "ibkr": IbkrBroker,
+        "ibkr_fractional": IbkrFractional,
+        "binanceus": CcxtBinanceus,
+    }
+    broker_cls = broker_map.get(lot["broker"])
+    if broker_cls is None:
+        raise ValueError(f"Unknown broker {lot['broker']}")
+
+    # 2. load universe
+    uni_path = f"config/universes/{lot['universe']}.yaml"
+    with open(uni_path) as f:
+        uni = yaml.safe_load(f)
+    symbols = uni["symbols"]
+
+    # 3. broker connect
+    if lot["broker"] == "binanceus":
+        api_key = os.getenv("BINANCEUS_API_KEY")
+        secret  = os.getenv("BINANCEUS_SECRET")
+        if not api_key or not secret:
+            print(f"[{name}] missing BINANCEUS keys – skipping")
+            return
+        broker = broker_cls(api_key, secret, sandbox=False)
+    else:  # IBKR paths
+        # minimal IBKR config stub (host/port/account) – load from env or hard-coded
+        broker = broker_cls("127.0.0.1", 7497, client_id)  # clientId=2,3,4… per task
+
+    await broker.connect()
+    if hasattr(broker, "set_market_data_type"):
+        broker.set_market_data_type(3)  # delayed for safety
+
+    # 4. resolve first symbol (simplest: rotate later)
+    symbol = symbols[0]
+    await broker.resolve_contract(symbol)
+
+    # 5. rolling bars + strategy (reuse your existing classes)
+    from trader.strategies.hybrid_orb_vwap import HybridOrbVwap, StratConfig
+    from trader.engine.risk import RiskConfig, RiskGovernor
+    from trader.engine.backtest import prepare_bars
+
+    orb_min = 15
+    rb = RollingBars("America/Chicago", orb_min, symbol)
+    strat_cfg = StratConfig(
+        orb_minutes=orb_min,
+        atr_len=14,
+        break_eps_ticks=2,
+        atr_mult=1.0,
+        target_R=1.0,
+        slope_min=0,
+        stop_pad_ticks=2,
+        trail_pad_ticks=2,
+        tick_size=0.01,
+        tick_value=0.01,
+    )
+    strat = HybridOrbVwap(strat_cfg)
+
+    risk_cfg = RiskConfig(
+        account_equity=lot["cash_alloc"],
+        risk_pct=lot["max_risk_per_trade"],
+        max_daily_loss_R=2.0,
+        max_consec_losses=3,
+        tick_value=0.01,
+        flat_time="16:00",
+        news_lockout_minutes=0,
+    )
+    risk = RiskGovernor(risk_cfg)
+
+    # 6. stream + simple loop (dry-run only prints)
+    def on_bar(bar):
+        rb.add(bar)
+
+    bar_task = asyncio.create_task(
+        broker.stream_realtime_bars(on_bar=on_bar,
+                                  what_to_show="TRADES",
+                                  bar_size_secs=60)
+    )
+
+    while not stop.is_set():
+        await asyncio.sleep(1)
+        df = rb.features()
+        if df is None or df.empty:
+            continue
+        bar = df.iloc[-1]
+        if dry_run:
+            print(f"[{name}] {bar['datetime']} close={bar['close']}")
+
+    # (never reached in this stub)
+    bar_task.cancel()
+    await broker.disconnect()
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -775,6 +917,8 @@ if __name__ == "__main__":
                     help="In dry-run, replay last N bars and print 'would place' lines, then exit")
     ap.add_argument("--dry-run-ignore-gates", action="store_true",
                     help="In dry-run, ignore staleness and session windows")
+    ap.add_argument("--portfolio", default=None,
+                    help="Run a multi-asset micro-lot portfolio (config/portfolios/<name>.yaml)")
 
     args = ap.parse_args()
     asyncio.run(main(args=args))
