@@ -19,12 +19,14 @@ class RiskGovernor:
         self.realized_R = 0.0
         self.consec_losses = 0
         self.halted = False
+        self.halt_reason: str | None = None
         self.reset_day()
 
     def reset_day(self, equity_now: float | None = None):
         self.realized_R = 0.0
         self.consec_losses = 0
         self.halted = False
+        self.halt_reason = None
         if equity_now is None:
             equity_now = self.cfg.account_equity
         self.day_start_equity = float(equity_now)
@@ -72,8 +74,17 @@ class RiskGovernor:
     def record_trade_outcome_R(self, R: float):
         self.realized_R += R
         self.consec_losses = self.consec_losses + 1 if R < 0 else 0
-        if self.realized_R <= -self.cfg.max_daily_loss_R or self.consec_losses >= self.cfg.max_consec_losses:
+
+        if self.realized_R <= -self.cfg.max_daily_loss_R:
             self.halted = True
+            self.halt_reason = f"max_daily_loss_R (realized_R={self.realized_R:.3f} <= -{self.cfg.max_daily_loss_R})"
+            return
+
+        if self.consec_losses >= self.cfg.max_consec_losses:
+            self.halted = True
+            self.halt_reason = f"max_consec_losses (consec_losses={self.consec_losses} >= {self.cfg.max_consec_losses})"
+            return
+
     def can_trade_now(self, ts_local_str: str) -> bool:
         if self.halted: 
             return False
@@ -93,22 +104,30 @@ class RiskGovernor:
         # DD% from peak
         dd = 0.0 if self.peak_equity <= 0 else 1.0 - (equity_now / self.peak_equity)
         if self.cfg.max_dd_pct is not None and dd >= self.cfg.max_dd_pct:
+            self.halted = True
+            self.halt_reason = f"max_dd_pct (dd={dd:.3f} >= {self.cfg.max_dd_pct})"
             return True
         # Daily loss % from day start
         day_loss = 0.0
         if self.day_start_equity and self.day_start_equity > 0:
             day_loss = 1.0 - (equity_now / self.day_start_equity)
         if self.cfg.max_daily_loss_pct is not None and day_loss >= self.cfg.max_daily_loss_pct:
+            self.halted = True
+            self.halt_reason = f"max_daily_loss_pct (day_loss={day_loss:.3f} >= {self.cfg.max_daily_loss_pct})"
             return True
         return False
     def snapshot(self):
         return {
-            "realized_R": float(self.realized_R), 
-            "consec_losses": int(self.consec_losses), 
-            "halted": bool(self.halted)
+            "realized_R": float(self.realized_R),
+            "consec_losses": int(self.consec_losses),
+            "halted": bool(self.halted),
+            "halt_reason": self.halt_reason,   # ✅ ADD
         }
+
     def restore(self, state: dict | None):
         if not state: return
         self.realized_R = float(state.get("realized_R", 0.0))
         self.consec_losses = int(state.get("consec_losses", 0))
         self.halted = bool(state.get("halted", False))
+        self.halt_reason = state.get("halt_reason")  # ✅ ADD
+

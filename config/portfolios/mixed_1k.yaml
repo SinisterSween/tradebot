@@ -1,10 +1,10 @@
 cash_total: 1000
 microlots:
   - name: EQ-SWI
-    cash_alloc: 150
+    cash_alloc: 500
     universe: sp500_fractional
     broker: ibkr_fractional
-    max_risk_per_trade: 0.005
+    max_risk_per_trade: 0.02
     max_pos: 3
     day_trade_cap: 2
   - name: EQ-TINY
@@ -22,9 +22,9 @@ microlots:
     max_pos: 4
     day_trade_cap: 999
   - name: ETF-SWING
-    cash_alloc: 200
+    cash_alloc: 500
     universe: levered_etf
     broker: ibkr_fractional
-    max_risk_per_trade: 0.0075
+    max_risk_per_trade: 0.02
     max_pos: 2
     day_trade_cap: 0

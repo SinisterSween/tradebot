@@ -1,0 +1,58 @@
+Generate CSV for data:
+# Build/refresh CSVs for the crypto_micro universe (writes into data/)
+PYTHONPATH=. .venv/bin/python scripts/build_universe_csvs.py \
+  --universe config/universes/crypto_micro.yaml \
+  --out-dir data
+# Wipe and rebuild CSVs (only if your script supports this flag)
+PYTHONPATH=. .venv/bin/python scripts/build_universe_csvs.py \
+  --universe config/universes/crypto_micro.yaml \
+  --out-dir data \
+  --reset
+PYTHONPATH=. .venv/bin/python scripts/build_universe_csvs.py \
+  --universe config/universes/crypto_micro.yaml \
+  --out-dir data \
+  --build-only
+
+
+Crypto Backtest all symbols last 2 months harsher friction:
+PYTHONPATH=. .venv/bin/python run_backtest.py \
+  --profile config/profile/equities.yaml \
+  --universe config/universes/crypto_micro.yaml \
+  --all \
+  --csv-dir data \
+  --starting-equity 2000 \
+  --risk-pct 0.01 \
+  --no-gui \
+  --fee-bps 3.0 \
+  --slip-bps 2.0 \
+  --start-date 2025-10-01 \
+  --end-date 2025-11-30
+Crypto Backtests all available symbols and data harsher friction:
+PYTHONPATH=. .venv/bin/python run_backtest.py \
+  --profile config/profile/equities.yaml \
+  --universe config/universes/crypto_micro.yaml \
+  --all \
+  --csv-dir data \
+  --starting-equity 2000 \
+  --risk-pct 0.01 \
+  --no-gui \
+  --fee-bps 3.0 \
+  --slip-bps 2.0
+
+Single symbol backtest using csv: 
+PYTHONPATH=. .venv/bin/python run_backtest.py \
+  --profile config/profile/equities.yaml \
+  --symbol SOL/USDT \
+  --csv data/SOL_USDT_live_1m.csv \
+  --starting-equity 2000 \
+  --risk-pct 0.01 \
+  --no-gui \
+  --fee-bps 3.0 \
+  --slip-bps 2.0 \
+  --start-date 2025-10-01 \
+  --end-date 2025-11-30
+
+Quick health check that csv's exist/are updating:
+ls -lh data/*_live_1m.csv
+tail -n 3 data/ETH_USDT_live_1m.csv
+tail -n 3 data/SOL_USDT_live_1m.csv

@@ -1,4 +1,30 @@
-symbols: ["AAPL","MSFT","GOOGL","AMZN","NVDA","TSLA","META","NFLX","AMD","CRM"]
+symbols:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - NVDA
+  - TSLA
+  - META
+  - NFLX
+  - AMD
+  - CRM
+
 tick_size: 0.01
 point_value: 1
 fractional: true
+
+rotate: true
+
+strategy:
+  orb_minutes: 15
+  atr_len: 14
+  break_eps_ticks: 2
+  atr_mult: 1.0
+  target_R: 1.0
+  slope_min: 0.0
+  stop_pad_ticks: 2
+  trail_pad_ticks: 2
+
+execution:
+  max_hold_min: 60

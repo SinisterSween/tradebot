@@ -31,7 +31,7 @@ SPY:
   exchange: SMART
   currency: USD
   tick_size: 0.01
-  tick_value: 1.00           
+  tick_value: 0.01           
   commission_per_contract: 0.005
   exchange_fees_per_contract: 0.00
 
@@ -40,7 +40,7 @@ QQQ:
   exchange: SMART
   currency: USD
   tick_size: 0.01
-  tick_value: 1.00
+  tick_value: 0.01
   commission_per_contract: 0.005
   exchange_fees_per_contract: 0.00
 

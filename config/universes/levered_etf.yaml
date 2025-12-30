@@ -1,3 +1,26 @@
-symbols: ["TQQQ","SQQQ","SOXL","SOXS"]
+symbols:
+  - TQQQ
+  - SQQQ
+  - SOXL
+  - SOXS
+
 tick_size: 0.01
 point_value: 1
+
+rotate: true
+
+strategy:
+  
+  orb_minutes: 15
+  atr_len: 14
+  break_eps_ticks: 2
+  atr_mult: 1.0
+  target_R: 1.0
+  slope_min: 0.0
+  stop_pad_ticks: 2
+  trail_pad_ticks: 2
+
+execution:
+  be_lock_min: 8
+  be_req_profit_ticks: 3
+  max_hold_min: 45

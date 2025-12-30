@@ -14,7 +14,7 @@ from ib_insync.util import parseIBDatetime as dt_to_datetime
 # Re-use the *exact* data-class you already import in ibkr.py
 from trader.brokers.ibkr import BracketPrices   # brings in your dataclass
 
-
+pending = set()
 class IbkrFractional:
     """
     Thin wrapper around ib_insync.IB that:
@@ -60,7 +60,7 @@ class IbkrFractional:
     def enforce_market_data_guard(self, *, use_delayed: bool, allow_mismatch: bool = False):
         # Same logic you already use; simplified here
         desired = 3 if use_delayed else 1
-        actual  = getattr(self.ib.client, "marketDataType", desired)
+        actual  = getattr(self.ib.client, "marketDataType", desired) or desired
         if desired != actual and not allow_mismatch:
             raise RuntimeError(f"Data mismatch: wanted {desired}, IB gives {actual}")
 
@@ -174,92 +174,132 @@ class IbkrFractional:
     # ------------------------------------------------------------------
     # Streamer (copy-paste of your futures logic, but contract=Stock)
     # ------------------------------------------------------------------
-    async def stream_realtime_bars(self, *, on_bar: Callable,
-                                   what_to_show: str = "TRADES",
-                                   bar_size_secs: int = 60,
-                                   preload_days: int = 2,
-                                   prefill_n: int = 2000):
+    async def stream_realtime_bars(self, *, on_bar,
+                               what_to_show: str = "TRADES",
+                               bar_size_secs: int = 60,
+                               preload_days: int = 2,
+                               prefill_n: int = 2000):
         """
-        Historical + live 1-min aggregate for equities.
-        Keeps the *same* signature you already call in run_live.py.
+        1-min bars using IB historical with keepUpToDate=True.
+        Works with delayed data; avoids RealTimeBars which often doesn't.
         """
-        import inspect
-        from ib_insync import RealTimeBar
+        import asyncio, inspect
+        from datetime import timezone
 
         if self.contract is None:
             raise RuntimeError("Contract not resolved")
+        
+        async def _emit(d):
+            try:
+                if inspect.iscoroutinefunction(on_bar):
+                    await on_bar(d)
+                else:
+                    on_bar(d)
+            except Exception as e:
+                print(f"[RTB][EMIT-ERROR] {type(e).__name__}: {e}")
+                raise
+
+
+
+        def _to_utc_iso(x):
+            # IB sometimes gives BarData.date as datetime, sometimes as string
+            if isinstance(x, datetime):
+                dt = x
+            else:
+                dt = dt_to_datetime(x)   # parseIBDatetime
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.isoformat()
+
 
         def _bar_to_dict(b):
-            dt = dt_to_datetime(b.time).replace(tzinfo=timezone.utc)
+            raw = getattr(b, "date", None)
             return {
-                "datetime": dt.isoformat(),
+                "datetime": _to_utc_iso(raw),
                 "open": float(b.open),
                 "high": float(b.high),
                 "low": float(b.low),
                 "close": float(b.close),
-                "volume": float(b.volume),
+                "volume": float(getattr(b, "volume", 0) or 0),
             }
 
-        async def _emit(d):
-            if inspect.iscoroutinefunction(on_bar):
-                await on_bar(d)
-            else:
-                on_bar(d)
-
-        # 1) back-fill
+        # Backfill + live updates via historical keepUpToDate
         bars = await self.ib.reqHistoricalDataAsync(
             self.contract,
             endDateTime="",
             durationStr=f"{preload_days} D",
             barSizeSetting="1 min",
             whatToShow=what_to_show,
-            useRTH=True,
+            useRTH=False,              # IMPORTANT: allow outside RTH
             formatDate=2,
-            keepUpToDate=False
+            keepUpToDate=True          # IMPORTANT: live updates
         )
+        last_seen = None
+        # Emit initial history
+        n_emit = min(len(bars), prefill_n)
+        print(f"[HIST] about to emit n={n_emit} for {getattr(self.contract,'symbol','?')}")
         for b in bars[-prefill_n:]:
-            await _emit(_bar_to_dict(b))
+            d = _bar_to_dict(b)
+            last_seen = d["datetime"]
+            await _emit(d)
+        print(f"[HIST] emitted n={n_emit} for {getattr(self.contract,'symbol','?')}")
+        print(f"[RTB] emitted history bars: {min(len(bars), prefill_n)}")
 
-        # 2) live 5-s RT-bars → 60-s aggregate
-        rtb = self.ib.reqRealTimeBars(self.contract, barSize=5,
-                                      whatToShow=what_to_show,
-                                      useRTH=True)
 
-        bucket = None
-        o = h = l = c = None
-        vol = 0
+        last_dbg = {"ts": 0.0}
 
-        def on_rtb(bar: RealTimeBar):
-            nonlocal bucket, o, h, l, c, vol
-            ts = dt_to_datetime(bar.time).replace(tzinfo=timezone.utc)
-            bkt = ts.replace(second=0, microsecond=0)
-            px = float(bar.close)
-            v = int(bar.volume or 0)
+        def on_live_update(bars_, hasNewBar=None):
+            nonlocal last_seen
+            try:
+                if not bars_:
+                    return
 
-            if bucket is None:
-                bucket, o, h, l, c, vol = bkt, px, px, px, px, v
-                return
+                b = bars_[-1]
+                d = _bar_to_dict(b)          # d["datetime"] is already UTC ISO string
+                ts = d["datetime"]
 
-            if bkt == bucket:
-                c, vol = px, vol + v
-                h = max(h, px)
-                l = min(l, px)
-            else:
-                asyncio.create_task(_emit({
-                    "datetime": bucket.isoformat(),
-                    "open": o, "high": h, "low": l, "close": c, "volume": vol
-                }))
-                bucket, o, h, l, c, vol = bkt, px, px, px, px, v
+                now = asyncio.get_event_loop().time()
+                if now - last_dbg["ts"] > 30:
+                    print(f"[RTB] updateEvent ok sym={getattr(self.contract,'symbol','?')} ts={ts}")
+                    last_dbg["ts"] = now
 
-        rtb.updateEvent += on_rtb
+                # dedupe
+                if ts == last_seen:
+                    return
+
+                last_seen = ts
+                asyncio.create_task(_emit(d))
+
+            except Exception as e:
+                print(f"[HIST][UPDATE][ERROR] {type(e).__name__}: {e}")
+
+
+
+        bars.updateEvent += on_live_update
+        print(f"[STREAM] subscribed updateEvent for {getattr(self.contract,'symbol','?')} (keepUpToDate=True)")
+        print(f"[STREAM] entering live loop for {getattr(self.contract,'symbol','?')}")
+        print(f"[TEST] about to emit history for {getattr(self.contract,'symbol','?')} bars={len(bars)}")
+
         try:
+            n = 0
             while True:
                 await asyncio.sleep(1)
+                n += 1
+                if n % 10 == 0:
+                    # show last_seen so we know if anything moved
+                    print(f"[STREAM] alive {getattr(self.contract,'symbol','?')} last_seen={last_seen}")
         except asyncio.CancelledError:
             pass
         finally:
-            rtb.updateEvent -= on_rtb
-            self.ib.cancelRealTimeBars(rtb)
+            bars.updateEvent -= on_live_update
+            try:
+                self.ib.cancelHistoricalData(bars)
+            except Exception:
+                pass
+
+
 
     # ------------------------------------------------------------------
     # Helpers you already call

@@ -1,3 +1,35 @@
-symbols: ["F","NOK","SIRI","LYG","ITUB","HBAN","SWN","NAK","SNDL","GOVX","CEI","MARK","ZOM","GSAT","CIDM"]
+symbols:
+  - F
+  - NOK
+  - SIRI
+  - LYG
+  - ITUB
+  - HBAN
+  - NAK
+  - SNDL
+  - GOVX
+  - MARK
+  - ZOM
+  - GSAT
+  - CIDM
+
 tick_size: 0.01
 point_value: 1
+
+
+rotate: true
+
+strategy:
+  orb_minutes: 15
+  atr_len: 14
+  break_eps_ticks: 2
+  atr_mult: 1.0
+  target_R: 1.0
+  slope_min: 0.0
+  stop_pad_ticks: 2
+  trail_pad_ticks: 2
+
+execution:
+  be_req_profit_ticks: 4
+  max_hold_min: 25
+  min_minutes_to_window_end: 30

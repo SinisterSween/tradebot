@@ -1,0 +1,52 @@
+asset_class: crypto
+exchange: binanceus
+timezone: UTC
+
+symbols:
+  - XRP/USDT
+
+tick_size: 0.0001
+point_value: 1
+trade_min_qty: 1.0   # 1 XRP ~ $0.5
+
+rotate: true
+
+backfill:
+  days: 180
+  timeframe: "15m"
+  limit_per_call: 1000
+
+risk:
+  flat_time: "23:59"
+  max_notional_pct: 0.10
+  max_notional_usd: 10
+  max_daily_loss_R: 999
+  max_consec_losses: 999
+
+strategy:
+  name: rsi_mean_reversion
+  rsi_len: 14
+  rsi_buy_below: 20
+  rsi_sell_above: 80
+  ema_fast_len: 50
+  ema_slope_max: 0.000X
+  ema_dist_atr_min: 0.8
+  cooldown_bars: 8
+  #shape
+  atr_len: 14
+  atr_mult: 1.0
+  target_R: 0.8
+  stop_pad_ticks: 2
+  #optional filters (start disabled)
+  slope_max: 0.0
+  min_atr_pct: 0.0003
+  session_windows:
+    - start: "00:00"
+      end: "23:59"
+
+execution:
+  cooldown_bars: 5
+  be_lock_min: 15
+  be_req_profit_ticks: 1
+  max_hold_min: 60
+  min_minutes_to_window_end: 10

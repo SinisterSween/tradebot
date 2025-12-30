@@ -25,3 +25,19 @@ def add_opening_range(df: pd.DataFrame, minutes: int, session_key: str = "date")
     agg = df[mask].groupby(session_key).agg(orh=("high", "max"), orl=("low", "min"))
     df = df.join(agg, on=session_key)
     return df
+def add_rsi(df: pd.DataFrame, length: int = 14, col: str = "close") -> pd.DataFrame:
+    df = df.copy()
+    close = pd.to_numeric(df[col], errors="coerce")
+
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+
+    # Wilder-style smoothing via EMA with alpha=1/length
+    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0.0, pd.NA)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    df["rsi"] = pd.to_numeric(rsi, errors="coerce").fillna(50.0).astype(float)
+    return df
