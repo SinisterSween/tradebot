@@ -95,6 +95,8 @@ def prepare_bars(
 
     if "vwap_slope" not in df.columns:
         df["vwap_slope"] = df["vwap"].diff().fillna(0.0)
+        
+    df["rsi_prev"] = df["rsi"].shift(1)
 
     # ATR must exist before we can normalize EMA slope / dist in ATR units
     df = add_atr(df, length=14)

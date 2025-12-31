@@ -174,6 +174,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             stop_pad_ticks=int(s_cfg.get("stop_pad_ticks", 2)),
             slope_max=float(s_cfg.get("slope_max", 0.0)),
             min_atr_pct=float(s_cfg.get("min_atr_pct", 0.0)),
+            target_vwap=bool(s_cfg.get("target_vwap", False)),
             tick_size=float(fees.get("tick_size", 0.01)),
             tick_value=float(fees.get("tick_value", 1.0)),
         )

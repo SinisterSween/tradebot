@@ -7,7 +7,7 @@ symbols:
 
 tick_size: 0.0001
 point_value: 1
-trade_min_qty: 1.0   # 1 XRP ~ $0.5
+trade_min_qty: 1.0   # 1 XRP
 
 rotate: true
 
@@ -19,33 +19,38 @@ backfill:
 risk:
   flat_time: "23:59"
   max_notional_pct: 0.10
-  max_notional_usd: 10
+  min_notional_usd: 10
   max_daily_loss_R: 999
   max_consec_losses: 999
 
 strategy:
+  strategy:
   name: rsi_mean_reversion
   rsi_len: 14
-  rsi_buy_below: 20
-  rsi_sell_above: 80
-  ema_fast_len: 50
-  ema_slope_max: 0.000X
-  ema_dist_atr_min: 0.8
-  cooldown_bars: 8
-  #shape
-  atr_len: 14
-  atr_mult: 1.0
-  target_R: 0.8
+  rsi_buy_below: 25
+  rsi_sell_above: 75
+  atr_mult: 1.2
+  target_vwap: true
+  target_R: 1.0
   stop_pad_ticks: 2
-  #optional filters (start disabled)
-  slope_max: 0.0
+
+  require_cross: true
+  min_minutes_between_trades: 240
+  max_trades_per_day: 0
+
   min_atr_pct: 0.0003
+  slope_max: 0.0
+
+  ema_slope_max: 0.0
+  ema_dist_atr_min: 0.0
+  ema_dist_atr_max: 0.0
+
   session_windows:
     - start: "00:00"
       end: "23:59"
 
 execution:
-  cooldown_bars: 5
+  cooldown_bars: 2
   be_lock_min: 15
   be_req_profit_ticks: 1
   max_hold_min: 60
