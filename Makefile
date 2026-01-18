@@ -50,8 +50,8 @@ help:
 	@echo "make clean              # purge generated csv/json (safe)"
 	@echo ""
 	@echo "=== Common targets ==="
-	@echo "make crypto-csv-90                # build crypto CSVs (90d)"
-	@echo "make crypto-csv-180               # build crypto CSVs (180d)"
+	@echo "make crypto-csv-90-1m                # build crypto CSVs (90d)"
+	@echo "make crypto-csv-180-1m               # build crypto CSVs (180d)"
 	@echo "make crypto-bt                    # backtest crypto (full range in CSVs)"
 	@echo "make crypto-bt-2m                 # backtest crypto for START_DATE..END_DATE"
 	@echo "make crypto-bt-2m-friction        # same but with harsher friction (fee/slip)"
@@ -68,7 +68,7 @@ help:
 PY := .venv/bin/python
 PP := PYTHONPATH=.
 PROFILE_EQ := config/profile/equities.yaml
-UNIV_CRYPTO := config/universes/crypto_micro.yaml
+UNIV_CRYPTO := config/universes/crypto_all.yaml
 CSV_DIR := data
 # Backtest defaults
 STARTING_EQUITY ?= 2000
@@ -82,11 +82,11 @@ END_DATE   ?= 2025-11-30
 
 # --- CSV generation (adjust flags to match your script if needed) ---
 
-crypto-csv-90:
-	$(PP) $(PY) scripts/build_universe_csvs.py --universe $(UNIV_CRYPTO) --csv-dir $(CSV_DIR) --days 90
+crypto-csv-90-1m:
+	$(PP) $(PY) scripts/build_universe_csvs.py --universes $(UNIV_CRYPTO) --out-dir $(CSV_DIR) --preload-days 90 --bar-size-secs 60 --reset-csv
 
-crypto-csv-180:
-	$(PP) $(PY) scripts/build_universe_csvs.py --universe $(UNIV_CRYPTO) --csv-dir $(CSV_DIR) --days 180
+crypto-csv-180-1m:
+	$(PP) $(PY) scripts/build_universe_csvs.py --universes $(UNIV_CRYPTO) --out-dir $(CSV_DIR) --preload-days 180 --bar-size-secs 60 --reset-csv
 
 # --- Backtests ---
 

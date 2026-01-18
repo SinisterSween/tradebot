@@ -7,6 +7,7 @@ from datetime import date
 import yaml
 import pandas as pd
 import matplotlib
+import numpy as np
 
 from trader.engine.backtest import prepare_bars, equity_curve
 from trader.engine.execution import OrderManager
@@ -17,6 +18,7 @@ from trader.strategies.vwap_reversion import VwapReversion, StratConfig as RevCf
 from trader.strategies.trend_pullback import TrendPullback, StratConfig as PbCfg
 from trader.engine.latency import BarDelay
 from trader.engine.metrics_ext import summarize_equity, write_artifacts
+from dataclasses import fields, is_dataclass
 
 def _in_windows(ts_local_str, windows):
     try:
@@ -51,6 +53,19 @@ def _resolve_universe_path(universe_name_or_path: str) -> str:
     p = os.path.join("config", "universes", f"{s}.yaml")
     return p
 
+def _as_bool(v, default=False) -> bool:
+    if v is None:
+        return bool(default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    s = str(v).strip().lower()
+    if s in {"true", "1", "yes", "y", "on"}:
+        return True
+    if s in {"false", "0", "no", "n", "off"}:
+        return False
+    return bool(default)
 
 def _deep_merge(a, b):
     out = dict(a or {})
@@ -87,7 +102,63 @@ def _minutes_to_window_end(ts_local_str, windows):
             return (e_h * 60 + e_m) - cur
     return 9999
 
-from dataclasses import fields, is_dataclass
+def _maybe_move_stop_to_be(
+    bar,
+    *,
+    open_side: str,
+    open_entry_px: float,
+    open_entry_ts: str,          # "HH:MM"
+    current_bracket,             # bracket object with .stop_price
+    tick_size: float,
+    be_req_ticks: int,
+    be_lock_min: int,
+    be_armed: bool,
+):
+    """
+    Returns (current_bracket, new_be_armed, reason_or_None)
+
+    - Uses bar["t_local"] and open_entry_ts (both "HH:MM") with _minutes_between()
+    - Mutates current_bracket.stop_price in-place (what simulate_bracket expects)
+    """
+    if be_armed:
+        return current_bracket, True, None
+
+    if current_bracket is None or open_entry_ts is None:
+        return current_bracket, be_armed, None
+
+    # lockout window (minutes since entry)
+    try:
+        mins_open = _minutes_between(open_entry_ts, bar["t_local"])
+    except Exception:
+        return current_bracket, be_armed, None
+
+    if mins_open < float(be_lock_min):
+        return current_bracket, be_armed, None
+
+    px = float(bar["close"])
+    req_move = float(be_req_ticks) * float(tick_size)
+
+    side = (open_side or "").upper()
+    stop_now = float(getattr(current_bracket, "stop_price", float("nan")))
+
+    if side == "BUY":
+        moved_enough = (px - float(open_entry_px)) >= req_move
+        be_stop = float(open_entry_px)  # BE; change to +tick_size for BE+1 tick if desired
+        tighten = moved_enough and (stop_now < be_stop)
+        if tighten:
+            current_bracket.stop_price = max(float(current_bracket.stop_price), be_stop)
+            return current_bracket, True, "be_moved"
+
+    elif side == "SELL":
+        moved_enough = (float(open_entry_px) - px) >= req_move
+        be_stop = float(open_entry_px)
+        tighten = moved_enough and (stop_now > be_stop)
+        if tighten:
+            current_bracket.stop_price = min(float(current_bracket.stop_price), be_stop)
+            return current_bracket, True, "be_moved"
+
+    return current_bracket, be_armed, None
+
 
 def _norm_strat_name(name: str) -> str:
     s = (name or "").strip()
@@ -117,6 +188,24 @@ def _norm_strat_name(name: str) -> str:
 
     return aliases.get(key, s)  # if already "VwapReversion", keep it
 
+_STRATEGY_META_KEYS = {
+    # common meta keys used by runner / prepare_bars
+    "name", "session_windows",
+    "orb_minutes",
+    "ema_fast_len", "ema_slope_lookback",
+    "rsi_len", "atr_len",
+    # keep these if you ever put them at strategy level
+    "timeframe", "bar_size", "backfill",
+    "fallback"
+}
+
+def warn_unused_keys(cfg_cls, s_cfg: dict, context: str = ""):
+    if not is_dataclass(cfg_cls):
+        return
+    allowed = {f.name for f in fields(cfg_cls)} | _STRATEGY_META_KEYS
+    extra = sorted(set((s_cfg or {}).keys()) - allowed)
+    if extra:
+        print(f"[CFG][WARN] Unused keys for {cfg_cls.__name__} {context}: {extra}")
 
 def _filter_kwargs(dataclass_type, kwargs: dict) -> dict:
     """Return only kwargs that exist on a dataclass."""
@@ -125,11 +214,22 @@ def _filter_kwargs(dataclass_type, kwargs: dict) -> dict:
     allowed = {f.name for f in fields(dataclass_type)}
     return {k: v for k, v in kwargs.items() if k in allowed}
 
+def deep_merge(a: dict, b: dict) -> dict:
+    """Return a deep-merged copy of a <- b (b wins)."""
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
 
 def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
     name = _norm_strat_name(strategy_name or "HybridOrbVwap")
 
     if name == "VwapReversion":
+        warn_unused_keys(RevCfg, s_cfg, context=f"({name})")
         rev_kwargs = dict(
             atr_len=int(s_cfg.get("atr_len", 14)),
             atr_mult=float(s_cfg.get("atr_mult", 1.0)),
@@ -138,17 +238,21 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             stop_pad_ticks=int(s_cfg.get("stop_pad_ticks", 2)),
             tick_size=float(fees["tick_size"]),
             tick_value=float(fees["tick_value"]),
-            target_vwap=bool(s_cfg.get("target_vwap", True)),
+            target_vwap=_as_bool(s_cfg.get("target_vwap", True)),
             min_atr_pct=float(s_cfg.get("min_atr_pct", 0.0)),
             max_bar_range_atr=float(s_cfg.get("max_bar_range_atr", 0.0)),
             ema_slope_max=float(s_cfg.get("ema_slope_max", 0.0)),
             ema_max_dist_atr=float(s_cfg.get("ema_max_dist_atr", 0.0)),
+            vwap_entry_min_atr=float(s_cfg.get("vwap_entry_min_atr", 0.0)),
+            vwap_entry_max_atr=float(s_cfg.get("vwap_entry_max_atr", 0.0)),
+            min_vwap_target_R=float(s_cfg.get("min_vwap_target_R", 0.0)),
 
         )
         cfg = RevCfg(**_filter_kwargs(RevCfg, rev_kwargs))
         return VwapReversion(cfg)
 
     if name == "TrendPullback":
+        warn_unused_keys(PbCfg, s_cfg, context=f"({name})")
         pb_kwargs = dict(
             atr_len=int(s_cfg.get("atr_len", 14)),
             atr_mult=float(s_cfg.get("atr_mult", 1.0)),
@@ -165,6 +269,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
         return TrendPullback(cfg)
     
     if name == "RsiMeanReversion":
+        warn_unused_keys(RsiMRConfig, s_cfg, context=f"({name})")
         pb_kwargs = dict(
             rsi_len=int(s_cfg.get("rsi_len", 14)),
             rsi_buy_below=float(s_cfg.get("rsi_buy_below", 28)),
@@ -174,15 +279,38 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             stop_pad_ticks=int(s_cfg.get("stop_pad_ticks", 2)),
             slope_max=float(s_cfg.get("slope_max", 0.0)),
             min_atr_pct=float(s_cfg.get("min_atr_pct", 0.0)),
-            target_vwap=bool(s_cfg.get("target_vwap", False)),
+            target_vwap=_as_bool(s_cfg.get("target_vwap", True)),
+            require_cross=_as_bool(s_cfg.get("require_cross", True)),
+            min_minutes_between_trades=int(s_cfg.get("min_minutes_between_trades", 30)),
+            max_trades_per_day=int(s_cfg.get("max_trades_per_day", 0)),
+            ema_slope_max=float(s_cfg.get("ema_slope_max", 0.0)),
+            ema_dist_atr_min=float(s_cfg.get("ema_dist_atr_min", 0.0)),
+            ema_dist_atr_max=float(s_cfg.get("ema_dist_atr_max", 0.0)),
+            ema_slope_atr_min=float(s_cfg.get("ema_slope_atr_min", -0.2)),
+            exit_on_ema=bool(s_cfg.get("exit_on_ema", False)),
+            exit_ema_len=int(s_cfg.get("exit_ema_len", 20)),
+            exit_ema_side=str(s_cfg.get("exit_ema_side", "cross")),
+            allow_longs=_as_bool(s_cfg.get("allow_longs", True)),
+            allow_shorts=_as_bool(s_cfg.get("allow_shorts", False)),
             tick_size=float(fees.get("tick_size", 0.01)),
             tick_value=float(fees.get("tick_value", 1.0)),
+            vwap_entry_min_atr=float(s_cfg.get("vwap_entry_min_atr", 0.0)),
+            vwap_entry_max_atr=float(s_cfg.get("vwap_entry_max_atr", 0.0)),
+            vwap_dist_atr_min=float(s_cfg.get("vwap_dist_atr_min", 0.0)),
+            min_vwap_target_R=float(s_cfg.get("min_vwap_target_R", 0.0)),
+            use_session_open_stop=_as_bool(s_cfg.get("use_session_open_stop", False)),
+            session_open_stop_atr_pad=float(s_cfg.get("session_open_stop_atr_pad", 0.0)),
+            use_early_range_target=_as_bool(s_cfg.get("use_early_range_target", False)),
+            early_range_mult=float(s_cfg.get("early_range_mult", 1.0)),
+            early_min_range_atr=float(s_cfg.get("early_min_range_atr", 0.0)),
+            require_early_done=_as_bool(s_cfg.get("require_early_done", True)),
         )
         cfg = RsiMRConfig(**_filter_kwargs(RsiMRConfig, pb_kwargs))
         return RsiMeanReversion(cfg)
 
 
     # default: HybridOrbVwap
+    warn_unused_keys(OrbCfg, s_cfg, context=f"({name})")
     orb_kwargs = dict(
         orb_minutes=int(s_cfg.get("orb_minutes", 5)),
         atr_len=int(s_cfg.get("atr_len", 14)),
@@ -251,26 +379,26 @@ def _compute_size_crypto(
 
     # USD risk per 1 unit of coin
     risk_per_unit = abs(float(entry_px) - float(stop_px))
-    if risk_per_unit <= 0:
+    if risk_per_unit <= 0 or entry_px <= 0:
         return 0.0
 
     qty_by_risk = risk_budget / risk_per_unit
 
-    # affordability in notional terms (still matters)
-    qty_by_cash = float(equity) / float(entry_px) if entry_px > 0 else 0.0
+    if max_notional_usd is None:
+        max_notional_usd = float(equity)
 
-    qty = min(qty_by_risk, qty_by_cash)
+    # affordability in notional terms (still matters)
+    qty_by_notional = float(max_notional_usd) / float(entry_px)
+
+    qty = min(qty_by_risk, qty_by_notional)
 
     if max_qty is not None:
         qty = min(qty, float(max_qty))
     
-    qty_by_cash = (max_notional_usd / entry_px) if (max_notional_usd is not None and entry_px > 0) else (equity / entry_px)
-    qty = min(qty_by_risk, qty_by_cash)
-
-    # enforce minimum tradable qty (your yaml)
-    qty = _floor_to_step(qty, float(trade_min_qty)) if trade_min_qty > 0 else qty
-    if trade_min_qty and qty < trade_min_qty:
-        return 0.0
+    if trade_min_qty and trade_min_qty > 0:
+        qty = _floor_to_step(qty, float(trade_min_qty))
+        if qty < float(trade_min_qty):
+            return 0.0
 
     return float(qty)
 
@@ -350,41 +478,13 @@ def _resolve_contract_for_symbol(symbol: str, contracts_path: str, universe: dic
         # keep universe point_value around as an extra field if you want later
         "_point_value": point_value,
     }
+def _mark_entry_for_throttles(strat, bar):
+# only count throttles when we actually submit an entry
+    if hasattr(strat, "_trades_today"):
+        strat._trades_today += 1
+    if hasattr(strat, "_last_trade_ts"):
+        strat._last_trade_ts = bar.name
 
-def _resolve_strategy_name(*, cfg: dict, universe_cfg: dict | None, symbol: str) -> str:
-    """
-    Resolve strategy.name for THIS symbol, with explicit precedence:
-      1) per-symbol override strategy.name
-      2) universe strategy.name
-      3) cfg strategy_name (legacy)
-      4) default HybridOrbVwap
-    """
-    sym = str(symbol)
-    sym_u = sym.upper()
-
-    # Per-symbol overrides
-    ov = None
-    if universe_cfg:
-        overrides = (universe_cfg.get("symbol_overrides") or {})
-        ov = overrides.get(sym) or overrides.get(sym_u)
-
-    if ov:
-        nm = ((ov.get("strategy") or {}).get("name") or "").strip()
-        if nm:
-            return nm
-
-    # Universe-level default
-    if universe_cfg:
-        nm = ((universe_cfg.get("strategy") or {}).get("name") or "").strip()
-        if nm:
-            return nm
-
-    # Legacy / misc
-    nm = (cfg.get("strategy_name") or "").strip()
-    if nm:
-        return nm
-
-    return "HybridOrbVwap"
 
 
 def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | None) -> dict:
@@ -421,19 +521,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
 
     # ✅ Per-symbol overrides (NEW)
-    sym_key = str(symbol).upper()  # keeps BTC/USDT format intact, normalizes case
-    overrides = ((universe_cfg or {}).get("symbol_overrides") or {})
-    sym_ovr = overrides.get(symbol) or overrides.get(sym_key)
-
-    if sym_ovr:
-        if "strategy" in sym_ovr:
-            cfg["strategy"] = _deep_merge(cfg.get("strategy", {}), sym_ovr["strategy"])
-        if "execution" in sym_ovr:
-            cfg["execution"] = _deep_merge(cfg.get("execution", {}), sym_ovr["execution"])
-        # optional if you ever add per-symbol fees
-        if "fees" in sym_ovr:
-            cfg["fees"] = _deep_merge(cfg.get("fees", {}), sym_ovr["fees"])
-
+    sym_ovr = universe_cfg or {}
 
     # ---- Contract / fees ----
     ct = _resolve_contract_for_symbol(symbol, args.contracts, universe_cfg)
@@ -454,6 +542,8 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     tz = cfg.get("timezone", "America/Chicago")
     df = pd.read_csv(csv_path)
     orb_minutes = int(cfg["strategy"].get("orb_minutes", 5))
+    rsi_len = int(cfg["strategy"].get("rsi_len", 14))
+    atr_len = int(cfg["strategy"].get("atr_len", 14))
 
     df = prepare_bars(
         df,
@@ -461,7 +551,56 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         orb_minutes=orb_minutes,
         ema_fast_len=int(cfg["strategy"].get("ema_fast_len", 50)),
         ema_slope_lookback=int(cfg["strategy"].get("ema_slope_lookback", 5)),
+        rsi_len=rsi_len,
+        atr_len=atr_len,
+        symbol=symbol,
+        exit_on_ema=bool(cfg["strategy"].get("exit_on_ema", False)),
+        exit_ema_len=int(cfg["strategy"].get("exit_ema_len", 20)),
     )
+
+    sc = cfg["strategy"]
+    print(
+        f"[EMA CFG] {symbol} exit_on_ema={bool(sc.get('exit_on_ema', False))} "
+        f"exit_ema_len={int(sc.get('exit_ema_len', 20))} "
+        f"exit_ema_side={str(sc.get('exit_ema_side', 'cross')).strip().lower()}"
+    )
+
+    if bool(sc.get("exit_on_ema", False)):
+        col = f"ema_exit_{int(sc.get('exit_ema_len', 20))}"
+        print(f"[EMA COL] {symbol} has={col in df.columns}")
+
+
+    # ---- Sanity: EMA exit column exists ----
+    if bool(cfg["strategy"].get("exit_on_ema", False)):
+        col = f"ema_exit_{int(cfg['strategy'].get('exit_ema_len', 20))}"
+        print(
+            "[CHK] exit ema col exists:",
+            col in df.columns,
+            "head:",
+            df[col].head(3).tolist() if col in df.columns else None,
+        )
+
+
+    print("[CHK] cols:", [c for c in ["ema_slope_atr","ema_dist_atr","ema_slope","atr"] if c in df.columns])
+    print("[CHK] ema_slope_atr head:", df["ema_slope_atr"].head(3).tolist())
+
+
+    if symbol == "XRP/USDT":
+        s = pd.to_numeric(df["ema_slope"], errors="coerce").dropna()
+        a = pd.to_numeric(df["atr"], errors="coerce").replace(0, np.nan)
+        s_atr = (s / a).replace([np.inf, -np.inf], np.nan).dropna()
+
+        print("[DIAG][XRP] ema_slope p50/p90/p99:", s.quantile([0.5,0.9,0.99]).to_dict())
+        print("[DIAG][XRP] ema_slope_atr p50/p90/p99:", s_atr.quantile([0.5,0.9,0.99]).to_dict())
+        print("[DIAG][XRP] ema_dist_atr p50/p90/p99:", pd.to_numeric(df["ema_dist_atr"], errors="coerce").dropna().quantile([0.5,0.9,0.99]).to_dict())
+        print("[DIAG][XRP] vwap_slope p50/p90/p99:", pd.to_numeric(df["vwap_slope"], errors="coerce").dropna().quantile([0.5,0.9,0.99]).to_dict())
+
+    ratio = (df["close"] - df["vwap"]).abs() / df["atr"].replace(0, np.nan)
+    ratio = ratio.replace([np.inf, -np.inf], np.nan)
+    print(f"[DIAG] dist_from_vwap_atr valid={ratio.notna().mean():.4f} nan={ratio.isna().mean():.4f}")
+    print(f"[DIAG] dist_from_vwap_atr pct>=0.9: {(ratio >= 0.9).mean():.4f}")
+    print(f"[DIAG] dist_from_vwap_atr pct>=1.5: {(ratio >= 1.5).mean():.4f}")
+    print(f"[DIAG] dist_from_vwap_atr p50/p90/p99: {ratio.quantile([0.5,0.9,0.99]).to_dict()}")
 
     # ---- DEBUG: timestamp sanity (do this BEFORE any filtering/sorting) ----
     print(f"[TSCHK] {symbol} index[:3] = {list(df.index[:3])}")
@@ -478,19 +617,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     if args.end_date:
         end_d = pd.to_datetime(args.end_date).date()
         df = df[df["date"] <= end_d]
-
-
-    # # ---- PATCH: enforce chronological order AND preserve timestamp index ----
-    # ts_col = next((c for c in ["ts", "datetime", "t_utc", "timestamp", "date_time"] if c in df.columns), None)
-    # if ts_col:
-    #     df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-    #     df = df.dropna(subset=[ts_col])
-    #     df = df.sort_values(ts_col)
-    #     df = df.set_index(ts_col, drop=False)   # ✅ bar.name becomes a Timestamp again
-    # else:
-    #     # fallback: if prepare_bars gave you a DateTimeIndex, just sort it
-    #     if not df.index.is_monotonic_increasing:
-    #         df = df.sort_index()
 
     # ensure bars are time-ordered after date filtering
     if not df.index.is_monotonic_increasing:
@@ -527,6 +653,13 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
     sc = cfg["strategy"]
 
+    exit_on_ema   = bool(sc.get("exit_on_ema", False))
+    exit_ema_len  = int(sc.get("exit_ema_len", 20))
+    exit_ema_side = str(sc.get("exit_ema_side", "cross")).strip().lower()  # "cross" or "touch"
+
+    print(f"[EMA CFG] {symbol} exit_on_ema={exit_on_ema} exit_ema_len={exit_ema_len} exit_ema_side={exit_ema_side}")
+
+
     windows = _norm_windows(sc.get("session_windows", []))
     if not windows:
         windows = [{"start": "00:00", "end": "23:59"}]
@@ -558,12 +691,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     print(f"[CFG] {symbol} orb={sc.get('orb_minutes')} atr_mult={sc.get('atr_mult')} slope_min={sc.get('slope_min')}")
 
     raw_name = (
-        (sym_ovr or {}).get("strategy", {}).get("name")
-        or (universe_cfg or {}).get("strategy", {}).get("name")
+        (cfg.get("strategy") or {}).get("name")
         or cfg.get("strategy_name")
         or "HybridOrbVwap"
     )
-
     strategy_name = _norm_strat_name(raw_name)
 
     VALID_STRATS = {"HybridOrbVwap", "VwapReversion", "TrendPullback", "RsiMeanReversion"}
@@ -573,7 +704,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     print(f"[STRATEGY] {symbol} -> {strategy_name}")
 
     strat = build_strategy(strategy_name, cfg["strategy"], fees)
-
+    print(f"[STRAT.CFG] {symbol} {type(strat).__name__} cfg={getattr(strat, 'cfg', None)}")
     # ---- Fallback strategy (universe/base) ----
     fallback = None
     fallback_name = None
@@ -582,8 +713,18 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     primary_name = strategy_name
 
     # Fallback strategy name from universe/base (captured before overrides)
-    if base_strategy_name:
-        fallback_name = _norm_strat_name(base_strategy_name)
+    fb_key_present = "fallback" in (sc or {})
+    fb_val = (sc or {}).get("fallback", None)
+    # If fallback is explicitly set to null/None/false/"" => disable fallback
+    if fb_key_present and (fb_val is None or fb_val is False or str(fb_val).strip().lower() in {"", "none", "null", "false", "0"}):
+        fallback_name = None
+    else:
+        # If fallback is a real name, use it
+        if fb_key_present and fb_val:
+            fallback_name = _norm_strat_name(str(fb_val))
+        # Otherwise: default fallback (your previous behavior)
+        elif base_strategy_name:
+            fallback_name = _norm_strat_name(base_strategy_name)
 
     # Only enable fallback if it's different from primary
     if fallback_name and fallback_name != primary_name:
@@ -622,6 +763,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     COOLDOWN_BARS = int(exe.get("cooldown_bars", 0) or 0)
     last_flat_i = -10**9
     halted_prev = False
+
     # ---- Sim loop ----
     equity = float(args.starting_equity)
     open_position = False
@@ -641,10 +783,84 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     trade_min_qty = float((universe_cfg or {}).get("trade_min_qty", 0.0) or 0.0)
 
 
+    def _force_exit_current_position(
+        bar,
+        reason: str,
+        i: int,
+        exit_px: float | None = None,
+    ) -> bool:
+        """
+        Force an exit at bar close (or provided exit_px) when bracket didn't exit.
+        Writes an EXIT trade record, updates equity, records R, and resets open state.
+        Returns True if exited, False if there was nothing to exit.
+        """
+        nonlocal equity, last_flat_i
+        nonlocal open_position, current_bracket, open_side, open_qty
+        nonlocal open_entry_px, open_entry_ts, open_be_locked, open_risk_pts
+
+        if not open_position or current_bracket is None:
+            return False
+
+        px = float(exit_px if exit_px is not None else bar["close"])
+        side = (open_side or "BUY")
+        qty = float(open_qty or getattr(current_bracket, "qty", 0) or 0.0)
+        entry_px = float(open_entry_px if open_entry_px is not None else bar["close"])
+
+        side_mult = 1.0 if side == "BUY" else -1.0
+
+        # USD PnL calc
+        if crypto_like or equity_like:
+            pnl = (px - entry_px) * side_mult * qty
+        else:
+            pnl = (px - entry_px) * dpp * side_mult * qty
+
+        om.trades.append({
+            "ts": bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or None,
+            "t_local": bar["t_local"],
+            "action": "EXIT",
+            "side": side,
+            "qty": float(qty),
+            "price": entry_px,
+            "reason": reason,
+            "exit_price": px,
+            "pnl": pnl,
+            "fees_total": 0.0,
+        })
+
+        om.realized_pnl = float(getattr(om, "realized_pnl", 0.0)) + float(pnl)
+
+
+        # Record R if we can
+        try:
+            if open_risk_pts and float(open_risk_pts) > 0:
+                pnl_pts = (px - entry_px) * (1.0 if side == "BUY" else -1.0)
+                R = pnl_pts / float(open_risk_pts)
+                risk.record_trade_outcome_R(R)
+                om.trades[-1]["R"] = float(R)
+        except Exception:
+            pass
+
+        
+        last_flat_i = i  # uses loop variable i from outer scope
+
+        # reset open state
+        open_position = False
+        current_bracket = None
+        open_side = None
+        open_qty = 0.0
+        open_entry_px = None
+        open_entry_ts = None
+        open_be_locked = False
+        open_risk_pts = None
+
+        return True
+
+
     for i, (_, bar) in enumerate(df.iterrows()):
         # new day
         if prev_date is None or bar["date"] != prev_date:
-            risk.reset_day(equity + om.realized_pnl)
+            equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
+            risk.reset_day(equity)
             prev_date = bar["date"]
             open_position = False
             current_bracket = None
@@ -676,6 +892,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
             current_bracket = bracket if bracket is not None else current_bracket
             open_position = True
+            if hasattr(due, "get") and "strat_used" in due:
+                s_used = due["strat_used"]
+                if hasattr(s_used, "record_entry"):
+                    s_used.record_entry(bar.name)
             open_side = str(order.side).upper()
             open_qty = float(order.qty)
             open_entry_px = entry
@@ -695,43 +915,12 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
 
                 if not exited:
-                    exit_px = float(bar["close"])
-                    side = (open_side or "BUY")
-                    qty = float(open_qty or getattr(current_bracket, "qty", 0) or 0.0)
-                    entry_px = float(open_entry_px if open_entry_px is not None else bar["close"])
+                    _force_exit_current_position(bar, reason="WINDOW", i=i, exit_px=float(bar["close"]))
+                
+                equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
 
-                    side_mult = 1.0 if side == "BUY" else -1.0
-                    # equities: $ pnl = (exit-entry)*qty ; futures: use dpp
-                    if crypto_like or equity_like:
-                        pnl = (exit_px - entry_px) * side_mult * qty
-                    else:
-                        pnl = (exit_px - entry_px) * dpp * side_mult * qty
 
-                    om.trades.append({
-                        "ts": bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or None,
-                        "t_local": bar["t_local"],
-                        "action": "EXIT",
-                        "side": side,
-                        "qty": float(qty),
-                        "price": entry_px,
-                        "reason": "WINDOW",
-                        "exit_price": exit_px,
-                        "pnl": pnl,
-                        "fees_total": 0.0,
-                    })
-
-                    try:
-                        if open_risk_pts and float(open_risk_pts) > 0:
-                            pnl_pts = (exit_px - entry_px) * (1.0 if side == "BUY" else -1.0)
-                            R = pnl_pts / float(open_risk_pts)
-                            risk.record_trade_outcome_R(R)
-                            om.trades[-1]["R"] = float(R)
-                    except Exception:
-                        pass
-
-                    equity += pnl
-                    last_flat_i = i
-
+            # reset state (safe even if helper already reset)
             open_position = False
             current_bracket = None
             open_side = None
@@ -742,9 +931,30 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             open_risk_pts = None
             continue
 
+
         # manage OPEN position
         if open_position and current_bracket:
             before = len(om.trades)
+
+            # ---- Break-even stop adjustment (must happen before simulate_bracket) ----
+            current_bracket, open_be_locked, be_reason = _maybe_move_stop_to_be(
+                bar,
+                open_side=open_side,
+                open_entry_px=float(open_entry_px),
+                open_entry_ts=open_entry_ts,
+                current_bracket=current_bracket,
+                tick_size=float(fees["tick_size"]),
+                be_req_ticks=int(BE_REQ_TICKS),
+                be_lock_min=int(BE_LOCK_MIN),
+                be_armed=bool(open_be_locked),
+            )
+
+            if be_reason:
+                if why[be_reason] < 10:
+                    print(f"[BE] {symbol} side={open_side} t={bar['t_local']} close={bar['close']} stop->{current_bracket.stop_price}")
+                why[be_reason] += 1
+
+
             exit_info = om.simulate_bracket(bar, current_bracket)
 
             if not exit_info and len(om.trades) > before and om.trades[-1].get("action") == "EXIT":
@@ -766,12 +976,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 R = (pnl_pts / risk_pts) * side_mult
                 risk.record_trade_outcome_R(R)
 
-                if om.trades:
-                    last_exit = om.trades[-1]
-                    pnl_usd = float(last_exit.get("pnl", 0.0) or 0.0)
-                    fees_usd = float(last_exit.get("fees_total", 0.0) or 0.0)
-                    equity += (pnl_usd - fees_usd)
-                    last_flat_i = i
+                
+                #last_exit = om.trades[-1]
+                equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
+                last_flat_i = i
 
                 open_position = False
                 current_bracket = None
@@ -781,23 +989,39 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 open_entry_ts = None
                 open_be_locked = False
                 continue
+            # ---- EMA-based exit (forced exit; after bracket sim, before BE/time exits) ----
+            if open_position and current_bracket and open_entry_ts is not None and exit_on_ema:
+                ema_col = f"ema_exit_{exit_ema_len}"
+                if ema_col in df.columns:
+                    ema = float(bar[ema_col])
+                    side = (open_side or "").upper()
+                    close_px = float(bar["close"])
+                    high_px = float(bar.get("high", close_px))
+                    low_px  = float(bar.get("low", close_px))
 
-        # guarded BE lock
-        if open_position and current_bracket and open_entry_ts is not None and not open_be_locked:
-            if _minutes_between(open_entry_ts, bar["t_local"]) >= BE_LOCK_MIN:
-                tick = float(fees["tick_size"])
-                entry_px = float(open_entry_px)
-                px_now = float(bar["close"])
-                moved = (
-                    (open_side == "BUY" and px_now >= entry_px + BE_REQ_TICKS * tick) or
-                    (open_side == "SELL" and px_now <= entry_px - BE_REQ_TICKS * tick)
-                )
-                if moved:
-                    if open_side == "BUY":
-                        current_bracket.stop_price = max(float(current_bracket.stop_price), entry_px)
-                    else:
-                        current_bracket.stop_price = min(float(current_bracket.stop_price), entry_px)
-                    open_be_locked = True
+                    do_exit = False
+
+                    if exit_ema_side == "touch":
+                        if side == "BUY":
+                            do_exit = high_px >= ema
+                        else:  # SELL
+                            do_exit = low_px <= ema
+
+                    else:  # "cross"
+                        if i > 0:
+                            prev_close = float(df["close"].iloc[i - 1])
+                            prev_ema = float(df[ema_col].iloc[i - 1])
+                            if side == "BUY":
+                                do_exit = (prev_close < prev_ema) and (close_px >= ema)
+                            else:
+                                do_exit = (prev_close > prev_ema) and (close_px <= ema)
+                    if do_exit:
+                        if why["ema_exit"] < 5:
+                            print(f"[EMA EXIT] {symbol} side={side} t={bar['t_local']} close={close_px:.6f} ema={ema:.6f} mode={exit_ema_side}")
+                        why["ema_exit"] += 1
+                        _force_exit_current_position(bar, reason=f"EMA_EXIT_{exit_ema_len}_{exit_ema_side}", i=i, exit_px=close_px)
+                        equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
+                        continue
 
         # time-based exit
         if open_position and current_bracket and open_entry_ts is not None:
@@ -805,50 +1029,25 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 before = len(om.trades)
                 exit_info = om.simulate_bracket(bar, current_bracket)
                 exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
+
                 if not exited:
-                    exit_px = float(bar["close"])
-                    side = (open_side or "BUY")
-                    qty = float(open_qty or getattr(current_bracket, "qty", 0) or 0.0)
-                    entry_px = float(open_entry_px if open_entry_px is not None else bar["close"])
-                    side_mult = 1.0 if side == "BUY" else -1.0
-                    if crypto_like or equity_like:
-                        pnl = (exit_px - entry_px) * side_mult * qty
-                    else:
-                        pnl = (exit_px - entry_px) * dpp * side_mult * qty
+                    _force_exit_current_position(bar, reason="TIME", i=i, exit_px=float(bar["close"]))
+                else:
+                    # Bracket exited; we still need to reset open state here because we are not
+                    # in the "manage OPEN position" block when this triggers.
+                    open_position = False
+                    current_bracket = None
+                    open_side = None
+                    open_qty = 0.0
+                    open_entry_px = None
+                    open_entry_ts = None
+                    open_be_locked = False
+                    open_risk_pts = None
 
-                    om.trades.append({
-                        "ts": bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or None,
-                        "t_local": bar["t_local"],
-                        "action": "EXIT",
-                        "side": side,
-                        "qty": float(qty),
-                        "price": entry_px,
-                        "reason": "TIME",
-                        "exit_price": exit_px,
-                        "pnl": pnl,
-                        "fees_total": 0.0,
-                    })
+                equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
 
-                    try:
-                        if open_risk_pts and float(open_risk_pts) > 0:
-                            pnl_pts = (exit_px - entry_px) * (1.0 if side == "BUY" else -1.0)
-                            R = pnl_pts / float(open_risk_pts)
-                            risk.record_trade_outcome_R(R)
-                            om.trades[-1]["R"] = float(R)
-                    except Exception:
-                        pass
-
-                    equity += pnl
-                    last_flat_i = i
-
-                open_position = False
-                current_bracket = None
-                open_side = None
-                open_qty = 0.0
-                open_entry_px = None
-                open_entry_ts = None
-                open_be_locked = False
                 continue
+
 
         # new signal
         if not open_position and not risk.halted:
@@ -857,8 +1056,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 continue
 
             sig = strat.maybe_signal(bar, windows, risk)
+            strat_used = None
             if sig:
                 why["signal"] += 1
+                strat_used = strat
             else:
                 # Try fallback if primary has no signal
                 if fallback is not None:
@@ -866,6 +1067,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                     if sig:
                         why["signal_fallback"] += 1
                         why[f"signal_fallback_{fallback_name}"] += 1
+                        strat_used = fallback
                     else:
                         why["no_signal"] += 1
                         continue
@@ -931,6 +1133,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 continue
 
             why["entry_submitted"] += 1
+            if strat_used is not None and hasattr(strat_used, "on_entry_submitted"):
+                strat_used.on_entry_submitted(bar.name)
+
+            _mark_entry_for_throttles(strat_used, bar)
 
             if crypto_like:
                 sig["order"].qty = float(size)
@@ -947,6 +1153,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                     "bracket": sig["bracket"], 
                     "entry": entry,
                     "risk_pts": risk_pts,
+                    "strat_used": strat_used,
                 })
             else:
                 om.place_and_simulate(bar, sig["order"])
@@ -956,6 +1163,8 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 open_qty = float(sig["order"].qty)
                 open_entry_px = entry
                 open_entry_ts = bar["t_local"]
+                if hasattr(strat_used, "record_entry"):
+                    strat_used.record_entry(bar.name)
                 open_risk_pts = risk_pts
         else:
             if risk.halted:
@@ -986,11 +1195,23 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     total_pnl = float(exits["pnl"].sum()) if (exits is not None and not exits.empty and "pnl" in exits.columns) else 0.0
     winrate = float((exits["pnl"] > 0).mean() * 100.0) if (exits is not None and not exits.empty and "pnl" in exits.columns) else 0.0
 
-    # Artifacts per symbol
+    # Artifacts per symbol (optionally separated per run)
     safe_sym = symbol.replace("/", "_")
+
+    # Default location: logs/bt_<SYMBOL>
     logs_dir = Path("logs") / f"bt_{safe_sym}"
+
+    # If caller supplies --outdir, use it instead (e.g. logs/sweeps/<sweep_id>)
+    if args.outdir:
+        logs_dir = Path(args.outdir)
+
+    # If caller supplies --run-tag, nest under it (e.g. lock12_ticks2)
+    if args.run_tag:
+        logs_dir = logs_dir / str(args.run_tag)
+
     logs_dir.mkdir(parents=True, exist_ok=True)
-    trades_df.to_csv(logs_dir / "backtest_trades.csv", index=False)
+
+    # trades_df.to_csv(logs_dir / "backtest_trades.csv", index=False)
 
     pnl_series = equity_curve(om.trades)
     if args.no_gui:
@@ -1016,6 +1237,8 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
     summary = summarize_equity(equity_full, trades_df)
 
+    summary["EndEquity"] = float(equity)
+
     # ---- WHY diagnostics (always print top reasons) ----
     top = sorted(why.items(), key=lambda kv: kv[1], reverse=True)[:12]
     print(f"[WHY] {symbol} top reasons:", top)
@@ -1029,10 +1252,19 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
 
     summary["EndEquity"] = float(equity)
-    write_artifacts(equity_full, trades_df, summary, logs_dir=str(logs_dir))
+    write_artifacts(
+        equity_full, 
+        trades_df, 
+        summary, 
+        logs_dir=str(logs_dir), 
+        write_equity=not args.light_artifacts
+        )
     if int(summary.get("Trades", 0) or 0) == 0:
         print(f"[WHY] {symbol} top reasons: {why.most_common(8)}")
-
+    if symbol == "XRP/USDT" and hasattr(strat, "_why"):
+        print("[WHY][RSI_MR] XRP gate counts (top 15):", strat._why.most_common(15))
+    if symbol == "XRP/USDT" and fallback is not None and hasattr(fallback, "_why"):
+        print("[WHY][RSI_MR] XRP fallback gate counts (top 15):", fallback._why.most_common(15))
     print(f"[RESULT] {symbol} Trades={summary.get('Trades', 0)} WinRate={summary.get('WinRate', 0):.1f}% "
           f"PF={summary.get('ProfitFactor')} NetPnL=${summary.get('NetPnL', 0):.2f} logs={logs_dir}")
 
@@ -1075,7 +1307,9 @@ def main():
     ap.add_argument("--min-equity", type=float, default=0.0)
     ap.add_argument("--start-date", dest="start_date", default=None, help="YYYY-MM-DD inclusive")
     ap.add_argument("--end-date", dest="end_date", default=None, help="YYYY-MM-DD inclusive")
-
+    ap.add_argument("--outdir", default=None, help="Artifacts output directory")
+    ap.add_argument("--run-tag", default=None, help="Subfolder name under outdir (or under default bt_<symbol>)")
+    ap.add_argument("--light-artifacts", action="store_true", help="Skip large artifacts (equity_curve.csv)")
 
 
     args = ap.parse_args()
@@ -1103,31 +1337,90 @@ def main():
 
 
 
-    universe_cfg = _load_yaml_if_exists(args.universe)
+    universe_cfg = _load_yaml_if_exists(args.universe) or {}
 
-    # Decide symbols
-    symbols = []
+    asset_class = (universe_cfg.get("asset_class") or "").lower()
+
+    # --- Build symbol_entries lookup from universe_cfg["symbols"] ALWAYS ---
+    symbol_entries: dict[str, dict] = {}
+
+    raw_syms = universe_cfg.get("symbols") or []
+    if raw_syms and isinstance(raw_syms[0], dict):
+        for entry in raw_syms:
+            sym0 = entry.get("symbol")
+            if not sym0:
+                raise ValueError(f"Universe symbols entries must include 'symbol'. Bad entry={entry}")
+
+            k0 = sym0 if asset_class == "crypto" else str(sym0).upper()
+
+            e0 = dict(entry)
+            e0.pop("symbol", None)          # IMPORTANT: don't leak symbol into merge
+            symbol_entries[k0] = e0
+
+
+
+    def norm_sym(s: str) -> str:
+        s = str(s)
+        return s if asset_class == "crypto" else s.upper()
+
+    # Decide symbols + build per-symbol entries
+    symbols: list[str] = []
+
     if args.all:
-        symbols = [s.upper() for s in (universe_cfg.get("symbols") or [])]
+        # Run all symbols listed in universe
+        if raw_syms and isinstance(raw_syms[0], dict):
+            symbols = list(symbol_entries.keys())
+        else:
+            symbols = [s if asset_class == "crypto" else str(s).upper() for s in (raw_syms or [])]
         if not symbols:
             raise SystemExit("You passed --all but universe has no symbols.")
     else:
         if not args.symbol:
             raise SystemExit("Pass --symbol <SYM> or use --all with --universe.")
-        symbols = [args.symbol.upper()]
+        sym_in = args.symbol if asset_class == "crypto" else str(args.symbol).upper()
+        symbols = [sym_in]
+
 
     results = []
+
+    base_universe = dict(universe_cfg)
+    base_universe.pop("symbols", None)
+
     for sym in symbols:
         # Choose CSV path
         if args.csv:
             csv_path = args.csv
         else:
             base = args.csv_dir or "data"
-            csv_sym = _symbol_to_csv_stem(sym)
-            csv_path = str(Path(base) / f"{csv_sym}_live_1m.csv")
 
-        r = run_one_symbol(args=args, symbol=sym, csv_path=csv_path, universe_cfg=universe_cfg if args.universe else None)
+            # OPTIONAL: if you want per-symbol timeframe naming later, support it here.
+            # Example: look for per-sym override: backfill.timeframe == "15m" and name accordingly.
+            per_sym_cfg = symbol_entries.get(sym, {})
+            tf = None
+            backfill = per_sym_cfg.get("backfill") or base_universe.get("backfill") or {}
+            if isinstance(backfill, dict):
+                tf = backfill.get("timeframe")
+
+            csv_sym = _symbol_to_csv_stem(sym)
+            # keep your current behavior by default:
+            suffix = "1m"
+            # If you ever decide to separate files by timeframe:
+            # if tf in ("15m", "1h", "5m"): suffix = tf
+
+            csv_path = str(Path(base) / f"{csv_sym}_live_{suffix}.csv")
+
+        per_sym = symbol_entries.get(sym, {})  # {} if old string list format
+        merged_universe_cfg = deep_merge(base_universe, per_sym)
+        merged_universe_cfg["symbol"] = sym
+
+        r = run_one_symbol(
+            args=args,
+            symbol=sym,
+            csv_path=csv_path,
+            universe_cfg=merged_universe_cfg,
+        )
         results.append(r)
+
 
     # Print combined summary
     df = pd.DataFrame(results)

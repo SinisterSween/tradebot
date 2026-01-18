@@ -133,9 +133,10 @@ def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None) -> dict:
         "PayoffRatio": payoff_ratio,
     }
 
-def write_artifacts(equity: pd.Series, trades: pd.DataFrame | None, summary: dict, logs_dir: str = "logs") -> None:
+def write_artifacts(equity: pd.Series, trades: pd.DataFrame | None, summary: dict, 
+                    logs_dir: str = "logs", write_equity: bool = True) -> None:
     os.makedirs(logs_dir, exist_ok=True)
-    if isinstance(equity, pd.Series):
+    if write_equity and isinstance(equity, pd.Series):
         equity.to_csv(os.path.join(logs_dir, "equity_curve.csv"))
     if trades is not None:
         trades.to_csv(os.path.join(logs_dir, "backtest_trades.csv"), index=False)

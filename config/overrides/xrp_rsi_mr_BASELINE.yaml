@@ -1,0 +1,397 @@
+strategy:
+  name: rsi_mean_reversion
+  fallback: null
+  allow_shorts: false
+  allow_longs: true
+  target_vwap: false
+
+  rsi_len: 14
+  rsi_buy_below: 28
+  rsi_sell_above: 72
+
+  atr_len: 14
+  atr_mult: 1.0
+  target_R: 0.3
+  stop_pad_ticks: 20
+
+  require_cross: false
+  min_minutes_between_trades: 0
+  max_trades_per_day: 0
+
+  min_atr_pct: 0.00005
+  slope_max: 0.02
+
+  ema_slope_atr_min: -0.2
+  ema_slope_max: 0.0
+  ema_dist_atr_min: 6.0
+  ema_dist_atr_max: 999
+
+  exit_on_ema: true
+  exit_ema_len: 20
+  exit_ema_side: cross
+
+  vwap_entry_min_atr: 0.0
+  vwap_entry_max_atr: 999
+  min_vwap_target_R: 0.0
+
+  use_early_range_target: true
+  early_range_mult: 1.0
+  early_min_range_atr: 0.05
+  require_early_done: false
+
+  use_session_open_stop: true
+  session_open_stop_atr_pad: 0.25
+
+risk:
+  min_notional_usd: 1
+
+
+#RESULTS:
+# (tradebot) hatefulsween@HatefulSweens-MacBook-Pro tradebot % PYTHONPATH=. .venv/bin/python run_backtest.py \
+#   --profile config/profile/crypto.yaml \
+#   --universe config/universes/crypto_all.yaml \
+#   --symbol XRP/USDT \
+#   --csv data/XRP_USDT_live_1m.csv \
+#   --start-date 2025-07-15 \
+#   --end-date 2026-01-11 \
+#   --no-gui
+
+# [PREP] tz=UTC orb=5 rsi_len=14 atr_len=14 ema_fast_len=50
+# [SANITY.FEAT] vwap nan%: 0.000405083215666304
+# [SANITY.FEAT] atr  nan%: 0.0
+# [SANITY.FEAT] atr<=0 %: 3.857935387298133e-06
+# [SANITY.FEAT] volume<=0 %: 0.6309383270448986
+# [FEATURES] rsi_len=14 ready
+# [CHK] exit ema col exists: True head: [2.8666, 2.8663238095238097, 2.8658643990929704]
+# [CHK] cols: ['ema_slope_atr', 'ema_dist_atr', 'ema_slope', 'atr']
+# [CHK] ema_slope_atr head: [0.0, 0.0, 0.0]
+# [DIAG][XRP] ema_slope p50/p90/p99: {0.5: 9.655812759579163e-06, 0.9: 0.0017371266888244197, 0.99: 0.004815555536978226}
+# [DIAG][XRP] ema_slope_atr p50/p90/p99: {0.5: 0.012760603182712644, 0.9: 1.8280711888905254, 0.99: 4.137331060646139}
+# [DIAG][XRP] ema_dist_atr p50/p90/p99: {0.5: 4.712690253275209, 0.9: 12.252679378574376, 0.99: 22.994474014279934}
+# [DIAG][XRP] vwap_slope p50/p90/p99: {0.5: 0.0, 0.9: 4.794957143783307e-06, 0.99: 0.0005839868581135063}
+# [DIAG] dist_from_vwap_atr valid=0.9996 nan=0.0004
+# [DIAG] dist_from_vwap_atr pct>=0.9: 0.9619
+# [DIAG] dist_from_vwap_atr pct>=1.5: 0.9387
+# [DIAG] dist_from_vwap_atr p50/p90/p99: {0.5: 16.993208381098007, 0.9: 62.6518135415457, 0.99: 202.61644252202072}
+# [TSCHK] XRP/USDT index[:3] = [Timestamp('2025-07-15 19:52:00+0000', tz='UTC'), Timestamp('2025-07-15 19:53:00+0000', tz='UTC'), Timestamp('2025-07-15 19:54:00+0000', tz='UTC')]
+# [TSCHK] XRP/USDT t_local head3 = ['19:52', '19:53', '19:54']
+# [TSCHK] XRP/USDT t_local tail3 = ['19:55', '19:56', '19:57']
+# [TSCHK] XRP/USDT date head/tail = 2025-07-15 -> 2026-01-11
+# [SANITY] XRP/USDT bars=259206 tradable=259206 tradable_pct=1.0
+# [SANITY] XRP/USDT index first/last: 2025-07-15 19:52:00+00:00 -> 2026-01-11 19:57:00+00:00
+# [SANITY] XRP/USDT tod min/max: 00:00 -> 23:59
+# [SANITY] XRP/USDT dates: 2025-07-15 -> 2026-01-11
+# [CFG] XRP/USDT orb=None atr_mult=1.0 slope_min=None
+# [STRATEGY] XRP/USDT -> RsiMeanReversion
+# [RsiMeanReversion] target_vwap=False
+# [STRAT.CFG] XRP/USDT RsiMeanReversion cfg=StratConfig(rsi_len=14, rsi_buy_below=28.0, rsi_sell_above=72.0, atr_mult=1.0, target_R=0.3, stop_pad_ticks=20, allow_longs=True, allow_shorts=False, slope_max=0.02, min_atr_pct=5e-05, tick_size=0.0001, tick_value=0.0001, target_vwap=False, require_cross=False, min_minutes_between_trades=0, max_trades_per_day=0, ema_slope_max=0.0, ema_slope_atr_min=-0.2, ema_dist_atr_min=6.0, ema_dist_atr_max=999.0, exit_on_ema=True, exit_ema_len=20, exit_ema_side='cross', min_vwap_target_R=0.0, vwap_entry_min_atr=0.0, vwap_entry_max_atr=999.0, use_session_open_stop=True, session_open_stop_atr_pad=0.25, use_early_range_target=True, early_range_mult=1.0, early_min_range_atr=0.05, require_early_done=False)
+# [EXEC KNOBS] XRP/USDT BE_LOCK_MIN=15 BE_REQ_TICKS=1 MAX_HOLD_MIN=45 HARD_CUTOFF_R=-0.25 HARD_CUTOFF_MIN=10 MIN_WIN_END=10
+# [WHY] XRP/USDT top reasons: [('no_signal', 252126), ('signal', 352), ('entry_submitted', 351), ('skip_window_end', 1)]
+# [WHY][RSI_MR] XRP gate counts (top 15): [('ema_slope_atr_min', 103405), ('ema_dist_atr_min', 93438), ('shorts_disabled', 33397), ('no_threshold', 14916), ('min_atr_pct', 6894), ('vwap_slope', 75), ('bad_price_or_atr', 1)]
+# [RESULT] XRP/USDT Trades=350 WinRate=64.0% PF=1.0092669451935614 NetPnL=$27.33 logs=logs/bt_XRP_USDT
+
+# === BACKTEST SUMMARY ===
+#   Symbol Status  Trades  WinRate  ProfitFactor    NetPnL                       CSV
+# XRP/USDT     OK     350     64.0      1.009267 27.330947 data/XRP_USDT_live_1m.csv
+
+# [COMBINED] Symbols OK=1 TotalNetPnL=$27.33
+
+
+#Turning of exit ema: 
+# (tradebot) hatefulsween@HatefulSweens-MacBook-Pro tradebot % PYTHONPATH=. .venv/bin/python run_backtest.py \
+#   --profile config/profile/crypto.yaml \
+#   --universe config/universes/crypto_all.yaml \
+#   --symbol XRP/USDT \
+#   --csv data/XRP_USDT_live_1m.csv \
+#   --start-date 2025-07-15 \
+#   --end-date 2026-01-11 \
+#   --no-gui
+
+# [PREP] tz=UTC orb=5 rsi_len=14 atr_len=14 ema_fast_len=50
+# [SANITY.FEAT] vwap nan%: 0.000405083215666304
+# [SANITY.FEAT] atr  nan%: 0.0
+# [SANITY.FEAT] atr<=0 %: 3.857935387298133e-06
+# [SANITY.FEAT] volume<=0 %: 0.6309383270448986
+# [FEATURES] rsi_len=14 ready
+# [CHK] cols: ['ema_slope_atr', 'ema_dist_atr', 'ema_slope', 'atr']
+# [CHK] ema_slope_atr head: [0.0, 0.0, 0.0]
+# [DIAG][XRP] ema_slope p50/p90/p99: {0.5: 9.655812759579163e-06, 0.9: 0.0017371266888244197, 0.99: 0.004815555536978226}
+# [DIAG][XRP] ema_slope_atr p50/p90/p99: {0.5: 0.012760603182712644, 0.9: 1.8280711888905254, 0.99: 4.137331060646139}
+# [DIAG][XRP] ema_dist_atr p50/p90/p99: {0.5: 4.712690253275209, 0.9: 12.252679378574376, 0.99: 22.994474014279934}
+# [DIAG][XRP] vwap_slope p50/p90/p99: {0.5: 0.0, 0.9: 4.794957143783307e-06, 0.99: 0.0005839868581135063}
+# [DIAG] dist_from_vwap_atr valid=0.9996 nan=0.0004
+# [DIAG] dist_from_vwap_atr pct>=0.9: 0.9619
+# [DIAG] dist_from_vwap_atr pct>=1.5: 0.9387
+# [DIAG] dist_from_vwap_atr p50/p90/p99: {0.5: 16.993208381098007, 0.9: 62.6518135415457, 0.99: 202.61644252202072}
+# [TSCHK] XRP/USDT index[:3] = [Timestamp('2025-07-15 19:52:00+0000', tz='UTC'), Timestamp('2025-07-15 19:53:00+0000', tz='UTC'), Timestamp('2025-07-15 19:54:00+0000', tz='UTC')]
+# [TSCHK] XRP/USDT t_local head3 = ['19:52', '19:53', '19:54']
+# [TSCHK] XRP/USDT t_local tail3 = ['19:55', '19:56', '19:57']
+# [TSCHK] XRP/USDT date head/tail = 2025-07-15 -> 2026-01-11
+# [SANITY] XRP/USDT bars=259206 tradable=259206 tradable_pct=1.0
+# [SANITY] XRP/USDT index first/last: 2025-07-15 19:52:00+00:00 -> 2026-01-11 19:57:00+00:00
+# [SANITY] XRP/USDT tod min/max: 00:00 -> 23:59
+# [SANITY] XRP/USDT dates: 2025-07-15 -> 2026-01-11
+# [CFG] XRP/USDT orb=None atr_mult=1.0 slope_min=None
+# [STRATEGY] XRP/USDT -> RsiMeanReversion
+# [RsiMeanReversion] target_vwap=False
+# [STRAT.CFG] XRP/USDT RsiMeanReversion cfg=StratConfig(rsi_len=14, rsi_buy_below=28.0, rsi_sell_above=72.0, atr_mult=1.0, target_R=0.3, stop_pad_ticks=20, allow_longs=True, allow_shorts=False, slope_max=0.02, min_atr_pct=5e-05, tick_size=0.0001, tick_value=0.0001, target_vwap=False, require_cross=False, min_minutes_between_trades=0, max_trades_per_day=0, ema_slope_max=0.0, ema_slope_atr_min=-0.2, ema_dist_atr_min=6.0, ema_dist_atr_max=999.0, exit_on_ema=False, exit_ema_len=20, exit_ema_side='cross', min_vwap_target_R=0.0, vwap_entry_min_atr=0.0, vwap_entry_max_atr=999.0, use_session_open_stop=True, session_open_stop_atr_pad=0.25, use_early_range_target=True, early_range_mult=1.0, early_min_range_atr=0.05, require_early_done=False)
+# [EXEC KNOBS] XRP/USDT BE_LOCK_MIN=15 BE_REQ_TICKS=1 MAX_HOLD_MIN=45 HARD_CUTOFF_R=-0.25 HARD_CUTOFF_MIN=10 MIN_WIN_END=10
+# [WHY] XRP/USDT top reasons: [('no_signal', 246342), ('signal', 346), ('entry_submitted', 345), ('skip_window_end', 1)]
+# [WHY][RSI_MR] XRP gate counts (top 15): [('ema_slope_atr_min', 101026), ('ema_dist_atr_min', 91096), ('shorts_disabled', 32645), ('no_threshold', 14724), ('min_atr_pct', 6775), ('vwap_slope', 75), ('bad_price_or_atr', 1)]
+# [RESULT] XRP/USDT Trades=339 WinRate=45.1% PF=0.652820632898159 NetPnL=$-1382.55 logs=logs/bt_XRP_USDT
+
+# === BACKTEST SUMMARY ===
+#   Symbol Status  Trades   WinRate  ProfitFactor       NetPnL                       CSV
+# XRP/USDT     OK     339 45.132743      0.652821 -1382.554251 data/XRP_USDT_live_1m.csv
+
+# [COMBINED] Symbols OK=1 TotalNetPnL=$-1382.55
+
+#Exit on and side = TOUCH:
+# (tradebot) hatefulsween@HatefulSweens-MacBook-Pro tradebot % PYTHONPATH=. .venv/bin/python run_backtest.py \
+#   --profile config/profile/crypto.yaml \
+#   --universe config/universes/crypto_all.yaml \
+#   --symbol XRP/USDT \
+#   --csv data/XRP_USDT_live_1m.csv \
+#   --start-date 2025-07-15 \
+#   --end-date 2026-01-11 \
+#   --no-gui
+
+# [PREP] tz=UTC orb=5 rsi_len=14 atr_len=14 ema_fast_len=50
+# [SANITY.FEAT] vwap nan%: 0.000405083215666304
+# [SANITY.FEAT] atr  nan%: 0.0
+# [SANITY.FEAT] atr<=0 %: 3.857935387298133e-06
+# [SANITY.FEAT] volume<=0 %: 0.6309383270448986
+# [FEATURES] rsi_len=14 ready
+# [CHK] exit ema col exists: True head: [2.8666, 2.8663238095238097, 2.8658643990929704]
+# [CHK] cols: ['ema_slope_atr', 'ema_dist_atr', 'ema_slope', 'atr']
+# [CHK] ema_slope_atr head: [0.0, 0.0, 0.0]
+# [DIAG][XRP] ema_slope p50/p90/p99: {0.5: 9.655812759579163e-06, 0.9: 0.0017371266888244197, 0.99: 0.004815555536978226}
+# [DIAG][XRP] ema_slope_atr p50/p90/p99: {0.5: 0.012760603182712644, 0.9: 1.8280711888905254, 0.99: 4.137331060646139}
+# [DIAG][XRP] ema_dist_atr p50/p90/p99: {0.5: 4.712690253275209, 0.9: 12.252679378574376, 0.99: 22.994474014279934}
+# [DIAG][XRP] vwap_slope p50/p90/p99: {0.5: 0.0, 0.9: 4.794957143783307e-06, 0.99: 0.0005839868581135063}
+# [DIAG] dist_from_vwap_atr valid=0.9996 nan=0.0004
+# [DIAG] dist_from_vwap_atr pct>=0.9: 0.9619
+# [DIAG] dist_from_vwap_atr pct>=1.5: 0.9387
+# [DIAG] dist_from_vwap_atr p50/p90/p99: {0.5: 16.993208381098007, 0.9: 62.6518135415457, 0.99: 202.61644252202072}
+# [TSCHK] XRP/USDT index[:3] = [Timestamp('2025-07-15 19:52:00+0000', tz='UTC'), Timestamp('2025-07-15 19:53:00+0000', tz='UTC'), Timestamp('2025-07-15 19:54:00+0000', tz='UTC')]
+# [TSCHK] XRP/USDT t_local head3 = ['19:52', '19:53', '19:54']
+# [TSCHK] XRP/USDT t_local tail3 = ['19:55', '19:56', '19:57']
+# [TSCHK] XRP/USDT date head/tail = 2025-07-15 -> 2026-01-11
+# [SANITY] XRP/USDT bars=259206 tradable=259206 tradable_pct=1.0
+# [SANITY] XRP/USDT index first/last: 2025-07-15 19:52:00+00:00 -> 2026-01-11 19:57:00+00:00
+# [SANITY] XRP/USDT tod min/max: 00:00 -> 23:59
+# [SANITY] XRP/USDT dates: 2025-07-15 -> 2026-01-11
+# [CFG] XRP/USDT orb=None atr_mult=1.0 slope_min=None
+# [STRATEGY] XRP/USDT -> RsiMeanReversion
+# [RsiMeanReversion] target_vwap=False
+# [STRAT.CFG] XRP/USDT RsiMeanReversion cfg=StratConfig(rsi_len=14, rsi_buy_below=28.0, rsi_sell_above=72.0, atr_mult=1.0, target_R=0.3, stop_pad_ticks=20, allow_longs=True, allow_shorts=False, slope_max=0.02, min_atr_pct=5e-05, tick_size=0.0001, tick_value=0.0001, target_vwap=False, require_cross=False, min_minutes_between_trades=0, max_trades_per_day=0, ema_slope_max=0.0, ema_slope_atr_min=-0.2, ema_dist_atr_min=6.0, ema_dist_atr_max=999.0, exit_on_ema=True, exit_ema_len=20, exit_ema_side='touch', min_vwap_target_R=0.0, vwap_entry_min_atr=0.0, vwap_entry_max_atr=999.0, use_session_open_stop=True, session_open_stop_atr_pad=0.25, use_early_range_target=True, early_range_mult=1.0, early_min_range_atr=0.05, require_early_done=False)
+# [EXEC KNOBS] XRP/USDT BE_LOCK_MIN=15 BE_REQ_TICKS=1 MAX_HOLD_MIN=45 HARD_CUTOFF_R=-0.25 HARD_CUTOFF_MIN=10 MIN_WIN_END=10
+# [WHY] XRP/USDT top reasons: [('no_signal', 252126), ('signal', 352), ('entry_submitted', 351), ('skip_window_end', 1)]
+# [WHY][RSI_MR] XRP gate counts (top 15): [('ema_slope_atr_min', 103405), ('ema_dist_atr_min', 93438), ('shorts_disabled', 33397), ('no_threshold', 14916), ('min_atr_pct', 6894), ('vwap_slope', 75), ('bad_price_or_atr', 1)]
+# [RESULT] XRP/USDT Trades=350 WinRate=64.0% PF=1.0092669451935614 NetPnL=$27.33 logs=logs/bt_XRP_USDT
+
+# === BACKTEST SUMMARY ===
+#   Symbol Status  Trades  WinRate  ProfitFactor    NetPnL                       CSV
+# XRP/USDT     OK     350     64.0      1.009267 27.330947 data/XRP_USDT_live_1m.csv
+
+# [COMBINED] Symbols OK=1 TotalNetPnL=$27.33
+
+# Slope ema atr min -0.1:
+# (tradebot) hatefulsween@HatefulSweens-MacBook-Pro tradebot % PYTHONPATH=. .venv/bin/python run_backtest.py \
+#   --profile config/profile/crypto.yaml \
+#   --universe config/universes/crypto_all.yaml \
+#   --symbol XRP/USDT \
+#   --csv data/XRP_USDT_live_1m.csv \
+#   --start-date 2025-07-15 \
+#   --end-date 2026-01-11 \
+#   --no-gui
+
+# [PREP] tz=UTC orb=5 rsi_len=14 atr_len=14 ema_fast_len=50
+# [SANITY.FEAT] vwap nan%: 0.000405083215666304
+# [SANITY.FEAT] atr  nan%: 0.0
+# [SANITY.FEAT] atr<=0 %: 3.857935387298133e-06
+# [SANITY.FEAT] volume<=0 %: 0.6309383270448986
+# [FEATURES] rsi_len=14 ready
+# [CHK] exit ema col exists: True head: [2.8666, 2.8663238095238097, 2.8658643990929704]
+# [CHK] cols: ['ema_slope_atr', 'ema_dist_atr', 'ema_slope', 'atr']
+# [CHK] ema_slope_atr head: [0.0, 0.0, 0.0]
+# [DIAG][XRP] ema_slope p50/p90/p99: {0.5: 9.655812759579163e-06, 0.9: 0.0017371266888244197, 0.99: 0.004815555536978226}
+# [DIAG][XRP] ema_slope_atr p50/p90/p99: {0.5: 0.012760603182712644, 0.9: 1.8280711888905254, 0.99: 4.137331060646139}
+# [DIAG][XRP] ema_dist_atr p50/p90/p99: {0.5: 4.712690253275209, 0.9: 12.252679378574376, 0.99: 22.994474014279934}
+# [DIAG][XRP] vwap_slope p50/p90/p99: {0.5: 0.0, 0.9: 4.794957143783307e-06, 0.99: 0.0005839868581135063}
+# [DIAG] dist_from_vwap_atr valid=0.9996 nan=0.0004
+# [DIAG] dist_from_vwap_atr pct>=0.9: 0.9619
+# [DIAG] dist_from_vwap_atr pct>=1.5: 0.9387
+# [DIAG] dist_from_vwap_atr p50/p90/p99: {0.5: 16.993208381098007, 0.9: 62.6518135415457, 0.99: 202.61644252202072}
+# [TSCHK] XRP/USDT index[:3] = [Timestamp('2025-07-15 19:52:00+0000', tz='UTC'), Timestamp('2025-07-15 19:53:00+0000', tz='UTC'), Timestamp('2025-07-15 19:54:00+0000', tz='UTC')]
+# [TSCHK] XRP/USDT t_local head3 = ['19:52', '19:53', '19:54']
+# [TSCHK] XRP/USDT t_local tail3 = ['19:55', '19:56', '19:57']
+# [TSCHK] XRP/USDT date head/tail = 2025-07-15 -> 2026-01-11
+# [SANITY] XRP/USDT bars=259206 tradable=259206 tradable_pct=1.0
+# [SANITY] XRP/USDT index first/last: 2025-07-15 19:52:00+00:00 -> 2026-01-11 19:57:00+00:00
+# [SANITY] XRP/USDT tod min/max: 00:00 -> 23:59
+# [SANITY] XRP/USDT dates: 2025-07-15 -> 2026-01-11
+# [CFG] XRP/USDT orb=None atr_mult=1.0 slope_min=None
+# [STRATEGY] XRP/USDT -> RsiMeanReversion
+# [RsiMeanReversion] target_vwap=False
+# [STRAT.CFG] XRP/USDT RsiMeanReversion cfg=StratConfig(rsi_len=14, rsi_buy_below=28.0, rsi_sell_above=72.0, atr_mult=1.0, target_R=0.3, stop_pad_ticks=20, allow_longs=True, allow_shorts=False, slope_max=0.02, min_atr_pct=5e-05, tick_size=0.0001, tick_value=0.0001, target_vwap=False, require_cross=False, min_minutes_between_trades=0, max_trades_per_day=0, ema_slope_max=0.0, ema_slope_atr_min=-0.1, ema_dist_atr_min=6.0, ema_dist_atr_max=999.0, exit_on_ema=True, exit_ema_len=20, exit_ema_side='cross', min_vwap_target_R=0.0, vwap_entry_min_atr=0.0, vwap_entry_max_atr=999.0, use_session_open_stop=True, session_open_stop_atr_pad=0.25, use_early_range_target=True, early_range_mult=1.0, early_min_range_atr=0.05, require_early_done=False)
+# [EXEC KNOBS] XRP/USDT BE_LOCK_MIN=15 BE_REQ_TICKS=1 MAX_HOLD_MIN=45 HARD_CUTOFF_R=-0.25 HARD_CUTOFF_MIN=10 MIN_WIN_END=10
+# [WHY] XRP/USDT top reasons: [('no_signal', 253849), ('signal', 252), ('entry_submitted', 252)]
+# [WHY][RSI_MR] XRP gate counts (top 15): [('ema_slope_atr_min', 112409), ('ema_dist_atr_min', 86174), ('shorts_disabled', 33335), ('no_threshold', 14905), ('min_atr_pct', 6950), ('vwap_slope', 75), ('bad_price_or_atr', 1)]
+# [RESULT] XRP/USDT Trades=251 WinRate=62.5% PF=1.0148483407389919 NetPnL=$34.78 logs=logs/bt_XRP_USDT
+
+# === BACKTEST SUMMARY ===
+#   Symbol Status  Trades   WinRate  ProfitFactor    NetPnL                       CSV
+# XRP/USDT     OK     251 62.549801      1.014848 34.777885 data/XRP_USDT_live_1m.csv
+
+# [COMBINED] Symbols OK=1 TotalNetPnL=$34.78
+
+# slope ema atr min 0.0:
+# (tradebot) hatefulsween@HatefulSweens-MacBook-Pro tradebot % PYTHONPATH=. .venv/bin/python run_backtest.py \
+#   --profile config/profile/crypto.yaml \
+#   --universe config/universes/crypto_all.yaml \
+#   --symbol XRP/USDT \
+#   --csv data/XRP_USDT_live_1m.csv \
+#   --start-date 2025-07-15 \
+#   --end-date 2026-01-11 \
+#   --no-gui
+
+# [PREP] tz=UTC orb=5 rsi_len=14 atr_len=14 ema_fast_len=50
+# [SANITY.FEAT] vwap nan%: 0.000405083215666304
+# [SANITY.FEAT] atr  nan%: 0.0
+# [SANITY.FEAT] atr<=0 %: 3.857935387298133e-06
+# [SANITY.FEAT] volume<=0 %: 0.6309383270448986
+# [FEATURES] rsi_len=14 ready
+# [CHK] exit ema col exists: True head: [2.8666, 2.8663238095238097, 2.8658643990929704]
+# [CHK] cols: ['ema_slope_atr', 'ema_dist_atr', 'ema_slope', 'atr']
+# [CHK] ema_slope_atr head: [0.0, 0.0, 0.0]
+# [DIAG][XRP] ema_slope p50/p90/p99: {0.5: 9.655812759579163e-06, 0.9: 0.0017371266888244197, 0.99: 0.004815555536978226}
+# [DIAG][XRP] ema_slope_atr p50/p90/p99: {0.5: 0.012760603182712644, 0.9: 1.8280711888905254, 0.99: 4.137331060646139}
+# [DIAG][XRP] ema_dist_atr p50/p90/p99: {0.5: 4.712690253275209, 0.9: 12.252679378574376, 0.99: 22.994474014279934}
+# [DIAG][XRP] vwap_slope p50/p90/p99: {0.5: 0.0, 0.9: 4.794957143783307e-06, 0.99: 0.0005839868581135063}
+# [DIAG] dist_from_vwap_atr valid=0.9996 nan=0.0004
+# [DIAG] dist_from_vwap_atr pct>=0.9: 0.9619
+# [DIAG] dist_from_vwap_atr pct>=1.5: 0.9387
+# [DIAG] dist_from_vwap_atr p50/p90/p99: {0.5: 16.993208381098007, 0.9: 62.6518135415457, 0.99: 202.61644252202072}
+# [TSCHK] XRP/USDT index[:3] = [Timestamp('2025-07-15 19:52:00+0000', tz='UTC'), Timestamp('2025-07-15 19:53:00+0000', tz='UTC'), Timestamp('2025-07-15 19:54:00+0000', tz='UTC')]
+# [TSCHK] XRP/USDT t_local head3 = ['19:52', '19:53', '19:54']
+# [TSCHK] XRP/USDT t_local tail3 = ['19:55', '19:56', '19:57']
+# [TSCHK] XRP/USDT date head/tail = 2025-07-15 -> 2026-01-11
+# [SANITY] XRP/USDT bars=259206 tradable=259206 tradable_pct=1.0
+# [SANITY] XRP/USDT index first/last: 2025-07-15 19:52:00+00:00 -> 2026-01-11 19:57:00+00:00
+# [SANITY] XRP/USDT tod min/max: 00:00 -> 23:59
+# [SANITY] XRP/USDT dates: 2025-07-15 -> 2026-01-11
+# [CFG] XRP/USDT orb=None atr_mult=1.0 slope_min=None
+# [STRATEGY] XRP/USDT -> RsiMeanReversion
+# [RsiMeanReversion] target_vwap=False
+# [STRAT.CFG] XRP/USDT RsiMeanReversion cfg=StratConfig(rsi_len=14, rsi_buy_below=28.0, rsi_sell_above=72.0, atr_mult=1.0, target_R=0.3, stop_pad_ticks=20, allow_longs=True, allow_shorts=False, slope_max=0.02, min_atr_pct=5e-05, tick_size=0.0001, tick_value=0.0001, target_vwap=False, require_cross=False, min_minutes_between_trades=0, max_trades_per_day=0, ema_slope_max=0.0, ema_slope_atr_min=0.0, ema_dist_atr_min=6.0, ema_dist_atr_max=999.0, exit_on_ema=True, exit_ema_len=20, exit_ema_side='cross', min_vwap_target_R=0.0, vwap_entry_min_atr=0.0, vwap_entry_max_atr=999.0, use_session_open_stop=True, session_open_stop_atr_pad=0.25, use_early_range_target=True, early_range_mult=1.0, early_min_range_atr=0.05, require_early_done=False)
+# [EXEC KNOBS] XRP/USDT BE_LOCK_MIN=15 BE_REQ_TICKS=1 MAX_HOLD_MIN=45 HARD_CUTOFF_R=-0.25 HARD_CUTOFF_MIN=10 MIN_WIN_END=10
+# [WHY] XRP/USDT top reasons: [('no_signal', 255525), ('signal', 167), ('entry_submitted', 167)]
+# [WHY][RSI_MR] XRP gate counts (top 15): [('ema_slope_atr_min', 121445), ('ema_dist_atr_min', 78791), ('shorts_disabled', 33273), ('no_threshold', 14898), ('min_atr_pct', 7042), ('vwap_slope', 75), ('bad_price_or_atr', 1)]
+# [RESULT] XRP/USDT Trades=167 WinRate=62.9% PF=0.6422057859292479 NetPnL=$-626.16 logs=logs/bt_XRP_USDT
+
+# === BACKTEST SUMMARY ===
+#   Symbol Status  Trades   WinRate  ProfitFactor      NetPnL                       CSV
+# XRP/USDT     OK     167 62.874251      0.642206 -626.155955 data/XRP_USDT_live_1m.csv
+
+# [COMBINED] Symbols OK=1 TotalNetPnL=$-626.16
+
+# dist atr min 3.0:
+# (tradebot) hatefulsween@HatefulSweens-MacBook-Pro tradebot % PYTHONPATH=. .venv/bin/python run_backtest.py \
+#   --profile config/profile/crypto.yaml \
+#   --universe config/universes/crypto_all.yaml \
+#   --symbol XRP/USDT \
+#   --csv data/XRP_USDT_live_1m.csv \
+#   --start-date 2025-07-15 \
+#   --end-date 2026-01-11 \
+#   --no-gui
+
+# [PREP] tz=UTC orb=5 rsi_len=14 atr_len=14 ema_fast_len=50
+# [SANITY.FEAT] vwap nan%: 0.000405083215666304
+# [SANITY.FEAT] atr  nan%: 0.0
+# [SANITY.FEAT] atr<=0 %: 3.857935387298133e-06
+# [SANITY.FEAT] volume<=0 %: 0.6309383270448986
+# [FEATURES] rsi_len=14 ready
+# [CHK] exit ema col exists: True head: [2.8666, 2.8663238095238097, 2.8658643990929704]
+# [CHK] cols: ['ema_slope_atr', 'ema_dist_atr', 'ema_slope', 'atr']
+# [CHK] ema_slope_atr head: [0.0, 0.0, 0.0]
+# [DIAG][XRP] ema_slope p50/p90/p99: {0.5: 9.655812759579163e-06, 0.9: 0.0017371266888244197, 0.99: 0.004815555536978226}
+# [DIAG][XRP] ema_slope_atr p50/p90/p99: {0.5: 0.012760603182712644, 0.9: 1.8280711888905254, 0.99: 4.137331060646139}
+# [DIAG][XRP] ema_dist_atr p50/p90/p99: {0.5: 4.712690253275209, 0.9: 12.252679378574376, 0.99: 22.994474014279934}
+# [DIAG][XRP] vwap_slope p50/p90/p99: {0.5: 0.0, 0.9: 4.794957143783307e-06, 0.99: 0.0005839868581135063}
+# [DIAG] dist_from_vwap_atr valid=0.9996 nan=0.0004
+# [DIAG] dist_from_vwap_atr pct>=0.9: 0.9619
+# [DIAG] dist_from_vwap_atr pct>=1.5: 0.9387
+# [DIAG] dist_from_vwap_atr p50/p90/p99: {0.5: 16.993208381098007, 0.9: 62.6518135415457, 0.99: 202.61644252202072}
+# [TSCHK] XRP/USDT index[:3] = [Timestamp('2025-07-15 19:52:00+0000', tz='UTC'), Timestamp('2025-07-15 19:53:00+0000', tz='UTC'), Timestamp('2025-07-15 19:54:00+0000', tz='UTC')]
+# [TSCHK] XRP/USDT t_local head3 = ['19:52', '19:53', '19:54']
+# [TSCHK] XRP/USDT t_local tail3 = ['19:55', '19:56', '19:57']
+# [TSCHK] XRP/USDT date head/tail = 2025-07-15 -> 2026-01-11
+# [SANITY] XRP/USDT bars=259206 tradable=259206 tradable_pct=1.0
+# [SANITY] XRP/USDT index first/last: 2025-07-15 19:52:00+00:00 -> 2026-01-11 19:57:00+00:00
+# [SANITY] XRP/USDT tod min/max: 00:00 -> 23:59
+# [SANITY] XRP/USDT dates: 2025-07-15 -> 2026-01-11
+# [CFG] XRP/USDT orb=None atr_mult=1.0 slope_min=None
+# [STRATEGY] XRP/USDT -> RsiMeanReversion
+# [RsiMeanReversion] target_vwap=False
+# [STRAT.CFG] XRP/USDT RsiMeanReversion cfg=StratConfig(rsi_len=14, rsi_buy_below=28.0, rsi_sell_above=72.0, atr_mult=1.0, target_R=0.3, stop_pad_ticks=20, allow_longs=True, allow_shorts=False, slope_max=0.02, min_atr_pct=5e-05, tick_size=0.0001, tick_value=0.0001, target_vwap=False, require_cross=False, min_minutes_between_trades=0, max_trades_per_day=0, ema_slope_max=0.0, ema_slope_atr_min=-0.2, ema_dist_atr_min=3.0, ema_dist_atr_max=999.0, exit_on_ema=True, exit_ema_len=20, exit_ema_side='cross', min_vwap_target_R=0.0, vwap_entry_min_atr=0.0, vwap_entry_max_atr=999.0, use_session_open_stop=True, session_open_stop_atr_pad=0.25, use_early_range_target=True, early_range_mult=1.0, early_min_range_atr=0.05, require_early_done=False)
+# [EXEC KNOBS] XRP/USDT BE_LOCK_MIN=15 BE_REQ_TICKS=1 MAX_HOLD_MIN=45 HARD_CUTOFF_R=-0.25 HARD_CUTOFF_MIN=10 MIN_WIN_END=10
+# [WHY] XRP/USDT top reasons: [('no_signal', 244213), ('signal', 814), ('entry_submitted', 807), ('skip_window_end', 7)]
+# [WHY][RSI_MR] XRP gate counts (top 15): [('ema_slope_atr_min', 96780), ('ema_dist_atr_min', 55676), ('no_threshold', 48836), ('shorts_disabled', 36116), ('min_atr_pct', 6729), ('vwap_slope', 75), ('bad_price_or_atr', 1)]
+# [RESULT] XRP/USDT Trades=803 WinRate=63.0% PF=1.0362918637546241 NetPnL=$184.52 logs=logs/bt_XRP_USDT
+
+# === BACKTEST SUMMARY ===
+#   Symbol Status  Trades   WinRate  ProfitFactor    NetPnL                       CSV
+# XRP/USDT     OK     803 63.013699      1.036292 184.52419 data/XRP_USDT_live_1m.csv
+
+# [COMBINED] Symbols OK=1 TotalNetPnL=$184.52
+
+#ema dist atr min 1.5:
+# (tradebot) hatefulsween@HatefulSweens-MacBook-Pro tradebot % PYTHONPATH=. .venv/bin/python run_backtest.py \
+#   --profile config/profile/crypto.yaml \
+#   --universe config/universes/crypto_all.yaml \
+#   --symbol XRP/USDT \
+#   --csv data/XRP_USDT_live_1m.csv \
+#   --start-date 2025-07-15 \
+#   --end-date 2026-01-11 \
+#   --no-gui
+
+# [PREP] tz=UTC orb=5 rsi_len=14 atr_len=14 ema_fast_len=50
+# [SANITY.FEAT] vwap nan%: 0.000405083215666304
+# [SANITY.FEAT] atr  nan%: 0.0
+# [SANITY.FEAT] atr<=0 %: 3.857935387298133e-06
+# [SANITY.FEAT] volume<=0 %: 0.6309383270448986
+# [FEATURES] rsi_len=14 ready
+# [CHK] exit ema col exists: True head: [2.8666, 2.8663238095238097, 2.8658643990929704]
+# [CHK] cols: ['ema_slope_atr', 'ema_dist_atr', 'ema_slope', 'atr']
+# [CHK] ema_slope_atr head: [0.0, 0.0, 0.0]
+# [DIAG][XRP] ema_slope p50/p90/p99: {0.5: 9.655812759579163e-06, 0.9: 0.0017371266888244197, 0.99: 0.004815555536978226}
+# [DIAG][XRP] ema_slope_atr p50/p90/p99: {0.5: 0.012760603182712644, 0.9: 1.8280711888905254, 0.99: 4.137331060646139}
+# [DIAG][XRP] ema_dist_atr p50/p90/p99: {0.5: 4.712690253275209, 0.9: 12.252679378574376, 0.99: 22.994474014279934}
+# [DIAG][XRP] vwap_slope p50/p90/p99: {0.5: 0.0, 0.9: 4.794957143783307e-06, 0.99: 0.0005839868581135063}
+# [DIAG] dist_from_vwap_atr valid=0.9996 nan=0.0004
+# [DIAG] dist_from_vwap_atr pct>=0.9: 0.9619
+# [DIAG] dist_from_vwap_atr pct>=1.5: 0.9387
+# [DIAG] dist_from_vwap_atr p50/p90/p99: {0.5: 16.993208381098007, 0.9: 62.6518135415457, 0.99: 202.61644252202072}
+# [TSCHK] XRP/USDT index[:3] = [Timestamp('2025-07-15 19:52:00+0000', tz='UTC'), Timestamp('2025-07-15 19:53:00+0000', tz='UTC'), Timestamp('2025-07-15 19:54:00+0000', tz='UTC')]
+# [TSCHK] XRP/USDT t_local head3 = ['19:52', '19:53', '19:54']
+# [TSCHK] XRP/USDT t_local tail3 = ['19:55', '19:56', '19:57']
+# [TSCHK] XRP/USDT date head/tail = 2025-07-15 -> 2026-01-11
+# [SANITY] XRP/USDT bars=259206 tradable=259206 tradable_pct=1.0
+# [SANITY] XRP/USDT index first/last: 2025-07-15 19:52:00+00:00 -> 2026-01-11 19:57:00+00:00
+# [SANITY] XRP/USDT tod min/max: 00:00 -> 23:59
+# [SANITY] XRP/USDT dates: 2025-07-15 -> 2026-01-11
+# [CFG] XRP/USDT orb=None atr_mult=1.0 slope_min=None
+# [STRATEGY] XRP/USDT -> RsiMeanReversion
+# [RsiMeanReversion] target_vwap=False
+# [STRAT.CFG] XRP/USDT RsiMeanReversion cfg=StratConfig(rsi_len=14, rsi_buy_below=28.0, rsi_sell_above=72.0, atr_mult=1.0, target_R=0.3, stop_pad_ticks=20, allow_longs=True, allow_shorts=False, slope_max=0.02, min_atr_pct=5e-05, tick_size=0.0001, tick_value=0.0001, target_vwap=False, require_cross=False, min_minutes_between_trades=0, max_trades_per_day=0, ema_slope_max=0.0, ema_slope_atr_min=-0.2, ema_dist_atr_min=1.5, ema_dist_atr_max=999.0, exit_on_ema=True, exit_ema_len=20, exit_ema_side='cross', min_vwap_target_R=0.0, vwap_entry_min_atr=0.0, vwap_entry_max_atr=999.0, use_session_open_stop=True, session_open_stop_atr_pad=0.25, use_early_range_target=True, early_range_mult=1.0, early_min_range_atr=0.05, require_early_done=False)
+# [EXEC KNOBS] XRP/USDT BE_LOCK_MIN=15 BE_REQ_TICKS=1 MAX_HOLD_MIN=45 HARD_CUTOFF_R=-0.25 HARD_CUTOFF_MIN=10 MIN_WIN_END=10
+# [WHY] XRP/USDT top reasons: [('no_signal', 243641), ('signal', 842), ('entry_submitted', 835), ('skip_window_end', 7)]
+# [WHY][RSI_MR] XRP gate counts (top 15): [('ema_slope_atr_min', 96395), ('no_threshold', 72914), ('shorts_disabled', 36181), ('ema_dist_atr_min', 31391), ('min_atr_pct', 6684), ('vwap_slope', 75), ('bad_price_or_atr', 1)]
+# [RESULT] XRP/USDT Trades=831 WinRate=62.8% PF=1.0190897602146334 NetPnL=$100.75 logs=logs/bt_XRP_USDT
+
+# === BACKTEST SUMMARY ===
+#   Symbol Status  Trades   WinRate  ProfitFactor    NetPnL                       CSV
+# XRP/USDT     OK     831 62.815884       1.01909 100.75176 data/XRP_USDT_live_1m.csv
+
+# [COMBINED] Symbols OK=1 TotalNetPnL=$100.75

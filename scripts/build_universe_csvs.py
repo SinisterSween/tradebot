@@ -255,8 +255,33 @@ def _universe_assets(universe_path: str) -> dict:
 
     asset_class = str(uni.get("asset_class") or "equity").lower()
     exchange = str(uni.get("exchange") or "").lower()
-    symbols = [str(s).upper() for s in (uni.get("symbols") or [])]
-    symbols = [s for s in symbols if s]
+
+    raw_symbols = uni.get("symbols") or []
+    symbols: list[str] = []
+
+    for item in raw_symbols:
+        # Case 1: plain list of strings: ["SPY", "QQQ"] or ["ETH/USDT", "SOL/USDT"]
+        if isinstance(item, str):
+            sym = item.strip()
+            if sym:
+                symbols.append(sym)
+            continue
+
+        # Case 2: list of dicts: [{"symbol": "ETH/USDT", "strategy": {...}}, ...]
+        if isinstance(item, dict):
+            sym = (item.get("symbol") or item.get("SYMBOL") or "").strip()
+            if sym:
+                symbols.append(sym)
+            continue
+
+        # ignore anything else
+        continue
+
+    # normalize symbols:
+    # - crypto should keep original casing and "/" for ccxt
+    # - non-crypto we can uppercase to match your existing behavior
+    if asset_class != "crypto":
+        symbols = [s.upper() for s in symbols]
 
     backfill = uni.get("backfill") or {}
     preload_days = int(backfill.get("days", uni.get("preload_days", 2)))
@@ -271,6 +296,7 @@ def _universe_assets(universe_path: str) -> dict:
         "timeframe": timeframe,
         "limit_per_call": limit_per_call,
     }
+
 
 
 
@@ -338,16 +364,54 @@ async def main():
     out_dir = Path(args.out_dir)
 
     sem = asyncio.Semaphore(args.max_concurrency)
-
+    import ast
     async def _run_one(idx: int, e: dict):
         async with sem:
-            sym = e["symbol"]
+            def _extract_symbol(e: dict) -> str:
+                """
+                e can be:
+                - normal: {"symbol": "ETH/USDT", ...}
+                - sometimes broken: {"symbol": "{'SYMBOL': 'ETH_USDT', ...}", ...}
+                - sometimes alternate: {"SYMBOL": "ETH_USDT", ...}
+                """
+                sym = e.get("symbol") or e.get("SYMBOL")
+
+                # If sym is already a dict for some reason
+                if isinstance(sym, dict):
+                    sym = sym.get("symbol") or sym.get("SYMBOL")
+
+                # If sym is a stringified dict like "{'SYMBOL': 'ETH_USDT', ...}"
+                if isinstance(sym, str):
+                    s = sym.strip()
+                    if s.startswith("{") and ("SYMBOL" in s or "symbol" in s):
+                        try:
+                            d = ast.literal_eval(s)
+                            if isinstance(d, dict):
+                                sym = d.get("symbol") or d.get("SYMBOL")
+                        except Exception:
+                            pass
+
+                if not isinstance(sym, str) or not sym.strip():
+                    raise ValueError(f"[CSV] could not extract symbol from entry: {e}")
+
+                return sym.strip()
+
+            sym = _extract_symbol(e)
 
             if e.get("asset_class") == "crypto":
-                csv_path = out_dir / f"{sym.replace('/', '_').upper()}_live_1m.csv"
-                if args.reset_csv and csv_path.exists():
-                    csv_path.unlink()
-                    print(f"[RESET] deleted {csv_path}")
+                # allow either "ETH/USDT" or "ETH_USDT" etc
+                sym_fs = sym.replace("/", "_").replace("-", "_").replace(":", "_").upper()
+                print(f"[DBG] entry_symbol_type={type(e.get('symbol'))} entry_symbol={repr(e.get('symbol'))[:120]}")
+                csv_path = out_dir / f"{sym_fs}_live_1m.csv"
+
+                if args.reset_csv:
+                    # avoid stat() on some weird long path edge cases
+                    try:
+                        if csv_path.exists():
+                            csv_path.unlink()
+                            print(f"[RESET] deleted {csv_path}")
+                    except OSError as ex:
+                        raise OSError(f"[RESET] bad csv_path={csv_path} sym={sym} entry_symbol={e.get('symbol')}") from ex
 
                 preload_days = int(e.get("preload_days", args.preload_days))
                 timeframe = str(e.get("timeframe", "1m"))

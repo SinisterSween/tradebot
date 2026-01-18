@@ -119,3 +119,15 @@ pgrep -fl shadow_mes_delayed.py; pgrep -fl run_oos_loop.py; tail -n 10 data/MES_
 ---
 
 *Keep this file in the repo root as `README_local.md` for fast startup.*
+
+## Archived Scripts
+
+The following scripts have been moved to `scripts/_archive/` as part of a codebase cleanup. They are not referenced by any active code, Makefile targets, or documentation as of December 2025. If you need to restore or review them, you can find them in the archive directory:
+
+- run_backtestv1.py
+- shadow_mes_delayed copy.py
+- md_test.py
+- ib_list_es_contracts.py
+- ib_dump_symbols.py
+
+If you believe any of these scripts are still needed, please update the documentation and codebase accordingly.
