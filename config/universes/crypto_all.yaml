@@ -39,42 +39,41 @@ symbols:
     strategy:
       name: TrendPullback
       atr_len: 14
-      atr_mult: 1.0
-      target_R: 0.8
-      slope_min: 0.15
-      pullback_atr: 0.25
-      stop_pad_ticks: 2
-      orb_minutes: 10
+      atr_mult: 1.2
+      target_R: 0.6
+      slope_min: 0.08
+      pullback_atr: 0.15
+      vwap_entry_min_atr: 0.5
+      vwap_entry_max_atr: 5.0
+      min_vwap_target_R: 0.2
+      stop_pad_ticks: 3
       min_atr_pct: 0.0002
       max_bar_range_atr: 4.0
     execution:
       cooldown_bars: 5
-    risk:
-      flat_time: "23:59"
-      max_notional_pct: 0.10
-      min_notional_usd: 10
+      max_hold_min: 45
 
   - symbol: SOL/USDT
+  # Locked do not change unless market changes
     strategy:
       name: VwapReversion
       atr_len: 14
-      atr_mult: 1.0
-      target_R: 0.7
+      atr_mult: 1.3
+      target_R: 1.0
       slope_max: 0.08
-      stop_pad_ticks: 2
+      stop_pad_ticks: 1 #When going live flip to 2 then after a few weeks can drop to 1
       orb_minutes: 10
+      target_vwap: false
       min_atr_pct: 0.001
       max_bar_range_atr: 6.0
-      target_vwap: false
-      vwap_entry_min_atr: 0.6
-      vwap_entry_max_atr: 4.0
-      # EMA filter knobs (ONLY if your VwapReversion reads these names)
+      vwap_entry_min_atr: 0.5
+      vwap_entry_max_atr: 3.5
       ema_slope_max: 0.0
       ema_max_dist_atr: 0.0
       min_vwap_target_R: 0.25
-
     execution:
       cooldown_bars: 5
+      max_hold_min: 30
 
     risk:
       flat_time: "23:59"
@@ -131,6 +130,7 @@ symbols:
       min_notional_usd: 1
 
   - symbol: LTC/USDT
+    #Locked and approved RSI MR config
     # LTC RSI MR — validated with BE=14
     # Same BE logic as XRP, generalization confirmed
     tick_size: 0.01
@@ -156,3 +156,146 @@ symbols:
       be_lock_min: 14        # 👈 reuse XRP baseline
       be_req_profit_ticks: 1
       max_hold_min: 45
+
+  - symbol: XLM/USDT
+    tick_size: 0.0001
+    point_value: 1
+    trade_min_qty: 1.0
+    rotate: true
+    strategy:
+      name: rsi_mean_reversion
+      fallback: null
+      allow_shorts: false
+      allow_longs: true
+      target_vwap: false
+      rsi_len: 14
+      rsi_buy_below: 28
+      rsi_sell_above: 72
+      atr_len: 14
+      atr_mult: 1.0
+      target_R: 0.25
+      stop_pad_ticks: 15
+      require_cross: false
+      min_minutes_between_trades: 0
+      max_trades_per_day: 0
+      min_atr_pct: 0.00005
+      slope_max: 0.02
+      ema_slope_atr_min: -999
+      ema_slope_max: 0.0
+      ema_dist_atr_min: 0.0
+      ema_dist_atr_max: 999
+      exit_on_ema: true
+      exit_ema_len: 20
+      exit_ema_side: touch
+      vwap_entry_max_atr: 999
+      vwap_dist_atr_min: 0.0
+      min_vwap_target_R: 0.0
+      use_early_range_target: false
+      early_range_mult: 1.0
+      early_min_range_atr: 0.0
+      require_early_done: false
+      use_session_open_stop: false
+      session_open_stop_atr_pad: 0.0
+    execution:
+      be_lock_min: 14
+      be_req_profit_ticks: 1
+      max_hold_min: 45
+      min_minutes_to_window_end: 10
+    risk:
+      min_notional_usd: 1
+
+  - symbol: BCH/USDT
+    #Locked and approved RSI MR config
+    tick_size: 0.01
+    point_value: 1
+    trade_min_qty: 0.01
+    rotate: true
+    strategy:
+      name: rsi_mean_reversion
+      fallback: null
+      allow_shorts: false
+      allow_longs: true
+      target_vwap: false
+      rsi_len: 14
+      rsi_buy_below: 28
+      rsi_sell_above: 72
+      atr_len: 14
+      atr_mult: 1.0
+      target_R: 0.25
+      stop_pad_ticks: 15
+      require_cross: false
+      min_minutes_between_trades: 0
+      max_trades_per_day: 0
+      min_atr_pct: 0.00005
+      slope_max: 0.02
+      ema_slope_atr_min: -999
+      ema_slope_max: 0.0
+      ema_dist_atr_min: 0.0
+      ema_dist_atr_max: 999
+      exit_on_ema: true
+      exit_ema_len: 20
+      exit_ema_side: touch
+      vwap_entry_max_atr: 999
+      vwap_dist_atr_min: 0.0
+      min_vwap_target_R: 0.0
+      use_early_range_target: false
+      early_range_mult: 1.0
+      early_min_range_atr: 0.0
+      require_early_done: false
+      use_session_open_stop: false
+      session_open_stop_atr_pad: 0.0
+    execution:
+      be_lock_min: 14
+      be_req_profit_ticks: 1
+      max_hold_min: 45
+      min_minutes_to_window_end: 10
+    risk:
+      min_notional_usd: 1
+
+  - symbol: DOGE/USDT
+    tick_size: 0.0001
+    point_value: 1
+    trade_min_qty: 1.0
+    rotate: true
+    strategy:
+      name: rsi_mean_reversion
+      fallback: null
+      allow_shorts: false
+      allow_longs: true
+      target_vwap: false
+      rsi_len: 14
+      rsi_buy_below: 28
+      rsi_sell_above: 72
+      atr_len: 14
+      atr_mult: 1.0
+      target_R: 0.25
+      stop_pad_ticks: 15
+      require_cross: false
+      min_minutes_between_trades: 0
+      max_trades_per_day: 0
+      min_atr_pct: 0.00005
+      slope_max: 0.02
+      ema_slope_atr_min: -999
+      ema_slope_max: 0.0
+      ema_dist_atr_min: 0.0
+      ema_dist_atr_max: 999
+      exit_on_ema: true
+      exit_ema_len: 20
+      exit_ema_side: touch
+      vwap_entry_max_atr: 999
+      vwap_dist_atr_min: 0.0
+      min_vwap_target_R: 0.0
+      use_early_range_target: false
+      early_range_mult: 1.0
+      early_min_range_atr: 0.0
+      require_early_done: false
+      use_session_open_stop: false
+      session_open_stop_atr_pad: 0.0
+    execution:
+      be_lock_min: 14
+      be_req_profit_ticks: 1
+      max_hold_min: 45
+      min_minutes_to_window_end: 10
+    risk:
+      min_notional_usd: 1
+

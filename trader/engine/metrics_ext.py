@@ -2,22 +2,22 @@ import os, json
 import numpy as np
 import pandas as pd
 
-def _daily_from_equity(equity: pd.Series) -> pd.Series:
+def _daily_from_equity(equity: pd.Series, bars_per_day: int = 390) -> pd.Series:
     if isinstance(equity.index, pd.DatetimeIndex):
         return equity.resample("1D").last().dropna()
     if len(equity) == 0:
         return equity
-    bars_per_day = 390  # approx minute bars in RTH
     grp = np.arange(len(equity)) // bars_per_day
     return equity.groupby(grp).last()
 
-def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None) -> dict:
+def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None, bars_per_day: int = 390) -> dict:
     if equity is None or len(equity) == 0:
         return {}
 
     equity = equity.astype(float).sort_index()
-    daily = _daily_from_equity(equity)
-    rets = daily.pct_change().dropna()
+    daily = _daily_from_equity(equity, bars_per_day=bars_per_day)
+    rets = daily.pct_change()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
 
     if isinstance(equity.index, pd.DatetimeIndex):
         span_days = max(1, (equity.index[-1] - equity.index[0]).days or 1)
@@ -31,15 +31,35 @@ def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None) -> dict:
     else:
         cagr = 0.0
 
-    sharpe = float((rets.mean() / (rets.std() + 1e-12)) * np.sqrt(252)) if len(rets) else 0.0
+    if len(rets) >= 3 and np.isfinite(rets.std()) and rets.std() > 0:
+        sharpe = float((rets.mean() / (rets.std() + 1e-12)) * np.sqrt(252))
+    else:
+        sharpe = 0.0
     neg = rets[rets < 0]
+
+    if len(rets) >= 3 and len(neg) >= 3 and np.isfinite(neg.std()) and neg.std() > 0:
+        sortino = float((rets.mean() / (neg.std() + 1e-12)) * np.sqrt(252))
+    else:
+        sortino = 0.0
+
     sortino = float((rets.mean() / (neg.std() + 1e-12)) * np.sqrt(252)) if len(neg) else 0.0
 
-    if len(daily):
-        roll_max = daily.cummax()
-        max_dd = float((1.0 - (daily / roll_max)).max())
+    # --- Max drawdown should be computed on the FULL curve ---
+    eq = equity.astype(float).sort_index()
+    if len(eq):
+        roll_max_full = eq.cummax()
+        dd_full = 1.0 - (eq / roll_max_full.replace(0.0, np.nan))
+        max_dd = float(dd_full.max()) if len(dd_full) else 0.0
     else:
         max_dd = 0.0
+
+    # close-to-close drawdown (daily closes)
+    if len(daily):
+        roll_max_d = daily.cummax()
+        dd_d = 1.0 - (daily / roll_max_d.replace(0.0, np.nan))
+        max_dd_close = float(dd_d.max())
+    else:
+        max_dd_close = 0.0
 
     # ----- Trade metrics (EXIT-only for PnL stats, ENTRY-only for turnover) -----
     trades_n = 0
@@ -117,6 +137,7 @@ def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None) -> dict:
         "Sharpe": sharpe,
         "Sortino": sortino,
         "MaxDrawdown": max_dd,
+        "MaxDrawdownClose": max_dd_close,
         "WinRate": win_rate,
         "ProfitFactor": profit_factor,
         "Turnover": turnover,
@@ -137,7 +158,7 @@ def write_artifacts(equity: pd.Series, trades: pd.DataFrame | None, summary: dic
                     logs_dir: str = "logs", write_equity: bool = True) -> None:
     os.makedirs(logs_dir, exist_ok=True)
     if write_equity and isinstance(equity, pd.Series):
-        equity.to_csv(os.path.join(logs_dir, "equity_curve.csv"))
+        equity.to_csv(os.path.join(logs_dir, "equity_curve.csv"), index_label="datetime", header=["equity"])
     if trades is not None:
         trades.to_csv(os.path.join(logs_dir, "backtest_trades.csv"), index=False)
     with open(os.path.join(logs_dir, "summary.json"), "w") as f:

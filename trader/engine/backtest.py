@@ -134,6 +134,16 @@ def prepare_bars(
         session_col="date",
         early_minutes=60,
     )
+
+    # bars: df has minutes_from_start
+    if int(orb_minutes or 0) > 0:
+        day_start = df.index.normalize()  # midnight UTC
+        df["minutes_from_start"] = ((df.index - day_start).total_seconds() / 60.0).astype(int)
+        df["orb_ok"] = df["minutes_from_start"] >= int(orb_minutes)
+    else:
+        df["orb_ok"] = True
+
+
     # --- 5) Features ---
     df = add_session_vwap(df, session_col="date")
 

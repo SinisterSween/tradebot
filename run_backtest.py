@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from collections import Counter
 from datetime import date
+from matplotlib.pyplot import bar
 import yaml
 import pandas as pd
 import matplotlib
@@ -246,6 +247,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             vwap_entry_min_atr=float(s_cfg.get("vwap_entry_min_atr", 0.0)),
             vwap_entry_max_atr=float(s_cfg.get("vwap_entry_max_atr", 0.0)),
             min_vwap_target_R=float(s_cfg.get("min_vwap_target_R", 0.0)),
+            orb_minutes=int(s_cfg.get("orb_minutes", 0)),
 
         )
         cfg = RevCfg(**_filter_kwargs(RevCfg, rev_kwargs))
@@ -264,6 +266,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             tick_value=float(fees["tick_value"]),
             min_atr_pct=float(s_cfg.get("min_atr_pct", 0.0)),
             max_bar_range_atr=float(s_cfg.get("max_bar_range_atr", 0.0)),
+            min_notional_usd=float(s_cfg.get("min_notional_usd", 0.0)),
         )
         cfg = PbCfg(**_filter_kwargs(PbCfg, pb_kwargs))
         return TrendPullback(cfg)
@@ -686,6 +689,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         dollars_per_point=float(dpp),
     )
     delay = BarDelay(bars=int(args.latency_bars or 0))
+    
 
     # ---- Strategy ----
     print(f"[CFG] {symbol} orb={sc.get('orb_minutes')} atr_mult={sc.get('atr_mult')} slope_min={sc.get('slope_min')}")
@@ -781,7 +785,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     equity_like = _is_equity_like(ct, cfg)
     crypto_like = _is_crypto_like(universe_cfg)
     trade_min_qty = float((universe_cfg or {}).get("trade_min_qty", 0.0) or 0.0)
+    
 
+    om.crypto_like = crypto_like
+    om.equity_like = equity_like
 
     def _force_exit_current_position(
         bar,
@@ -813,9 +820,12 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             pnl = (px - entry_px) * side_mult * qty
         else:
             pnl = (px - entry_px) * dpp * side_mult * qty
+        ts = bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or bar.get("timestamp") or bar.name
+        if ts is None:
+            print("[EXIT.TS][WARN] ts is None; bar keys:", list(getattr(bar, "keys", lambda: [])()))
 
         om.trades.append({
-            "ts": bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or None,
+            "ts": ts,
             "t_local": bar["t_local"],
             "action": "EXIT",
             "side": side,
@@ -862,14 +872,18 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
             risk.reset_day(equity)
             prev_date = bar["date"]
-            open_position = False
-            current_bracket = None
-            open_side = None
-            open_qty = 0.0
-            open_entry_px = None
-            open_entry_ts = None
-            open_be_locked = False
-            open_risk_pts = None
+
+            if float(getattr(om.pos, "qty", 0.0)) == 0.0:
+                open_position = False
+                current_bracket = None
+                open_side = None
+                open_qty = 0.0
+                open_entry_px = None
+                open_entry_ts = None
+                open_be_locked = False
+                open_risk_pts = None
+            else:
+                open_position = True
 
         # latency queue
         for due in delay.due(i):
@@ -911,7 +925,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         if not _in_windows(bar["t_local"], windows):
             if open_position and current_bracket:
                 before = len(om.trades)
-                exit_info = om.simulate_bracket(bar, current_bracket)
+                exit_info = om.simulate_bracket(
+                    bar, 
+                    current_bracket,
+                )
                 exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
 
                 if not exited:
@@ -932,11 +949,32 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             continue
 
 
+        # -----------------------
         # manage OPEN position
+        # -----------------------
         if open_position and current_bracket:
             before = len(om.trades)
 
-            # ---- Break-even stop adjustment (must happen before simulate_bracket) ----
+            # Debug prints only (DO NOT gate logic behind debug)
+            if why.get("dbg_bracket_once", 0) < 5:
+                why["dbg_bracket_once"] += 1
+                entry = float(open_entry_px)
+                stop = float(current_bracket.stop_price)
+                target = float(current_bracket.target_price)
+                close_px = float(bar["close"])
+                high_px = float(bar.get("high", close_px))
+                low_px  = float(bar.get("low", close_px))
+                print(
+                    f"[BRKT.DBG] {symbol} side={open_side} entry={entry:.2f} stop={stop:.2f} target={target:.2f} "
+                    f"barL/H/C={low_px:.2f}/{high_px:.2f}/{close_px:.2f} "
+                    f"d_stop={abs(entry-stop):.2f} d_tgt={abs(target-entry):.2f}"
+                )
+                print(
+                    f"[POS.DBG] {symbol} open_qty={open_qty} open_side={open_side} open_entry_px={open_entry_px} "
+                    f"om.qty={getattr(om.pos,'qty',None)} om.side={getattr(om.pos,'side',None)} om.avg={getattr(om.pos,'avg_price',None)}"
+                )
+
+            # Break-even stop adjustment ALWAYS runs
             current_bracket, open_be_locked, be_reason = _maybe_move_stop_to_be(
                 bar,
                 open_side=open_side,
@@ -949,35 +987,21 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 be_armed=bool(open_be_locked),
             )
 
-            if be_reason:
-                if why[be_reason] < 10:
-                    print(f"[BE] {symbol} side={open_side} t={bar['t_local']} close={bar['close']} stop->{current_bracket.stop_price}")
-                why[be_reason] += 1
-
-
+            # Bracket simulation ALWAYS runs
             exit_info = om.simulate_bracket(bar, current_bracket)
 
+            # If simulate_bracket returned None but it still wrote an EXIT row, capture it
             if not exit_info and len(om.trades) > before and om.trades[-1].get("action") == "EXIT":
                 last = om.trades[-1]
                 exit_info = {
                     "side": last.get("side"),
-                    "entry_price": float(last.get("price") or last.get("entry_price") or bar["close"]),
+                    "entry_price": float(last.get("price") or last.get("entry_price") or open_entry_px),
                     "exit_price": float(last.get("exit_price") or bar["close"]),
                     "reason": last.get("reason"),
                 }
 
             if exit_info:
-                tick_size = float(fees["tick_size"])
-                pnl_pts = float(exit_info["exit_price"]) - float(exit_info["entry_price"])
-                risk_pts = abs(float(exit_info["entry_price"]) - float(current_bracket.stop_price))
-                if risk_pts < (tick_size / 2.0):
-                    risk_pts = tick_size
-                side_mult = 1.0 if str(exit_info["side"]).upper() == "BUY" else -1.0
-                R = (pnl_pts / risk_pts) * side_mult
-                risk.record_trade_outcome_R(R)
-
-                
-                #last_exit = om.trades[-1]
+                # finalize + reset state
                 equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
                 last_flat_i = i
 
@@ -988,7 +1012,9 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 open_entry_px = None
                 open_entry_ts = None
                 open_be_locked = False
+                open_risk_pts = None
                 continue
+
             # ---- EMA-based exit (forced exit; after bracket sim, before BE/time exits) ----
             if open_position and current_bracket and open_entry_ts is not None and exit_on_ema:
                 ema_col = f"ema_exit_{exit_ema_len}"
@@ -1022,31 +1048,37 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                         _force_exit_current_position(bar, reason=f"EMA_EXIT_{exit_ema_len}_{exit_ema_side}", i=i, exit_px=close_px)
                         equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
                         continue
-
         # time-based exit
         if open_position and current_bracket and open_entry_ts is not None:
             if _minutes_between(open_entry_ts, bar["t_local"]) >= MAX_HOLD_MIN:
-                before = len(om.trades)
-                exit_info = om.simulate_bracket(bar, current_bracket)
-                exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
-
-                if not exited:
-                    _force_exit_current_position(bar, reason="TIME", i=i, exit_px=float(bar["close"]))
-                else:
-                    # Bracket exited; we still need to reset open state here because we are not
-                    # in the "manage OPEN position" block when this triggers.
-                    open_position = False
-                    current_bracket = None
-                    open_side = None
-                    open_qty = 0.0
-                    open_entry_px = None
-                    open_entry_ts = None
-                    open_be_locked = False
-                    open_risk_pts = None
-
+                _force_exit_current_position(bar, reason="TIME", i=i, exit_px=float(bar["close"]))
                 equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
-
                 continue
+
+        # time-based exit
+        # if open_position and current_bracket and open_entry_ts is not None:
+        #     if _minutes_between(open_entry_ts, bar["t_local"]) >= MAX_HOLD_MIN:
+        #         before = len(om.trades)
+        #         exit_info = om.simulate_bracket(bar, current_bracket)
+        #         exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
+
+        #         if not exited:
+        #             _force_exit_current_position(bar, reason="TIME", i=i, exit_px=float(bar["close"]))
+        #         else:
+        #             # Bracket exited; we still need to reset open state here because we are not
+        #             # in the "manage OPEN position" block when this triggers.
+        #             open_position = False
+        #             current_bracket = None
+        #             open_side = None
+        #             open_qty = 0.0
+        #             open_entry_px = None
+        #             open_entry_ts = None
+        #             open_be_locked = False
+        #             open_risk_pts = None
+
+        #         equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
+
+        #         continue
 
 
         # new signal
@@ -1158,14 +1190,17 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             else:
                 om.place_and_simulate(bar, sig["order"])
                 current_bracket = sig["bracket"]
-                open_position = True
-                open_side = str(sig["order"].side).upper()
-                open_qty = float(sig["order"].qty)
-                open_entry_px = entry
+                open_position = (om.pos.qty != 0)
+                open_side = str(om.pos.side).upper()
+                open_qty = float(om.pos.qty)
+                open_entry_px = float(om.pos.avg_price)
                 open_entry_ts = bar["t_local"]
                 if hasattr(strat_used, "record_entry"):
                     strat_used.record_entry(bar.name)
                 open_risk_pts = risk_pts
+                if open_position and getattr(om.pos, "qty", 0) == 0:
+                    raise RuntimeError("Entered trade but om.pos.qty is 0 — bracket exits will never trigger.")
+
         else:
             if risk.halted:
                 why["risk_halted"] += 1
@@ -1183,61 +1218,173 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
     # ---- Results ----
     trades_df = pd.DataFrame(om.trades)
-    if trades_df.empty:
-        trades_df = pd.DataFrame(columns=[
-            "ts","t_local","action","side","qty","entry_price","price",
-            "reason","exit_price","pnl","fees_total","R"
-        ])
 
-    exits = trades_df.loc[trades_df["action"] == "EXIT"] if ("action" in trades_df.columns) else pd.DataFrame()
-    trades_n = int(len(exits)) if exits is not None else 0
+    # --- EXIT selection (robust, self-validating) ---
+    if trades_df.empty or "action" not in trades_df.columns:
+        print("[EXIT.SEL] no action col; columns=", list(trades_df.columns))
+        exits = trades_df.iloc[0:0].copy()
+        mask_exit = None
+    else:
+        a = trades_df["action"].astype(str).str.strip().str.upper()
+        mask_exit = (a.eq("EXIT") | a.str.startswith("EXIT_", na=False)).to_numpy()
+        exits = trades_df.loc[mask_exit].copy()
+        if "reason" in trades_df.columns:
+            exit_reasons = trades_df.loc[a.eq("EXIT"), "reason"].astype(str).value_counts().head(20)
+            print("[EXIT.REASONS] top:\n", exit_reasons.to_string())
+        #trades_df["action"] = a  # normalize in-place
 
-    total_pnl = float(exits["pnl"].sum()) if (exits is not None and not exits.empty and "pnl" in exits.columns) else 0.0
-    winrate = float((exits["pnl"] > 0).mean() * 100.0) if (exits is not None and not exits.empty and "pnl" in exits.columns) else 0.0
+        print(
+            "[EXIT.SEL] mask_true=", int(mask_exit.sum()),
+            "rows=", len(trades_df),
+            "action_counts=", a.value_counts().head(5).to_dict()
+        )
 
-    # Artifacts per symbol (optionally separated per run)
-    safe_sym = symbol.replace("/", "_")
+        # HARD ASSERT: if EXIT exists but mask is 0, something is wrong upstream
+        if ("EXIT" in set(a.values)) and mask_exit.sum() == 0:
+            cols = [c for c in ["ts", "action", "pnl"] if c in trades_df.columns]
+            sample = trades_df.loc[a.eq("EXIT").to_numpy(), cols].head(5)
+            raise RuntimeError(f"EXIT present but mask_exit.sum()==0. Sample rows:\n{sample}")
 
-    # Default location: logs/bt_<SYMBOL>
-    logs_dir = Path("logs") / f"bt_{safe_sym}"
+    if exits.empty:
+        pnl_series = pd.Series([], dtype="float64", index=pd.DatetimeIndex([], tz="UTC"))
+    else:
+        ts_col = None
+        ts_parsed = None
 
-    # If caller supplies --outdir, use it instead (e.g. logs/sweeps/<sweep_id>)
-    if args.outdir:
-        logs_dir = Path(args.outdir)
+        for c in ["ts", "timestamp", "exit_time", "time", "dt"]:
+            if c not in exits.columns:
+                continue
+            raw = exits[c]
+             # normalize common "fake null" strings
+            if raw.dtype == "object":
+                raw = raw.astype(str).str.strip()
+                raw = raw.replace({"": pd.NA, "NAN": pd.NA, "NaN": pd.NA, "NONE": pd.NA, "None": pd.NA, "NAT": pd.NA, "NaT": pd.NA})    
+        
+            parsed = pd.to_datetime(raw, utc=True, errors="coerce")
+            ok = int(parsed.notna().sum())
+            print(f"[EXIT.TS.CAND] {c}: ok={ok}/{len(exits)} dtype={exits[c].dtype}")
 
-    # If caller supplies --run-tag, nest under it (e.g. lock12_ticks2)
-    if args.run_tag:
-        logs_dir = logs_dir / str(args.run_tag)
+            if ok > 0:
+                ts_col = c
+                ts_parsed = parsed
+                break
 
-    logs_dir.mkdir(parents=True, exist_ok=True)
+        if ts_col is None:
+            sample_cols = [c for c in ["ts", "timestamp", "exit_time", "time", "dt", "action", "pnl"] if c in exits.columns]
+            print("[EXIT.TS.FAIL] sample:\n", exits[sample_cols].head(10))
+            raise ValueError("No usable timestamp column found for EXIT rows (all parse to NaT).")
 
-    # trades_df.to_csv(logs_dir / "backtest_trades.csv", index=False)
+        exits[ts_col] = ts_parsed
 
-    pnl_series = equity_curve(om.trades)
+        print("[EXIT.TS] using:", ts_col)
+        print("[EXIT.TS] NaT count:", int(exits[ts_col].isna().sum()))
+        print("[EXIT.TS] min/max:", exits[ts_col].min(), exits[ts_col].max())
+
+        exits = exits.dropna(subset=[ts_col]).sort_values(ts_col)
+
+        pnl_series = (
+            exits.set_index(ts_col)["pnl"]
+            .astype("float64")
+            .groupby(level=0)
+            .sum()
+            .sort_index()
+        )
+
+        print(f"[EXIT] exits={len(exits)} unique_ts={len(pnl_series)} dup_ts={len(exits)-len(pnl_series)}")
+        print("[PNL] idx min/max:", pnl_series.index.min(), pnl_series.index.max(), "len:", len(pnl_series))
+        print("[PNL.SER] type:", type(pnl_series), "len:", len(pnl_series))
+        if len(pnl_series):
+            print("[PNL.SER] idx min/max:", pnl_series.index.min(), pnl_series.index.max())
+            print("[PNL.SER] head:", pnl_series.head(3).to_dict())
+
+        _pnl_id = id(pnl_series)
+        print("[PNL.CHK] id:", id(pnl_series), "same_as_built:", id(pnl_series) == _pnl_id, "len:", len(pnl_series))
+        print("[PNL.BUILT] len:", len(pnl_series))
+
     if args.no_gui:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    safe_sym = symbol.replace("/", "_")
+    logs_dir = Path("logs") / f"bt_{safe_sym}"
+
+    if getattr(args, "outdir", None):
+        logs_dir = Path(args.outdir)
+
+    if getattr(args, "run_tag", None):
+        logs_dir = logs_dir / str(args.run_tag)
+
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
     if pnl_series is not None and not pnl_series.empty:
-        ax = pnl_series.plot(title=f"{symbol} PnL (USD)")
+        ax = pnl_series.plot(title=f"{symbol} Realized PnL per EXIT (USD)")
         fig = ax.get_figure()
         fig.savefig(logs_dir / "pnl_curve.png", dpi=120, bbox_inches="tight")
         if not args.no_gui:
             plt.show()
         plt.close(fig)
 
-    # Build a minimal equity series for summarize_equity() / summary.json
-    equity_full = pd.Series(index=df.index, dtype=float)
-    if len(equity_full.index) > 0:
-        equity_full.iloc[0] = float(args.starting_equity)
-        equity_full = equity_full.ffill().fillna(float(args.starting_equity))
-        equity_full.iloc[-1] = float(equity)
+    if pnl_series is not None and not pnl_series.empty:
+        equity_steps = float(args.starting_equity) + pnl_series.cumsum()
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("df.index must be a DatetimeIndex to build equity_full")
+
+        equity_full = (
+            equity_steps.sort_index()
+            .reindex(df.index, method="ffill")
+            .fillna(float(args.starting_equity))
+        )
     else:
-        equity_full = pd.Series([float(equity)])
+        # fallback if no trades
+        equity_full = pd.Series(
+            float(args.starting_equity),
+            index=df.index if isinstance(df.index, pd.DatetimeIndex) and len(df.index) else [0]
+        )
+    # Final safety align
+    if isinstance(equity_full.index, pd.DatetimeIndex) and isinstance(df.index, pd.DatetimeIndex):
+        equity_full = equity_full.reindex(df.index, method="ffill").fillna(float(args.starting_equity))
+    
+    print("equity_full index min/max:",
+          equity_full.index.min() if isinstance(equity_full.index, pd.DatetimeIndex) else None,
+          equity_full.index.max() if isinstance(equity_full.index, pd.DatetimeIndex) else None)
 
-    summary = summarize_equity(equity_full, trades_df)
+    bars_per_day = 1440 if crypto_like else 390
+    summary = summarize_equity(equity_full, trades_df, bars_per_day=bars_per_day)
 
-    summary["EndEquity"] = float(equity)
+    summary["EndEquity"] = float(equity_full.iloc[-1]) if len(equity_full) else float(args.starting_equity)
+    
+    print("[PNL.BEFORE_DBG] len:", 0 if pnl_series is None else len(pnl_series))
+
+    summary["PnL_curve_last"] = float(pnl_series.iloc[-1]) if pnl_series is not None and len(pnl_series) else 0.0
+
+    trades_n = int(len(exits))
+    summary["Trades"] = trades_n
+
+    if trades_n > 0 and "pnl" in exits.columns:
+        pnl_exit = exits["pnl"].astype("float64")
+        summary["NetPnL"] = float(pnl_exit.sum())
+        summary["WinRate"] = float((pnl_exit > 0).mean() * 100.0)
+
+        gains = float(pnl_exit[pnl_exit > 0].sum())
+        losses = float((-pnl_exit[pnl_exit < 0]).sum())
+        summary["ProfitFactor"] = (gains / losses) if losses > 0 else float("inf")
+    else:
+        summary["NetPnL"] = 0.0
+        summary["WinRate"] = 0.0
+        summary["ProfitFactor"] = 0.0
+
+    print(f"[SUMMARY.CHK] summary.Trades={summary.get('Trades')} summary.NetPnL={summary.get('NetPnL'):.2f}")
+
+    if pnl_series is not None and len(pnl_series):
+        equity_tmp = float(args.starting_equity) + pnl_series.cumsum()
+        print("equity min/max:" , equity_tmp.min(), equity_tmp.max())
+        print("pnl_series len:", len(pnl_series))
+        print("exit pnl min:", pnl_series.min())
+        print("exit pnl neg count:", (pnl_series < 0).sum())
+        print("exit pnl pos count:", (pnl_series > 0).sum())
+    else:
+        print("pnl_series len: 0 (no exits)")
 
     # ---- WHY diagnostics (always print top reasons) ----
     top = sorted(why.items(), key=lambda kv: kv[1], reverse=True)[:12]
@@ -1250,8 +1397,14 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     elif trades_ct <= 3:
         print(f"[WHY] {symbol} LOW TRADES ({trades_ct}) — likely over-filtered")
 
+    # --- Equity sanity: equity_full should reconcile to exits pnl (within rounding) ---
+    try:
+        netpnl_equity = float(equity_full.iloc[-1] - equity_full.iloc[0])
+        netpnl_exits = float(summary["NetPnL"])
+        print(f"[SANITY] netpnl(exits)={netpnl_exits:.2f} netpnl(equity)={netpnl_equity:.2f}")
+    except Exception as e:
+        print(f"[SANITY] netpnl check skipped: {e}")
 
-    summary["EndEquity"] = float(equity)
     write_artifacts(
         equity_full, 
         trades_df, 
@@ -1259,12 +1412,17 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         logs_dir=str(logs_dir), 
         write_equity=not args.light_artifacts
         )
-    if int(summary.get("Trades", 0) or 0) == 0:
-        print(f"[WHY] {symbol} top reasons: {why.most_common(8)}")
+    
+    # if int(summary.get("Trades", 0) or 0) == 0:
+    #     print(f"[WHY] {symbol} top reasons: {why.most_common(8)}")
+
+
     if symbol == "XRP/USDT" and hasattr(strat, "_why"):
         print("[WHY][RSI_MR] XRP gate counts (top 15):", strat._why.most_common(15))
     if symbol == "XRP/USDT" and fallback is not None and hasattr(fallback, "_why"):
         print("[WHY][RSI_MR] XRP fallback gate counts (top 15):", fallback._why.most_common(15))
+
+
     print(f"[RESULT] {symbol} Trades={summary.get('Trades', 0)} WinRate={summary.get('WinRate', 0):.1f}% "
           f"PF={summary.get('ProfitFactor')} NetPnL=${summary.get('NetPnL', 0):.2f} logs={logs_dir}")
 

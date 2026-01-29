@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from ..engine.utils import Order, Bracket, side_mult
 import math
+from collections import Counter
 
 @dataclass
 class StratConfig:
@@ -20,19 +21,58 @@ class StratConfig:
     ema_max_dist_atr: float = 0.0
     vwap_entry_min_atr: float = 0.0
     vwap_entry_max_atr: float = 0.0
+    orb_minutes: int = 0
 
 class VwapReversion:
     def __init__(self, cfg: StratConfig):
         self.cfg = cfg
+        self._why = Counter()
+        self._rej = Counter()
+        self._last_trade_ts = None          # pd.Timestamp
+        self._day = None                    # datetime.date
+        self._trades_today = 0
+
+
+    def on_entry_submitted(self, ts) -> None:
+        self._trades_today += 1
+        self._last_trade_ts = ts
+
+    def _reset_if_new_day(self, bar):
+        d = bar.get("date", None)
+        if d is None:
+            return
+        if self._day != d:
+            self._day = d
+            self._trades_today = 0
+            self._last_trade_ts = None
+
+    def _minutes_since_last(self, ts_now) -> float:
+        if self._last_trade_ts is None or ts_now is None:
+            return 1e9
+        # both should be tz-aware timestamps
+        delta = ts_now - self._last_trade_ts
+        return delta.total_seconds() / 60.0
+
 
     def window_ok(self, ts_local_str: str, windows) -> bool:
         return any(w["start"] <= ts_local_str <= w["end"] for w in windows)
 
     def maybe_signal(self, bar, windows, risk):
-        if bar["atr"] <= 0:
+        def reject(reason: str):
+            self._why[reason] += 1
             return None
+        
+        self._reset_if_new_day(bar)
+
         if not self.window_ok(bar["t_local"], windows):
-            return None
+            return reject("window")
+
+        atr = float(bar.get("atr", 0.0) or 0.0)
+        if atr <= 0:
+            return reject("atr<=0")
+        
+        if self.cfg.orb_minutes > 0 and not bool(bar.get("orb_ok", True)):
+            return reject("skip_orb")
 
         px = float(bar.get("close", 0.0) or 0.0)
         atr = float(bar.get("atr", 0.0) or 0.0)
@@ -45,9 +85,9 @@ class VwapReversion:
 
         # hard guards (prevents NaN vwap from killing every signal)
         if px <= 0 or atr <= 0:
-            return None
+            return reject("bad_price_or_atr")
         if not math.isfinite(px) or not math.isfinite(atr):
-            return None
+            return reject("nonfinite_price_or_atr")
         if (not math.isfinite(vwap)) or vwap <= 0:
             vwap = px
 
@@ -71,19 +111,27 @@ class VwapReversion:
         # mean reversion regime: VWAP slope must be flat-ish
         slope = float(bar.get("vwap_slope", 0.0) or 0.0)
         if abs(slope) > float(self.cfg.slope_max):
-            return None
+            return reject("vwap_slope")
 
-        # optional EMA regime gate (only if you actually compute ema_slope)
-        if float(getattr(self.cfg, "ema_slope_max", 0.0) or 0.0) > 0:
-            ema_slope = float(bar.get("ema_slope", 0.0) or 0.0)
-            if abs(ema_slope) > float(self.cfg.ema_slope_max):
+        # optional EMA regime gate
+        ema_slope_max = float(getattr(self.cfg, "ema_slope_max", 0.0) or 0.0)
+        if ema_slope_max > 0:
+            # prefer normalized slope if available
+            ema_slope_atr = bar.get("ema_slope_atr", None)
+            if ema_slope_atr is not None:
+                slope_val = float(ema_slope_atr or 0.0)
+            else:
+                slope_val = float(bar.get("ema_slope", 0.0) or 0.0)
+
+            if abs(slope_val) > ema_slope_max:
                 return None
-            
-        if float(getattr(self.cfg, "ema_max_dist_atr", 0.0) or 0.0) > 0:
+
+        ema_max_dist = float(getattr(self.cfg, "ema_max_dist_atr", 0.0) or 0.0)
+        if ema_max_dist > 0:
             ema_dist_atr = float(bar.get("ema_dist_atr", 0.0) or 0.0)
-            if abs(ema_dist_atr) > float(self.cfg.ema_max_dist_atr):
-                return None
-
+            if abs(ema_dist_atr) > ema_max_dist:
+                return reject("ema_max_dist_atr")
+            
         atr_pts = float(self.cfg.atr_mult) * atr
         if atr_pts <= 0:
             return None
@@ -125,5 +173,8 @@ class VwapReversion:
             type="MARKET",
         )
         bracket = Bracket(stop_price=stop, target_price=target)
+
+        self._why["signal"] += 1
+
         return {"order": order, "bracket": bracket, "stop_dist_points": abs(entry_price - stop)}
 

@@ -43,68 +43,108 @@ class OrderManager:
     # --- entry path ---
     def place_and_simulate(self, bar: pd.Series, order: Order):
         # fill at bar open with slippage (latency means next bar open generally)
-        if not isinstance(order.qty, (int, float)) or order.qty <= 0:
+        if getattr(self.pos, "qty", 0) != 0:
             return
-        if self.pos.qty != 0:
+        try:
+            qty = float(order.qty)
+        except Exception:
             return
-        ref_px = float(bar["open"])
-        entry_px = market_slippage(ref_px, order.side, self.tick_size, bps=self.slip_bps)
-        entry_px = self._round_to_tick(entry_px)
+        if qty <= 0:
+            return
         
-        # fees: notional (bps/fixed) + per-contract
-        entry_fee = self._notional_fee(entry_px, order.qty) + self._per_contract_fee(order.qty)
+        side = str(order.side).upper()
 
-        # update position
-        self.pos.side = order.side
-        self.pos.qty = int(order.qty)
-        self.pos.avg_price = entry_px
+        # fill at bar open with slippage (next bar open sim)
+        ref_px = float(bar["open"])
+        entry_px = market_slippage(ref_px, side, self.tick_size, bps=self.slip_bps)
+        entry_px = self._round_to_tick(entry_px)
+
+        # fees: notional (bps/fixed) + per-contract
+        entry_fee = self._notional_fee(entry_px, qty) + self._per_contract_fee(qty)
         self._last_entry_fee = entry_fee
 
+        # update position (IMPORTANT: keep crypto/equity qty as float)
+        self.pos.side = side
+        self.pos.qty = qty
+        self.pos.avg_price = entry_px
+
+        # notional for logging
+        if getattr(self, "crypto_like", False) or getattr(self, "equity_like", False):
+            notional = abs(entry_px * qty)
+        else:
+            notional = abs(entry_px * self.dpp * qty)
         # record trade
+        ts = getattr(order, "ts", None)
+        if ts is None:
+            ts = bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or bar.get("timestamp") or bar.name
+
         self.trades.append({
-            "ts": getattr(order, "ts", bar.name),
+            "ts": ts,
             "action": "ENTRY",
-            "side": order.side,
-            "qty": int(order.qty),
+            "side": self.pos.side,
+            "qty": float(qty),
             "entry_price": entry_px,
-            "price": entry_px,             # keep legacy field for your equity_curve()
-            "fees": entry_fee,
-            "notional": abs(entry_px * self.dpp * order.qty),
-        })
+            "price": entry_px,             # keep legacy field for equity_curve()
+            "fees": float(entry_fee),
+            "fees_total": float(entry_fee),  # handy for consistency (optional but recommended)
+            "notional": float(notional),
+        })  
+
     # --- exit path (stop/target) ---
     def simulate_bracket(self, bar: pd.Series, oco: Bracket):
-        if self.pos.qty == 0:
+        if float(self.pos.qty) <= 0:
             return None
 
-        hi, lo = float(bar["high"]), float(bar["low"])
-        side = self.pos.side
-        qty = int(self.pos.qty)
+        hi = float(bar.get("high", bar["close"]))
+        lo = float(bar.get("low",  bar["close"]))
+        close_px = float(bar.get("close", (hi + lo) / 2.0))
 
-        stop_hit   = (lo <= oco.stop_price   <= hi)
-        target_hit = (lo <= oco.target_price <= hi)
+        side_u = str(self.pos.side).upper()
+        qty = float(self.pos.qty)  # IMPORTANT: keep crypto qty as float
+        entry_px = float(self.pos.avg_price)
+        stop_px = float(oco.stop_price)
+        tgt_px  = float(oco.target_price)
+
+        # Intrabar hit (classic)
+        stop_hit_intra   = (lo <= stop_px <= hi)
+        target_hit_intra = (lo <= tgt_px  <= hi)
+
+        # Close-based fallback (handles flat OHLC bars)
+        if side_u == "BUY":
+            stop_hit_close   = close_px <= stop_px
+            target_hit_close = close_px >= tgt_px
+        else:  # SELL
+            stop_hit_close   = close_px >= stop_px
+            target_hit_close = close_px <= tgt_px
+
+        stop_hit   = stop_hit_intra   or stop_hit_close
+        target_hit = target_hit_intra or target_hit_close
+
         exit_price = None
         exit_reason = None
 
         if stop_hit and target_hit:
-            exit_price, exit_reason = oco.stop_price, "STOP"
+            exit_price, exit_reason = stop_px, "STOP"
         elif stop_hit:
-            exit_price, exit_reason = oco.stop_price, "STOP"
+            exit_price, exit_reason = stop_px, "STOP"
         elif target_hit:
-            exit_price, exit_reason = oco.target_price, "TARGET"
-
+            exit_price, exit_reason = tgt_px, "TARGET"
         if exit_price is None:
             return None
 
         # slippage on exit
-        exit_px = market_slippage(float(exit_price), side, self.tick_size, bps=self.slip_bps)
+        exit_px = market_slippage(float(exit_price), side_u, self.tick_size, bps=self.slip_bps)
         exit_px = self._round_to_tick(exit_px)
 
         # fees on exit side
         exit_fee = self._notional_fee(exit_px, qty) + self._per_contract_fee(qty)
-        total_fees = self._last_entry_fee + exit_fee
+        total_fees = float(getattr(self, "_last_entry_fee", 0.0)) + float(exit_fee)
 
         # gross pnl (ticks * qty * direction)
-        gross_pnl = (exit_px - self.pos.avg_price) * self.dpp * qty * side_mult(side)
+        if getattr(self, "crypto_like", False) or getattr(self, "equity_like", False):
+            gross_pnl = (exit_px - float(entry_px)) * qty * side_mult(side_u)
+        else:
+            gross_pnl = (exit_px - float(entry_px)) * float(self.dpp) * qty * side_mult(side_u)
         net_pnl = gross_pnl - total_fees
         self.realized_pnl += net_pnl
 
@@ -113,17 +153,16 @@ class OrderManager:
             "ts": bar.name,
             "action": "EXIT",
             "reason": exit_reason,
-            "side": side,
-            "qty": qty,
-            "entry_price": self.pos.avg_price,
-            "exit_price": exit_px,
-            "pnl": net_pnl,                     # net of entry+exit fees
-            "fees": exit_fee,                   # exit-side fee
-            "fees_total": total_fees,           # entry + exit
-            "notional": abs(exit_px * qty),
+            "side": side_u,
+            "qty": float(qty),
+            "price": float(entry_px),
+            "entry_price": float(entry_px),
+            "exit_price": float(exit_px),
+            "pnl": float(net_pnl),                                      
+            "fees_total": float(total_fees),           # entry + exit
+            "notional": abs(exit_px * qty) if (getattr(self, "crypto_like", False) or getattr(self, "equity_like", False))
+                        else abs(exit_px * self.dpp * qty),
         }
         self.trades.append(trade)
 
-        # flatten
-        self._flat()
         return trade

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
 import argparse, csv, itertools, json, os, subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -93,6 +99,76 @@ def fnum(v: Any) -> float:
     except Exception:
         return float("-inf")
 
+def run_one_job(
+    *,
+    repo_root: Path,
+    base_uni: Dict[str, Any],
+    symbol: str,
+    param_paths: List[str],
+    combo: Tuple[Any, ...],
+    sweep_root: Path,
+    run_tag: str,
+    args_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    run_dir = sweep_root / run_tag
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Deep copy universe and apply overrides to *symbol block*
+    uni = json.loads(json.dumps(base_uni))
+    sym_block = find_symbol_block(uni, symbol)
+    for path, val in zip(param_paths, combo):
+        deep_set(sym_block, path, val)
+
+    temp_universe = run_dir / "universe.yaml"
+    temp_universe.write_text(yaml.safe_dump(uni, sort_keys=False))
+
+    cmd = [
+        args_dict["py_bin"], "run_backtest.py",
+        "--profile", args_dict["profile"],
+        "--universe", str(temp_universe),
+        "--symbol", symbol,
+        "--csv", args_dict["csv"],
+        "--start-date", args_dict["start_date"],
+        "--end-date", args_dict["end_date"],
+        "--no-gui",
+        "--outdir", str(sweep_root),
+        "--run-tag", run_tag,
+        "--light-artifacts",
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo_root),
+        env={**os.environ, "PYTHONPATH": "."},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    (run_dir / "stdout.txt").write_text(proc.stdout)
+    (run_dir / "stderr.txt").write_text(proc.stderr)
+
+    summary = read_summary(run_dir / "summary.json")
+
+    row: Dict[str, Any] = {
+        "rc": proc.returncode,
+        "run_tag": run_tag,
+        "run_dir": str(run_dir.relative_to(repo_root)),
+    }
+    for path, val in zip(param_paths, combo):
+        row[path] = val
+
+    for k in [
+        "Trades","WinRate","ProfitFactor","Expectancy","NetPnL",
+        "FeesTotal","MaxDrawdown","Sharpe","Sortino",
+        "NetReturnPct","GrossReturnPct","AvgTrade","AvgWin","AvgLoss","PayoffRatio","Turnover","CAGR"
+    ]:
+        if k in summary:
+            row[k] = summary[k]
+
+    return row
+
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -106,6 +182,8 @@ def main() -> int:
     ap.add_argument("--py-bin", default=str(Path(".venv/bin/python")))
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--outdir", default="logs/sweeps")
+    ap.add_argument("--jobs", type=int, default=1, help="Parallel workers (subprocesses)")
+    ap.add_argument("--keep-going", action="store_true", help="Continue even if some runs fail")
 
     ap.add_argument(
         "--params",
@@ -141,74 +219,72 @@ def main() -> int:
     combos = list(itertools.product(*param_values))
     total = len(combos)
 
+    # Build all jobs (run_tag + combo)
+    jobs: List[Tuple[int, Tuple[Any, ...], str]] = []
     for i, combo in enumerate(combos, start=1):
-        # Build run tag: key=val_key=val...
         parts = []
         for path, val in zip(param_paths, combo):
             key = path.split(".")[-1]
             parts.append(f"{key}{safe_val(val)}")
         run_tag = "_".join(parts)
+        jobs.append((i, combo, run_tag))
 
-        run_dir = sweep_root / run_tag
-        run_dir.mkdir(parents=True, exist_ok=True)
+    args_dict = dict(
+        py_bin=args.py_bin,
+        profile=args.profile,
+        csv=args.csv,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
 
-        # Deep copy universe and apply overrides to *symbol block*
-        uni = json.loads(json.dumps(base_uni))
-        sym_block = find_symbol_block(uni, args.symbol)
+    print(f"[SWEEP] runs={total} jobs={args.jobs} out={sweep_root.relative_to(repo_root)}")
 
-        for path, val in zip(param_paths, combo):
-            deep_set(sym_block, path, val)
+    if args.jobs <= 1:
+        # fallback: keep your old behavior but via the same worker
+        for i, combo, run_tag in jobs:
+            print(f"[{i}/{total}] {run_tag}")
+            row = run_one_job(
+                repo_root=repo_root,
+                base_uni=base_uni,
+                symbol=args.symbol,
+                param_paths=param_paths,
+                combo=combo,
+                sweep_root=sweep_root,
+                run_tag=run_tag,
+                args_dict=args_dict,
+            )
+            rows.append(row)
+    else:
+        # parallel
+        with ThreadPoolExecutor(max_workers=int(args.jobs)) as ex:
+            futs = {}
+            for i, combo, run_tag in jobs:
+                fut = ex.submit(
+                    run_one_job,
+                    repo_root=repo_root,
+                    base_uni=base_uni,
+                    symbol=args.symbol,
+                    param_paths=param_paths,
+                    combo=combo,
+                    sweep_root=sweep_root,
+                    run_tag=run_tag,
+                    args_dict=args_dict,
+                )
+                futs[fut] = (i, run_tag)
 
-        temp_universe = run_dir / "universe.yaml"
-        temp_universe.write_text(yaml.safe_dump(uni, sort_keys=False))
+            completed = 0
+            for fut in as_completed(futs):
+                i, run_tag = futs[fut]
+                completed += 1
+                try:
+                    row = fut.result()
+                    rows.append(row)
+                    print(f"[{completed}/{total}] rc={row.get('rc')} {run_tag} NetPnL={row.get('NetPnL')} Trades={row.get('Trades')}")
+                except Exception as e:
+                    print(f"[{completed}/{total}] FAILED {run_tag}: {e}")
+                    if not args.keep_going:
+                        raise
 
-        cmd = [
-            args.py_bin, "run_backtest.py",
-            "--profile", args.profile,
-            "--universe", str(temp_universe),
-            "--symbol", args.symbol,
-            "--csv", args.csv,
-            "--start-date", args.start_date,
-            "--end-date", args.end_date,
-            "--no-gui",
-            "--outdir", str(sweep_root),
-            "--run-tag", run_tag,
-            "--light-artifacts",
-        ]
-
-        print(f"[{i}/{total}] {run_tag}")
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo_root),
-            env={**os.environ, "PYTHONPATH": "."},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        (run_dir / "stdout.txt").write_text(proc.stdout)
-        (run_dir / "stderr.txt").write_text(proc.stderr)
-
-        summary_path = run_dir / "summary.json"
-        summary = read_summary(summary_path)
-
-        row: Dict[str, Any] = {
-            "rc": proc.returncode,
-            "run_tag": run_tag,
-            "run_dir": str(run_dir.relative_to(repo_root)),
-        }
-        for path, val in zip(param_paths, combo):
-            row[path] = val
-
-        for k in [
-            "Trades","WinRate","ProfitFactor","Expectancy","NetPnL",
-            "FeesTotal","MaxDrawdown","Sharpe","Sortino",
-            "NetReturnPct","GrossReturnPct","AvgTrade","AvgWin","AvgLoss","PayoffRatio","Turnover","CAGR"
-        ]:
-            if k in summary:
-                row[k] = summary[k]
-
-        rows.append(row)
 
     # results.csv
     results_csv = sweep_root / "results.csv"

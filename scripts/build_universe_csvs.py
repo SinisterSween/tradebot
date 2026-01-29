@@ -115,6 +115,8 @@ async def run_crypto_symbol_feeder(
     poll_secs: float = 2.0,
     build_only: bool = False,
     limit_per_call: int = 1000,
+    log_pages_every: int = 0,
+    verbose: bool = False,
     ):
     """
     Writes: <out_dir>/<SYMBOL>_live_1m.csv
@@ -146,54 +148,63 @@ async def run_crypto_symbol_feeder(
         }
     )
 
-    if use_sandbox and hasattr(ex, "set_sandbox_mode"):
-        ex.set_sandbox_mode(True)
-
-    await ex.load_markets()
-
-    if symbol not in ex.markets:
-        # Some exchanges require exact casing; try to find a close match.
-        candidates = [m for m in ex.markets.keys() if m.upper() == symbol.upper()]
-        if candidates:
-            symbol = candidates[0]
-        else:
-            raise RuntimeError(f"{exchange}: market not found for symbol={symbol}")
-
-    header = ["datetime", "open", "high", "low", "close", "volume"]
-    wrote_header = csv_path.exists()
-
-    def _write_row(ts_ms: int, o: float, h: float, l: float, c: float, v: float):
-        nonlocal wrote_header
-        dt_iso = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
-        new_file = not wrote_header
-        with csv_path.open("a", newline="") as f:
-            w = csv.writer(f)
-            if new_file:
-                w.writerow(header)
-                wrote_header = True
-            w.writerow([dt_iso, float(o), float(h), float(l), float(c), float(v)])
-
-    # ----- Backfill -----
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    since_ms = int((datetime.now(timezone.utc).timestamp() - preload_days * 86400) * 1000)
-
-    # Aim to backfill up through the last *closed* 1m candle
-    target_end_ms = now_ms - 60_000
-
-    last_seen_ms: int | None = None
-    rows_written = 0
-
-    print(f"[START][CRYPTO] {exchange} {symbol} -> {csv_path} preload_days={preload_days}")
-
+    
     try:
+        if use_sandbox and hasattr(ex, "set_sandbox_mode"):
+            ex.set_sandbox_mode(True)
+        await ex.load_markets()
+
+    
+        if symbol not in ex.markets:
+            # Some exchanges require exact casing; try to find a close match.
+            candidates = [m for m in ex.markets.keys() if m.upper() == symbol.upper()]
+            if candidates:
+                symbol = candidates[0]
+            else:
+                raise RuntimeError(f"{exchange}: market not found for symbol={symbol}")
+
+        header = ["datetime", "open", "high", "low", "close", "volume"]
+        wrote_header = csv_path.exists()
+
+        def _write_row(ts_ms: int, o: float, h: float, l: float, c: float, v: float):
+            nonlocal wrote_header
+            dt_iso = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+            new_file = not wrote_header
+            with csv_path.open("a", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(header)
+                    wrote_header = True
+                w.writerow([dt_iso, float(o), float(h), float(l), float(c), float(v)])
+
+        # ----- Backfill -----
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        since_ms = int((datetime.now(timezone.utc).timestamp() - preload_days * 86400) * 1000)
+
+        # Aim to backfill up through the last *closed* 1m candle
+        target_end_ms = now_ms - 60_000
+
+        last_seen_ms: int | None = None
+        rows_written = 0
+
+        print(f"[START][CRYPTO] {exchange} {symbol} -> {csv_path} preload_days={preload_days}")
+        # Align since to minute boundary (optional, but nice)
+        since_ms = (since_ms // 60_000) * 60_000
+        page_i = 0
+        rows_written = 0
+        last_progress_print = 0
+
         # Keep paging until we reach target_end_ms or the exchange stops returning data
         while True:
             ohlcv = await ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit_per_call)
             if not ohlcv:
-                break
+                    break
+            # optional debug page range (recommended)
+            page_i += 1
+            first_ts = ohlcv[0][0]
+            last_ts = ohlcv[-1][0]
 
             advanced = False
-
             for ts_ms, o, h, l, c, v in ohlcv:
                 if last_seen_ms is not None and ts_ms <= last_seen_ms:
                     continue
@@ -202,11 +213,18 @@ async def run_crypto_symbol_feeder(
                 rows_written += 1
                 advanced = True
 
-            if last_seen_ms is None:
-                break
+            # Print page debug only every 25 pages (tune this)
+            if verbose or (log_pages_every and page_i % log_pages_every == 0):
+                print(f"[PAGE][CRYPTO] {symbol} page={page_i} got={len(ohlcv)} "
+                    f"ts {first_ts}->{last_ts} since={since_ms} rows_written={rows_written}")
 
-            # If we didn't advance, stop to avoid an infinite loop on duplicate pages
-            if not advanced:
+            # Print progress every ~10k rows (optional)
+            if rows_written - last_progress_print >= 10_000:
+                print(f"[PROG][CRYPTO] {symbol} rows_written={rows_written} last_seen={last_seen_ms}")
+                last_progress_print = rows_written
+
+
+            if last_seen_ms is None or not advanced:
                 break
 
             # Done when we’ve reached the last closed candle
@@ -214,7 +232,7 @@ async def run_crypto_symbol_feeder(
                 break
 
             # Advance since to just after the last candle we wrote
-            since_ms = last_seen_ms + 60_000
+            since_ms = last_seen_ms + 1
 
 
         print(f"[HIST][CRYPTO] {symbol} backfill rows={rows_written} last_seen={last_seen_ms}")
@@ -227,6 +245,12 @@ async def run_crypto_symbol_feeder(
         while True:
             # Get most recent candles (2 gives you the just-closed candle reliably)
             ohlcv = await ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=2)
+            # Debug: show range returned each page
+            if ohlcv:
+                first_ts = ohlcv[0][0]
+                last_ts = ohlcv[-1][0]
+                print(f"[PAGE][CRYPTO] {symbol} got={len(ohlcv)} ts {first_ts}->{last_ts} since={since_ms}")
+
             if ohlcv:
                 for ts_ms, o, h, l, c, v in ohlcv:
                     if last_seen_ms is None or ts_ms > last_seen_ms:
@@ -238,8 +262,7 @@ async def run_crypto_symbol_feeder(
             if now - last_print >= 30:
                 last_dt = (
                     datetime.fromtimestamp(last_seen_ms / 1000, tz=timezone.utc).isoformat()
-                    if last_seen_ms
-                    else "?"
+                    if last_seen_ms else "?"
                 )
                 print(f"[FEED][CRYPTO] {symbol} last={last_dt} rows_written={rows_written} csv={csv_path}")
                 last_print = now
@@ -302,8 +325,17 @@ def _universe_assets(universe_path: str) -> dict:
 
 async def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--log-pages-every", type=int, default=0)
     ap.add_argument("--universes", nargs="+", required=True,
                     help="Universe names or paths. Example: sp500_fractional or config/universes/sp500_fractional.yaml")
+    ap.add_argument("--symbol", default=None,
+                    help='Only build one symbol, e.g. "XLM/USDT" or "LTC/USDT" or "SPY"')
+    ap.add_argument("--symbols", default=None,
+                    help='Only build these symbols (comma-separated), e.g. "XLM/USDT,LTC/USDT"')
+    ap.add_argument("--list-symbols", action="store_true",
+                    help="Print resolved symbols from the universe(s) then exit")
+
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7497)
     ap.add_argument("--client-id-start", type=int, default=50,
@@ -359,6 +391,33 @@ async def main():
 
     if not entries:
         raise SystemExit("No symbols found in the provided universes.")
+
+
+        # ---- Optional: filter to specific symbol(s) ----
+    def _norm(s: str) -> str:
+        return (s or "").strip().upper()
+
+    if args.list_symbols:
+        print("\n".join([e["symbol"] for e in entries]))
+        return
+
+    wanted = None
+    if args.symbol:
+        wanted = {_norm(args.symbol)}
+    elif args.symbols:
+        wanted = {_norm(x) for x in args.symbols.split(",") if x.strip()}
+
+    if wanted is not None:
+        before = len(entries)
+        entries = [e for e in entries if _norm(e["symbol"]) in wanted]
+
+        missing = sorted(list(wanted - {_norm(e["symbol"]) for e in entries}))
+        if missing:
+            raise SystemExit(f"[CSV] requested symbol(s) not found in universes: {missing}")
+
+        print(f"[PLAN] filtered symbols: {before} -> {len(entries)}")
+
+
 
     print(f"[PLAN] universes={len(universe_paths)} symbols={len(entries)} out_dir={args.out_dir}")
     out_dir = Path(args.out_dir)
@@ -426,6 +485,8 @@ async def main():
                     limit_per_call=limit_per_call,
                     poll_secs=2.0,
                     build_only=bool(args.build_only),
+                    log_pages_every=args.log_pages_every,
+                    verbose=args.verbose,
                 )
                 return  # important: don’t fall through to non-crypto
             
