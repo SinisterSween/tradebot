@@ -4,19 +4,26 @@ symbols:
   - SOXL
   - SOXS
 
+asset_class: equity
+exchange: ibkr
+
+backfill:
+  days: 30
+  timeframe: "1m"
+
 tick_size: 0.01
 point_value: 1
-
 rotate: true
 
+strategy_name: LeveredEtfBreakout
 strategy:
   
-  orb_minutes: 15
+  orb_minutes: 10
   atr_len: 14
   break_eps_ticks: 2
   atr_mult: 1.0
   target_R: 1.0
-  slope_min: 0.0
+  slope_min: 0.05
   stop_pad_ticks: 2
   trail_pad_ticks: 2
 

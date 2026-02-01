@@ -5,31 +5,32 @@ symbols:
   - LYG
   - ITUB
   - HBAN
-  - NAK
   - SNDL
-  - GOVX
-  - MARK
-  - ZOM
   - GSAT
-  - CIDM
+
+asset_class: equity
+exchange: ibkr
+
+backfill:
+  days: 30
+  timeframe: "1m"
 
 tick_size: 0.01
 point_value: 1
-
-
 rotate: true
 
+strategy_name: TinyCapBreakout
 strategy:
-  orb_minutes: 15
+  orb_minutes: 5
   atr_len: 14
-  break_eps_ticks: 2
+  break_eps_ticks: 3
   atr_mult: 1.0
-  target_R: 1.0
-  slope_min: 0.0
+  target_R: 0.75
+  slope_min: 0.08
   stop_pad_ticks: 2
   trail_pad_ticks: 2
 
 execution:
   be_req_profit_ticks: 4
-  max_hold_min: 25
+  max_hold_min: 20
   min_minutes_to_window_end: 30

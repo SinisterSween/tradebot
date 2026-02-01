@@ -71,6 +71,40 @@ class RiskGovernor:
             "ts": getattr(self, "_dbg_ts", None),
         }
         return max(0,qty)
+    def position_size_units(self, stop_distance_points: float) -> float:
+        """
+        Spot sizing: returns units (float), where $PnL = units * (exit - entry).
+        So risk per 1 unit for stop distance is simply stop_distance_points dollars.
+        """
+        if stop_distance_points <= 0:
+            return 0.0
+
+        tick_value = float(getattr(self.cfg, "tick_value", 0.0))
+        account_equity = float(getattr(self.cfg, "account_equity", 0.0))
+        risk_pct = float(getattr(self.cfg, "risk_pct", 0.0))
+        if account_equity <= 0 or risk_pct <= 0:
+            return 0.0
+
+        buffer = float(getattr(self, "risk_buffer_pct", 1.0) or 1.0)
+        allowed = account_equity * risk_pct * buffer
+
+        # $ risk per 1 unit at this stop distance
+        per_unit = float(stop_distance_points)
+        if per_unit <= 0:
+            return 0.0
+
+        units = allowed / per_unit
+        self._last_ps = {
+            "mode": "units",
+            "stop_dist_pts": stop_distance_points,
+            "risk_per_unit": per_unit,
+            "allowed": allowed,
+            "qty": units,
+            "ts": getattr(self, "_dbg_ts", None),
+        }
+        return max(0.0, float(units))
+
+
     def record_trade_outcome_R(self, R: float):
         self.realized_R += R
         self.consec_losses = self.consec_losses + 1 if R < 0 else 0

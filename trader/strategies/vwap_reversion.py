@@ -24,13 +24,15 @@ class StratConfig:
     orb_minutes: int = 0
 
 class VwapReversion:
-    def __init__(self, cfg: StratConfig):
+    def __init__(self, cfg: StratConfig, *, debug_cfg_echo: bool = False):
         self.cfg = cfg
         self._why = Counter()
         self._rej = Counter()
         self._last_trade_ts = None          # pd.Timestamp
         self._day = None                    # datetime.date
         self._trades_today = 0
+        if debug_cfg_echo:
+            print(f"[STRAT.ECHO] VwapReversion cfg={self.cfg}")
 
 
     def on_entry_submitted(self, ts) -> None:
@@ -59,7 +61,7 @@ class VwapReversion:
 
     def maybe_signal(self, bar, windows, risk):
         def reject(reason: str):
-            self._why[reason] += 1
+            self._rej[reason] += 1
             return None
         
         self._reset_if_new_day(bar)
@@ -85,7 +87,7 @@ class VwapReversion:
 
         # hard guards (prevents NaN vwap from killing every signal)
         if px <= 0 or atr <= 0:
-            return reject("bad_price_or_atr")
+            return reject("px_or_atr<=0")
         if not math.isfinite(px) or not math.isfinite(atr):
             return reject("nonfinite_price_or_atr")
         if (not math.isfinite(vwap)) or vwap <= 0:
@@ -93,20 +95,23 @@ class VwapReversion:
 
         dist_atr = abs(px - vwap) / atr
 
-        if float(getattr(self.cfg, "vwap_entry_min_atr", 0.0) or 0.0) > 0 and dist_atr < float(self.cfg.vwap_entry_min_atr):
-            return None
-        if float(getattr(self.cfg, "vwap_entry_max_atr", 0.0) or 0.0) > 0 and dist_atr > float(self.cfg.vwap_entry_max_atr):
-            return None
+        vmin = float(getattr(self.cfg, "vwap_entry_min_atr", 0.0) or 0.0)
+        if vmin > 0 and dist_atr < vmin:
+            return reject("vwap_entry_min_atr")
+
+        vmax = float(getattr(self.cfg, "vwap_entry_max_atr", 0.0) or 0.0)
+        if vmax > 0 and dist_atr > vmax:
+            return reject("vwap_entry_max_atr")
 
         # dead / micro chop
         if self.cfg.min_atr_pct and (atr / px) < float(self.cfg.min_atr_pct):
-            return None
+            return reject("min_atr_pct")
 
         # reject huge bars
         if self.cfg.max_bar_range_atr:
             bar_range = float(bar["high"]) - float(bar["low"])
             if (bar_range / atr) > float(self.cfg.max_bar_range_atr):
-                return None
+                return reject("max_bar_range_atr")
 
         # mean reversion regime: VWAP slope must be flat-ish
         slope = float(bar.get("vwap_slope", 0.0) or 0.0)
@@ -124,7 +129,7 @@ class VwapReversion:
                 slope_val = float(bar.get("ema_slope", 0.0) or 0.0)
 
             if abs(slope_val) > ema_slope_max:
-                return None
+                return reject("ema_slope_max")
 
         ema_max_dist = float(getattr(self.cfg, "ema_max_dist_atr", 0.0) or 0.0)
         if ema_max_dist > 0:
@@ -134,7 +139,7 @@ class VwapReversion:
             
         atr_pts = float(self.cfg.atr_mult) * atr
         if atr_pts <= 0:
-            return None
+            return reject("atr_pts<=0")
 
         side = None
         entry_price = px
@@ -147,7 +152,7 @@ class VwapReversion:
                 stop_dist = abs(entry_price - stop)
                 tgt_dist = abs(vwap - entry_price)
                 if stop_dist <= 0 or (tgt_dist / stop_dist) < float(self.cfg.min_vwap_target_R):
-                    return None
+                    return reject("min_vwap_target_R")
 
         elif px <= vwap - atr_pts:
             side = "BUY"
@@ -157,10 +162,10 @@ class VwapReversion:
                 stop_dist = abs(entry_price - stop)
                 tgt_dist = abs(vwap - entry_price)
                 if stop_dist <= 0 or (tgt_dist / stop_dist) < float(self.cfg.min_vwap_target_R):
-                    return None
+                    return reject("min_vwap_target_R")
 
         else:
-            return None
+            return reject("no_setup")
 
         order_id = str(bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or bar.get("timestamp") or bar.name)
 

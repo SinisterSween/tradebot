@@ -52,6 +52,13 @@ def parse_param_spec(spec: str) -> Tuple[str, List[Any]]:
         raise ValueError(f"Bad --params spec (missing '='): {spec}")
     path, raw = spec.split("=", 1)
     path = path.strip()
+     # basic path validation: segments like "strategy.target_R"
+    parts = path.split(".")
+    if len(parts) < 2:
+        raise ValueError(f"Bad --params path (need 'section.key' or deeper): {path}")
+    for p in parts:
+        if not p or any(ch.isspace() for ch in p):
+            raise ValueError(f"Bad --params path (empty/whitespace segment): {path}")
     vals_raw = [v.strip() for v in raw.split(",") if v.strip()]
 
     def coerce(x: str) -> Any:

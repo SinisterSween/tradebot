@@ -44,3 +44,61 @@ QQQ:
   commission_per_contract: 0.005
   exchange_fees_per_contract: 0.00
 
+ETH/USDT:
+  symbol: ETH/USDT
+  tick_size: 0.01
+  currency: USD
+  exchange: binanceus
+  commission_per_contract: 0.0
+  exchange_fees_per_contract: 0.0
+
+SOL/USDT:
+  symbol: SOL/USDT
+  tick_size: 0.01
+  currency: USD
+  exchange: binanceus
+  commission_per_contract: 0.0
+  exchange_fees_per_contract: 0.0
+
+XRP/USDT:
+  symbol: XRP/USDT
+  tick_size: 0.0001
+  currency: USD
+  exchange: binanceus
+  commission_per_contract: 0.0
+  exchange_fees_per_contract: 0.0
+
+LTC/USDT:
+  symbol: LTC/USDT
+  tick_size: 0.01
+  currency: USD
+  exchange: binanceus
+  commission_per_contract: 0.0
+  exchange_fees_per_contract: 0.0
+
+XLM/USDT:
+  symbol: XLM/USDT
+  tick_size: 0.0001
+  currency: USD
+  exchange: binanceus
+  commission_per_contract: 0.0
+  exchange_fees_per_contract: 0.0
+
+BCH/USDT:
+  symbol: BCH/USDT
+  tick_size: 0.01
+  currency: USD
+  exchange: binanceus
+  commission_per_contract: 0.0
+  exchange_fees_per_contract: 0.0
+
+DOGE/USDT:
+  symbol: DOGE/USDT
+  tick_size: 0.0001
+  currency: USD
+  exchange: binanceus
+  commission_per_contract: 0.0
+  exchange_fees_per_contract: 0.0
+
+
+

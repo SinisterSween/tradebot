@@ -1,4 +1,8 @@
 symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - SMH
   - AAPL
   - MSFT
   - GOOGL
@@ -9,20 +13,26 @@ symbols:
   - NFLX
   - AMD
   - CRM
+asset_class: equity
+exchange: ibkr
+
+backfill:
+  days: 30
+  timeframe: "1m"
 
 tick_size: 0.01
 point_value: 1
 fractional: true
-
 rotate: true
 
+strategy_name: TrendPullback
 strategy:
-  orb_minutes: 15
+  orb_minutes: 10
   atr_len: 14
   break_eps_ticks: 2
   atr_mult: 1.0
   target_R: 1.0
-  slope_min: 0.0
+  slope_min: 0.06
   stop_pad_ticks: 2
   trail_pad_ticks: 2
 

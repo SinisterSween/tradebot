@@ -1,16 +1,21 @@
 # run_backtest.py
 import argparse
 import os
+import sys
 from pathlib import Path
 from collections import Counter
 from datetime import date
 from matplotlib.pyplot import bar
+from typing import Optional
 import yaml
 import pandas as pd
 import matplotlib
 import numpy as np
+import json, hashlib
+
 
 from trader.engine.backtest import prepare_bars, equity_curve
+from trader.utils.run_manifest import write_run_manifest
 from trader.engine.execution import OrderManager
 from trader.engine.risk import RiskConfig, RiskGovernor
 from trader.strategies.hybrid_orb_vwap import HybridOrbVwap, StratConfig as OrbCfg
@@ -42,6 +47,27 @@ def _pick_microlot(portfolio_cfg: dict, microlot_name: str) -> dict:
             return m
     raise SystemExit(f"Microlot not found: {microlot_name}. Options: {[m.get('name') for m in lots]}")
 
+def _reanchor_bracket_to_fill(side: str, sig_entry: float, sig_stop: float, sig_target: float, fill_entry: float):
+    side = (side or "").upper().strip()
+    stop_dist = abs(float(sig_entry) - float(sig_stop))
+    tgt_dist  = abs(float(sig_target) - float(sig_entry))
+
+    if side == "BUY":
+        stop_px   = float(fill_entry) - stop_dist
+        target_px = float(fill_entry) + tgt_dist
+    else:  # SELL
+        stop_px   = float(fill_entry) + stop_dist
+        target_px = float(fill_entry) - tgt_dist
+
+    return float(stop_px), float(target_px)
+
+def _round_to_tick(px: float, tick_size: float) -> float:
+    t = float(tick_size or 0.0)
+    if t <= 0:
+        return float(px)
+    return round(float(px) / t) * t
+
+
 def _symbol_to_csv_stem(symbol: str) -> str:
     # Matches feeder naming: "BTC/USDT" -> "BTC_USDT", "AAPL" -> "AAPL"
     return str(symbol).upper().replace("/", "_")
@@ -67,16 +93,6 @@ def _as_bool(v, default=False) -> bool:
     if s in {"false", "0", "no", "n", "off"}:
         return False
     return bool(default)
-
-def _deep_merge(a, b):
-    out = dict(a or {})
-    for k, v in (b or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
 
 def _norm_windows(windows):
     out = []
@@ -206,7 +222,10 @@ def warn_unused_keys(cfg_cls, s_cfg: dict, context: str = ""):
     allowed = {f.name for f in fields(cfg_cls)} | _STRATEGY_META_KEYS
     extra = sorted(set((s_cfg or {}).keys()) - allowed)
     if extra:
-        print(f"[CFG][WARN] Unused keys for {cfg_cls.__name__} {context}: {extra}")
+        msg = f"Unused keys for {cfg_cls.__name__} {context}: {extra}"
+        if os.getenv("FAIL_ON_UNUSED_KEYS", "0") == "1":
+            raise ValueError(msg)
+        print(f"[CFG][WARN] {msg}")
 
 def _filter_kwargs(dataclass_type, kwargs: dict) -> dict:
     """Return only kwargs that exist on a dataclass."""
@@ -219,16 +238,94 @@ def deep_merge(a: dict, b: dict) -> dict:
     """Return a deep-merged copy of a <- b (b wins)."""
     out = dict(a or {})
     for k, v in (b or {}).items():
+        # --- SPECIAL CASE: strategy blocks ---
+        # If both sides have strategy dicts and strategy name changes,
+        # DO NOT deep-merge; replace entirely to avoid key leakage.
+        if k == "strategy" and isinstance(v, dict) and isinstance(out.get(k), dict):
+            a_name = (out[k].get("name") or "").strip()
+            b_name = (v.get("name") or "").strip()
+            if a_name and b_name and a_name.lower() != b_name.lower():
+                out[k] = dict(v)  # replace strategy block
+                continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = deep_merge(out[k], v)
         else:
             out[k] = v
     return out
 
+def merge_strategy_cfg(base: dict | None, ovr: dict | None) -> dict:
+    base = dict(base or {})
+    ovr  = dict(ovr or {})
+
+    a_name = (base.get("name") or "").strip()
+    b_name = (ovr.get("name") or "").strip()
+
+    # If strategy name changes, replace entirely (prevents key leakage like target_vwap)
+    if a_name and b_name and a_name.lower() != b_name.lower():
+        return ovr
+
+    # Otherwise normal deep merge (ovr wins)
+    return deep_merge(base, ovr)
+
+REQUIRED_BY_STRATEGY = {
+    "rsi_mean_reversion": {
+        "rsi_len",
+        "rsi_buy_below",
+        "rsi_sell_above",
+        "atr_len",
+        "atr_mult",
+        "target_R",
+        "stop_pad_ticks",
+    },
+    "vwap_reversion": {
+        "atr_len",
+        "atr_mult",
+        "target_R",
+        "stop_pad_ticks",
+    },
+    "hybrid_orb_vwap": {
+        "orb_minutes",
+        "atr_len",
+        "atr_mult",
+        "target_R",
+    },
+}
+
+def assert_locked_strategy_complete(
+    cfg: dict,
+    *,
+    symbol: str | None = None, 
+    strategy_name: str | None = None,
+    strategy_cfg: dict | None = None,
+):
+
+    if not cfg.get("locked", False):
+        return
+    
+    sym = symbol or cfg.get("symbol") or "<unknown>"
+
+    strat = strategy_cfg if strategy_cfg is not None else cfg.get("strategy") or {}
+    if not isinstance(strat, dict):
+        raise ValueError(f"[LOCKED CONFIG ERROR] {sym} strategy must be a dict")
+    
+    if strategy_name is None:
+        raw = strat.get("name") or cfg.get("strategy_name") or "HybridOrbVwap"
+        strategy_name = _norm_strat_name(raw)
+
+    required = REQUIRED_BY_STRATEGY.get(strategy_name)
+    if not required:
+        return  # no rule for this strategy name
+
+    missing = required - set(strat.keys())
+    if missing:
+        raise ValueError(
+            f"[LOCKED CONFIG ERROR] {sym} ({strategy_name}) missing keys: {sorted(missing)}"
+        )
+
 
 def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
     name = _norm_strat_name(strategy_name or "HybridOrbVwap")
-
+    debug_echo = (os.getenv("STRAT_ECHO", "0") == "1")
     if name == "VwapReversion":
         warn_unused_keys(RevCfg, s_cfg, context=f"({name})")
         rev_kwargs = dict(
@@ -251,7 +348,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
 
         )
         cfg = RevCfg(**_filter_kwargs(RevCfg, rev_kwargs))
-        return VwapReversion(cfg)
+        return VwapReversion(cfg, debug_cfg_echo=debug_echo)
 
     if name == "TrendPullback":
         warn_unused_keys(PbCfg, s_cfg, context=f"({name})")
@@ -269,7 +366,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             min_notional_usd=float(s_cfg.get("min_notional_usd", 0.0)),
         )
         cfg = PbCfg(**_filter_kwargs(PbCfg, pb_kwargs))
-        return TrendPullback(cfg)
+        return TrendPullback(cfg, debug_cfg_echo=debug_echo)
     
     if name == "RsiMeanReversion":
         warn_unused_keys(RsiMRConfig, s_cfg, context=f"({name})")
@@ -309,7 +406,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             require_early_done=_as_bool(s_cfg.get("require_early_done", True)),
         )
         cfg = RsiMRConfig(**_filter_kwargs(RsiMRConfig, pb_kwargs))
-        return RsiMeanReversion(cfg)
+        return RsiMeanReversion(cfg, debug_cfg_echo=debug_echo)
 
 
     # default: HybridOrbVwap
@@ -327,7 +424,7 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
         tick_value=float(fees["tick_value"]),
     )
     cfg = OrbCfg(**_filter_kwargs(OrbCfg, orb_kwargs))
-    return HybridOrbVwap(cfg)
+    return HybridOrbVwap(cfg, debug_cfg_echo=debug_echo)
 
 def _minutes_between(a_str, b_str):
     try:
@@ -442,8 +539,34 @@ def _compute_size(symbol, equity, risk_pct, stop_ticks, tick_value, last_price, 
     raw = int(risk_capital // risk_per_contract)
     return max(0, min(raw, max_size))
 
+def _norm_sym(s: str | None) -> str:
+    if not s:
+        return ""
+    return str(s).strip().upper().replace(" ", "")
 
+def _find_symbol_row(universe_cfg: dict | None, symbol: str) -> Optional[dict]:
+    """
+    universe_cfg format:
+      symbols:
+        - symbol: XRP/USDT
+          strategy: ...
+          execution: ...
+    """
+    if not universe_cfg:
+        return None
+    rows = universe_cfg.get("symbols") or []
+    if not isinstance(rows, list):
+        return None
+    target = _norm_sym(symbol)
+    matches = [
+        row for row in rows
+        if isinstance(row, dict) and _norm_sym(row.get("symbol")) == target
+    ]
 
+    if len(matches) > 1:
+        print(f"[WARN] duplicate symbol rows for {symbol}: {len(matches)} (using first)")
+
+    return matches[0] if matches else None
 
 def _load_yaml_if_exists(path: str | None) -> dict:
     if not path:
@@ -456,7 +579,7 @@ def _load_yaml_if_exists(path: str | None) -> dict:
 
 def _resolve_contract_for_symbol(symbol: str, contracts_path: str, universe: dict | None) -> dict:
     contracts = _load_yaml_if_exists(contracts_path)
-    sym_u = symbol.upper()
+    sym_u = symbol.strip().upper()
 
     # Prefer explicit contract definition
     if sym_u in contracts:
@@ -467,6 +590,22 @@ def _resolve_contract_for_symbol(symbol: str, contracts_path: str, universe: dic
     tick_size = float(uni.get("tick_size", 0.01))
     point_value = float(uni.get("point_value", 1.0))
 
+    asset_class = str(uni.get("asset_class", "")).lower()
+    exchange = str(uni.get("exchange", "")).lower()
+
+    is_crypto = (asset_class == "crypto") or ("/" in sym_u) or (exchange in {"binanceus", "kraken", "coinbase"})
+    if is_crypto:
+        
+        return {
+            "symbol": sym_u,
+            "exchange": exchange.upper() if exchange else "CRYPTO",
+            "currency": "USD",
+            "tick_size": tick_size,
+            "tick_value": tick_size,
+            "commission_per_contract": 0.0,
+            "exchange_fees_per_contract": 0.0,
+            "_point_value": point_value,
+        }
     # For equities we want dollars-per-point to be 1 (per share).
     # Our engine uses dpp = tick_value / tick_size, so set tick_value = tick_size * 1 => dpp=1.
     return {
@@ -476,13 +615,13 @@ def _resolve_contract_for_symbol(symbol: str, contracts_path: str, universe: dic
         "tick_size": tick_size,
         "tick_value": float(tick_size) * 1.0,
         # Use a sane default if not given elsewhere
-        "commission_per_contract": 0.005,
+        "commission_per_contract": 0.0,
         "exchange_fees_per_contract": 0.0,
         # keep universe point_value around as an extra field if you want later
         "_point_value": point_value,
     }
 def _mark_entry_for_throttles(strat, bar):
-# only count throttles when we actually submit an entry
+    # only count throttles when we actually submit an entry
     if hasattr(strat, "_trades_today"):
         strat._trades_today += 1
     if hasattr(strat, "_last_trade_ts"):
@@ -493,28 +632,34 @@ def _mark_entry_for_throttles(strat, bar):
 def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | None) -> dict:
     # ---- Load layered config: profile -> env -> config(extra) ----
     cfg = {}
-    cfg = _deep_merge(cfg, _load_yaml_if_exists(args.profile))
-    cfg = _deep_merge(cfg, _load_yaml_if_exists(args.env))
-    cfg = _deep_merge(cfg, _load_yaml_if_exists(args.config))
+    cfg = deep_merge(cfg, _load_yaml_if_exists(args.profile))
+    cfg = deep_merge(cfg, _load_yaml_if_exists(args.env))
+    cfg = deep_merge(cfg, _load_yaml_if_exists(args.config))
 
     # Stash profile name for equity heuristic
     cfg["profile_name"] = os.path.basename(args.profile or "")
 
     # Merge universe strategy over profile strategy (universe is closer to “intent”)
     if universe_cfg:
+
         uc = dict(universe_cfg)
         uc.pop("symbols", None)  # don't let symbols pollute cfg
-        cfg = _deep_merge(cfg, uc)
+
+        cfg = deep_merge(cfg, uc)
+
         if "strategy" in universe_cfg:
-            cfg["strategy"] = _deep_merge(cfg.get("strategy", {}), universe_cfg.get("strategy", {}))
-        # Universe session windows if present, else keep profile’s
-        uni_windows = (universe_cfg.get("strategy") or {}).get("session_windows")
-        if uni_windows:
             cfg.setdefault("strategy", {})
-            cfg["strategy"]["session_windows"] = uni_windows
-        # Merge universe execution over profile execution (if present)
-    if universe_cfg and "execution" in universe_cfg:
-        cfg["execution"] = _deep_merge(cfg.get("execution", {}), universe_cfg.get("execution", {}))
+            cfg["strategy"] = merge_strategy_cfg(cfg.get("strategy", {}), universe_cfg.get("strategy", {}))
+        
+        # Execution merge (global)
+        if "execution" in universe_cfg:
+            cfg.setdefault("execution", {})
+            cfg["execution"] = deep_merge(cfg.get("execution", {}), universe_cfg.get("execution", {}))
+
+        # Risk merge (global) — important for crypto_all.yaml
+        if "risk" in universe_cfg:
+            cfg.setdefault("risk", {})
+            cfg["risk"] = deep_merge(cfg.get("risk", {}), universe_cfg.get("risk", {}))
 
     # --- Capture universe/base strategy as fallback BEFORE per-symbol overrides ---
     import copy
@@ -522,17 +667,105 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     # base_strategy_cfg = dict((cfg.get("strategy") or {}))
     base_strategy_name = (base_strategy_cfg.get("name") or "").strip()
 
+    print(f"[UNI.CFG] is_none={universe_cfg is None} type={type(universe_cfg)} keys={list((universe_cfg or {}).keys())}")
+    rows = (universe_cfg or {}).get("symbols")
+    print(f"[UNI.SYMS] type={type(rows)} len={len(rows) if isinstance(rows, list) else 'NA'} sample0={rows[0] if isinstance(rows, list) and rows else None}")
+    print(f"[UNI.SYM.NORM] target={_norm_sym(symbol)} sample0_norm={_norm_sym(rows[0].get('symbol')) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None}")
 
     # ✅ Per-symbol overrides (NEW)
-    sym_ovr = universe_cfg or {}
+    sym_row = _find_symbol_row(universe_cfg, symbol)
+    if sym_row:
+        # Merge any top-level symbol-specific fields (tick_size, trade_min_qty, rotate, etc.)
+        sym_top = dict(sym_row)
+        sym_top.pop("symbol", None)
+        sym_top.pop("strategy", None)
+        sym_top.pop("execution", None)
+        sym_top.pop("risk", None)
+        cfg = deep_merge(cfg, sym_top)
+
+        # strategy override
+        if "strategy" in sym_row:
+            cfg.setdefault("strategy", {})
+            cfg["strategy"] = merge_strategy_cfg(cfg.get("strategy", {}), sym_row.get("strategy", {}))
+
+        # execution override
+        if "execution" in sym_row:
+            cfg.setdefault("execution", {})
+            cfg["execution"] = deep_merge(cfg.get("execution", {}), sym_row.get("execution", {}))
+
+        # risk override
+        if "risk" in sym_row:
+            cfg.setdefault("risk", {})
+            cfg["risk"] = deep_merge(cfg.get("risk", {}), sym_row.get("risk", {}))
+
+        print(f"[SYM.OVR] {symbol} applied keys={list(sym_row.keys())}")
+    else:
+        print(f"[SYM.OVR] {symbol} none")
 
     # ---- Contract / fees ----
     ct = _resolve_contract_for_symbol(symbol, args.contracts, universe_cfg)
     cfg.setdefault("fees", {})
-    for k in ("tick_size", "tick_value", "commission_per_contract", "exchange_fees_per_contract"):
+    fees = cfg["fees"]
+
+    asset_class = str((universe_cfg or {}).get("asset_class", "")).lower()
+
+    if "tick_size" in cfg:
+        cfg["fees"]["tick_size"] = float(cfg["tick_size"])
+
+    for k in ("commission_per_contract", "exchange_fees_per_contract"):
         if k in ct:
-            cfg["fees"][k] = ct[k]
+            fees[k] = ct[k]
+    # 2) Tick sizing rules:
+    if asset_class == "crypto":
+        # Prefer YAML tick_size if present (because you override per symbol there)
+        if "tick_size" not in fees and "tick_size" in ct:
+            fees["tick_size"] = ct["tick_size"]
+
+        # Enforce dpp=1: tick_value MUST equal tick_size
+        if "tick_size" in fees:
+            fees["tick_value"] = float(fees["tick_size"])
+
+    else:
+        # Futures/equities: ct defines tick_size + tick_value (if present)
+        for k in ("tick_size", "tick_value"):
+            if k in ct:
+                fees[k] = ct[k]
+
     cfg["symbol"] = ct.get("symbol", symbol)
+
+    # --- Invariant guard: dollars-per-point (dpp) must be sane ---
+    tick_size  = float(cfg["fees"]["tick_size"])
+    tick_value = float(cfg["fees"]["tick_value"])
+    fees["dpp"] = float(fees["tick_value"]) / float(fees["tick_size"])
+    dpp = float(fees["dpp"])
+    print(f"[DPP] {symbol} dollars_per_point={dpp} (tick_value={tick_value}, tick_size={tick_size})")
+
+    asset_class = str((universe_cfg or {}).get("asset_class", "")).lower()
+    if asset_class == "crypto" and abs(dpp - 1.0) > 1e-6:
+        raise ValueError(
+            f"[DPP] crypto must be dpp=1. got {dpp}. "
+            f"tick_value={tick_value} tick_size={tick_size} symbol={symbol}"
+        )
+
+    def _fingerprint(obj) -> str:
+        s = json.dumps(obj, sort_keys=True, default=str)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+    # Pick only the stuff that should define behavior
+    finger_obj = {
+        "symbol": symbol,
+        "start_date": args.start_date,
+        "end_date": args.end_date,
+        "strategy": cfg.get("strategy"),
+        "execution": cfg.get("execution"),
+        "risk": cfg.get("risk"),
+        "fees": cfg.get("fees"),
+        "timezone": cfg.get("timezone"),
+    }
+    print(f"[RUN.FP] {symbol} fp={_fingerprint(finger_obj)}")
+
+    print(f"[CT] {symbol} ct={ct}")
+    print(f"[FEES] {symbol} fees={cfg['fees']}")
 
     if not csv_path or not os.path.exists(csv_path):
         return {
@@ -540,7 +773,11 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             "CSV": csv_path,
             "Status": "MISSING_CSV",
         }
-
+    if args.strict:
+        if not args.start_date or not args.end_date:
+            raise SystemExit("[STRICT] Must pass --start-date and --end-date")
+        if not (cfg.get("strategy") or {}).get("name"):
+            raise SystemExit("[STRICT] strategy.name missing in merged config")
     # ---- Prep bars ----
     tz = cfg.get("timezone", "America/Chicago")
     df = pd.read_csv(csv_path)
@@ -586,6 +823,31 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
     print("[CHK] cols:", [c for c in ["ema_slope_atr","ema_dist_atr","ema_slope","atr"] if c in df.columns])
     print("[CHK] ema_slope_atr head:", df["ema_slope_atr"].head(3).tolist())
+    # ---- DIAG: TrendPullback sanity (ATR + slope scaling) ----
+    # Make sure these exist; if not, you'll see it immediately.
+    for c in ["close", "atr", "ema_slope_atr"]:
+        if c not in df.columns:
+            print(f"[DIAG][MISSING] {symbol} missing column: {c}")
+
+    # Coerce to numeric and clean
+    close_s = pd.to_numeric(df.get("close"), errors="coerce")
+    atr_s   = pd.to_numeric(df.get("atr"), errors="coerce")
+    slope_atr_s = pd.to_numeric(df.get("ema_slope_atr"), errors="coerce")
+
+    # ATR percent of price
+    atr_pct = (atr_s / close_s).replace([np.inf, -np.inf], np.nan)
+
+    def _q(series, name):
+        s = series.dropna()
+        if len(s) == 0:
+            print(f"[DIAG] {symbol} {name}: EMPTY after dropna")
+            return
+        q = s.quantile([0.5, 0.9, 0.99]).to_dict()
+        print(f"[DIAG] {symbol} {name} p50/p90/p99: {q} (n={len(s)})")
+
+    _q(atr_s, "atr")
+    _q(atr_pct, "atr_pct")
+    _q(slope_atr_s, "ema_slope_atr")
 
 
     if symbol == "XRP/USDT":
@@ -629,9 +891,22 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     if not df.index.is_monotonic_increasing:
         raise ValueError(f"[DATA] {symbol} bars not monotonic after sort")
 
+    # ---- Logs dir (create EARLY so manifest/artifacts are consistent) ----
+    safe_sym = symbol.replace("/", "_")
+    logs_dir = Path("logs") / f"bt_{safe_sym}"
+
+    if getattr(args, "outdir", None):
+        logs_dir = Path(args.outdir)
+
+    if getattr(args, "run_tag", None):
+        logs_dir = logs_dir / str(args.run_tag)
+    else:
+        logs_dir = logs_dir / f"run_{args.run_id}"
+
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
 
     # ---- Risk / fees ----
-    fees = cfg["fees"]
     yaml_risk = cfg.get("risk", {})
 
     # Fall back if env/profile didn’t provide risk
@@ -678,14 +953,46 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     print(f"[SANITY] {symbol} dates: {df['date'].min()} -> {df['date'].max()}")
 
     # ---- Order manager / execution ----
-    dpp = float(fees["tick_value"]) / float(fees["tick_size"])  # dollars per full point
+    dpp = float(fees["dpp"])  # dollars per full point
+    exe = cfg.get("execution", {}) or {}
+    
+
+    commission = float(fees.get("commission_per_contract", 0.0))
+    exch_fees   = float(fees.get("exchange_fees_per_contract", 0.0))
+    fee_bps     = float(fees.get("fee_bps", 0.0))
+    fee_fixed   = float(fees.get("fee_fixed", 0.0))
+    slip_bps    = float(fees.get("slip_bps", 0.0))
+
+    if args.fee_bps is not None:
+        fee_bps = float(args.fee_bps)
+    if args.fee_fixed is not None:
+        fee_fixed = float(args.fee_fixed)
+    if args.slip_bps is not None:
+        slip_bps = float(args.slip_bps)
+
+    if getattr(args, "no_friction", False):
+        commission = 0.0
+        exch_fees  = 0.0
+        fee_bps    = 0.0
+        fee_fixed  = 0.0
+        slip_bps   = 0.0
+
+    print(
+    f"[FRICTION] {symbol} commission={commission} exch_fees={exch_fees} "
+    f"fee_bps={fee_bps} fee_fixed={fee_fixed} slip_bps={slip_bps} "
+    f"no_friction={getattr(args,'no_friction', False)}\n"
+    f"[FEES.EFF] {symbol} tick_size={fees.get('tick_size')} tick_value={fees.get('tick_value')} "
+    f"commission={commission} exch={exch_fees} fee_bps={fee_bps} fee_fixed={fee_fixed} slip_bps={slip_bps}"
+    )
+
+
     om = OrderManager(
-        commission_per_contract=float(fees.get("commission_per_contract", 0.0)),
-        exchange_fees_per_contract=float(fees.get("exchange_fees_per_contract", 0.0)),
+        commission_per_contract=commission,
+        exchange_fees_per_contract=exch_fees,
         tick_size=float(fees["tick_size"]),
-        fee_bps=float(args.fee_bps),
-        fee_fixed=float(args.fee_fixed),
-        slip_bps=float(args.slip_bps),
+        fee_bps=fee_bps,
+        fee_fixed=fee_fixed,
+        slip_bps=slip_bps,
         dollars_per_point=float(dpp),
     )
     delay = BarDelay(bars=int(args.latency_bars or 0))
@@ -707,8 +1014,38 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
     print(f"[STRATEGY] {symbol} -> {strategy_name}")
 
+    assert_locked_strategy_complete(cfg, symbol=symbol, strategy_name=strategy_name, strategy_cfg=cfg.get("strategy"))
+
     strat = build_strategy(strategy_name, cfg["strategy"], fees)
     print(f"[STRAT.CFG] {symbol} {type(strat).__name__} cfg={getattr(strat, 'cfg', None)}")
+
+    # ---- Run manifest (after strategy exists; before sim loop) ----
+    strat_cfg_obj = getattr(strat, "cfg", None)
+
+    bars_info = {
+        "rows": int(len(df)),
+        "first_ts": str(df.index[0]) if len(df) else None,
+        "last_ts": str(df.index[-1]) if len(df) else None,
+        "date_min": str(df["date"].min()) if "date" in df.columns and len(df) else None,
+        "date_max": str(df["date"].max()) if "date" in df.columns and len(df) else None,
+    }
+
+    manifest_path = write_run_manifest(
+        logs_dir,
+        cli_argv=sys.argv,
+        parsed_args=vars(args),
+        symbol=symbol,
+        csv_path=csv_path,
+        start_date=getattr(args, "start_date", None),
+        end_date=getattr(args, "end_date", None),
+        resolved_config=cfg,  # merged dict
+        strategy_name=strategy_name,
+        strategy_kwargs=strat_cfg_obj.__dict__ if strat_cfg_obj is not None else {},
+        bars_info=bars_info,
+        repo_root=".",
+    )
+    print(f"[MANIFEST] {manifest_path}")
+
     # ---- Fallback strategy (universe/base) ----
     fallback = None
     fallback_name = None
@@ -732,6 +1069,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
 
     # Only enable fallback if it's different from primary
     if fallback_name and fallback_name != primary_name:
+        assert_locked_strategy_complete(cfg, symbol=symbol, strategy_name=fallback_name, strategy_cfg=base_strategy_cfg)
         # Build fallback using base_strategy_cfg (NOT the overridden cfg["strategy"])
         fallback = build_strategy(fallback_name, base_strategy_cfg, fees)
         print(f"[FALLBACK] {symbol} primary={primary_name} fallback={fallback_name}")
@@ -830,14 +1168,18 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             "action": "EXIT",
             "side": side,
             "qty": float(qty),
-            "price": entry_px,
+            "price": px,
+            "entry_price": entry_px,
             "reason": reason,
             "exit_price": px,
-            "pnl": pnl,
+            "pnl": float(pnl),
             "fees_total": 0.0,
         })
 
         om.realized_pnl = float(getattr(om, "realized_pnl", 0.0)) + float(pnl)
+        if crypto_like and abs((float(cfg["fees"]["tick_value"]) / float(cfg["fees"]["tick_size"])) - 1.0) > 1e-6:
+            print(f"[WARN] crypto_like but dpp != 1: tick_value={cfg['fees']['tick_value']} tick_size={cfg['fees']['tick_size']}")
+        print(f"[PNL.DBG] {symbol} side={side} qty={qty} entry={entry_px} exit={px} pnl={pnl} crypto_like={crypto_like} dpp={locals().get('dpp', None)}")
 
 
         # Record R if we can
@@ -905,21 +1247,38 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             om.place_and_simulate(bar, order)
 
             current_bracket = bracket if bracket is not None else current_bracket
-            open_position = True
+            open_position = (float(getattr(om.pos, "qty", 0.0) or 0.0) != 0.0)
             if hasattr(due, "get") and "strat_used" in due:
                 s_used = due["strat_used"]
                 if hasattr(s_used, "record_entry"):
                     s_used.record_entry(bar.name)
-            open_side = str(order.side).upper()
-            open_qty = float(order.qty)
-            open_entry_px = entry
+            open_side = str(getattr(om.pos, "side", order.side)).upper()
+            open_qty = float(getattr(om.pos, "qty", order.qty))
+            open_entry_px = float(getattr(om.pos, "avg_price", entry))   # ✅ USE FILL
             open_entry_ts = bar["t_local"]
             open_be_locked = False
 
+            if current_bracket is not None:
+                sig_entry = float(entry)
+                sig_stop  = float(current_bracket.stop_price)
+                sig_tgt   = float(current_bracket.target_price)
+
+                stop_px, tgt_px = _reanchor_bracket_to_fill(open_side, sig_entry, sig_stop, sig_tgt, open_entry_px)
+                stop_px = _round_to_tick(stop_px, float(fees["tick_size"]))
+                tgt_px  = _round_to_tick(tgt_px,  float(fees["tick_size"]))
+
+                current_bracket.entry_price  = float(open_entry_px)
+                current_bracket.stop_price   = float(stop_px)
+                current_bracket.target_price = float(tgt_px)
+
             if risk_pts_due is not None:
                 open_risk_pts = float(risk_pts_due)
+            elif current_bracket is not None:
+                open_risk_pts = max(float(fees["tick_size"]), abs(float(open_entry_px) - float(current_bracket.stop_price)))
             else:
-                open_risk_pts = max(float(fees["tick_size"]), abs(entry - float(current_bracket.stop_price)))
+                open_risk_pts = float(fees["tick_size"])
+                
+            
 
         # outside session => flatten-on-close simulation
         if not _in_windows(bar["t_local"], windows):
@@ -1015,6 +1374,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 open_risk_pts = None
                 continue
 
+
             # ---- EMA-based exit (forced exit; after bracket sim, before BE/time exits) ----
             if open_position and current_bracket and open_entry_ts is not None and exit_on_ema:
                 ema_col = f"ema_exit_{exit_ema_len}"
@@ -1055,32 +1415,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
                 continue
 
-        # time-based exit
-        # if open_position and current_bracket and open_entry_ts is not None:
-        #     if _minutes_between(open_entry_ts, bar["t_local"]) >= MAX_HOLD_MIN:
-        #         before = len(om.trades)
-        #         exit_info = om.simulate_bracket(bar, current_bracket)
-        #         exited = bool(exit_info) or (len(om.trades) > before and om.trades[-1].get("action") == "EXIT")
-
-        #         if not exited:
-        #             _force_exit_current_position(bar, reason="TIME", i=i, exit_px=float(bar["close"]))
-        #         else:
-        #             # Bracket exited; we still need to reset open state here because we are not
-        #             # in the "manage OPEN position" block when this triggers.
-        #             open_position = False
-        #             current_bracket = None
-        #             open_side = None
-        #             open_qty = 0.0
-        #             open_entry_px = None
-        #             open_entry_ts = None
-        #             open_be_locked = False
-        #             open_risk_pts = None
-
-        #         equity = float(args.starting_equity) + float(getattr(om, "realized_pnl", 0.0))
-
-        #         continue
-
-
         # new signal
         if not open_position and not risk.halted:
             if COOLDOWN_BARS > 0 and (i - last_flat_i) < COOLDOWN_BARS:
@@ -1088,6 +1422,19 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 continue
 
             sig = strat.maybe_signal(bar, windows, risk)
+            # DEBUG: see bracket as returned by strategy BEFORE OM / sizing touches anything
+            if sig:
+                br = sig["bracket"]
+                entry_px = float(bar["close"])
+                stop_px  = float(br.stop_price)
+                print(
+                    f"[SIG.BRKT] side={sig['order'].side} "
+                    f"entry(bar_close)={entry_px:.2f} "
+                    f"stop={stop_px:.2f} target={float(br.target_price):.2f} "
+                    f"d_stop={abs(entry_px-stop_px):.2f} "
+                    f"d_tgt={abs(float(br.target_price)-entry_px):.2f}"
+                )
+                pass
             strat_used = None
             if sig:
                 why["signal"] += 1
@@ -1108,6 +1455,13 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                     continue
             if not sig:
                 why["no_signal"] += 1
+                continue
+            
+            # Reject garbage brackets where target ~= entry (often rounds to same tick)
+            entry_px = float(getattr(sig["order"], "entry", bar["close"]))
+            tgt_px   = float(getattr(sig["bracket"], "target_price", entry_px))
+            if abs(tgt_px - entry_px) < float(fees["tick_size"]) * 1.0:
+                why["rej_target_too_close"] += 1
                 continue
 
             if _minutes_to_window_end(bar["t_local"], windows) < MIN_WIN_END:
@@ -1189,15 +1543,45 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
                 })
             else:
                 om.place_and_simulate(bar, sig["order"])
+                if open_position and current_bracket is not None:
+                    stop_px = float(getattr(current_bracket, "stop_price", float("nan"))) if current_bracket is not None else float("nan")
+                    tgt_px  = float(getattr(current_bracket, "target_price", float("nan"))) if current_bracket is not None else float("nan")
+                    close_px = float(bar["close"])
+                    high_px = float(bar.get("high", close_px))
+                    low_px  = float(bar.get("low", close_px))
+
+                    print(
+                        f"[BRKT.DBG] {symbol} side={open_side} "
+                        f"entry={float(open_entry_px):.2f} "
+                        f"br.stop={stop_px:.2f} br.target={tgt_px:.2f} "
+                        f"barL/H/C={low_px:.2f}/{high_px:.2f}/{close_px:.2f}"
+                    )
+
                 current_bracket = sig["bracket"]
                 open_position = (om.pos.qty != 0)
                 open_side = str(om.pos.side).upper()
                 open_qty = float(om.pos.qty)
                 open_entry_px = float(om.pos.avg_price)
                 open_entry_ts = bar["t_local"]
+                open_be_locked = False
+
+                sig_entry = float(getattr(sig["order"], "entry", bar["close"]))
+                sig_stop  = float(current_bracket.stop_price)
+                sig_tgt   = float(current_bracket.target_price)
+
+                stop_px, tgt_px = _reanchor_bracket_to_fill(open_side, sig_entry, sig_stop, sig_tgt, open_entry_px)
+                stop_px = _round_to_tick(stop_px, float(fees["tick_size"]))
+                tgt_px  = _round_to_tick(tgt_px,  float(fees["tick_size"]))
+
+                current_bracket.entry_price  = float(open_entry_px)
+                current_bracket.stop_price   = float(stop_px)
+                current_bracket.target_price = float(tgt_px)
+
+                # ✅ risk should be based on ACTUAL fill vs re-anchored stop
+                open_risk_pts = max(float(fees["tick_size"]), abs(float(open_entry_px) - float(stop_px)))
                 if hasattr(strat_used, "record_entry"):
                     strat_used.record_entry(bar.name)
-                open_risk_pts = risk_pts
+                #open_risk_pts = risk_pts
                 if open_position and getattr(om.pos, "qty", 0) == 0:
                     raise RuntimeError("Entered trade but om.pos.qty is 0 — bracket exits will never trigger.")
 
@@ -1305,23 +1689,25 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    safe_sym = symbol.replace("/", "_")
-    logs_dir = Path("logs") / f"bt_{safe_sym}"
+    # safe_sym = symbol.replace("/", "_")
+    # logs_dir = Path("logs") / f"bt_{safe_sym}"
 
-    if getattr(args, "outdir", None):
-        logs_dir = Path(args.outdir)
+    # if getattr(args, "outdir", None):
+    #     logs_dir = Path(args.outdir)
 
-    if getattr(args, "run_tag", None):
-        logs_dir = logs_dir / str(args.run_tag)
+    # if getattr(args, "run_tag", None):
+    #     logs_dir = logs_dir / str(args.run_tag)
 
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    # logs_dir.mkdir(parents=True, exist_ok=True)
 
     if pnl_series is not None and not pnl_series.empty:
         ax = pnl_series.plot(title=f"{symbol} Realized PnL per EXIT (USD)")
         fig = ax.get_figure()
         fig.savefig(logs_dir / "pnl_curve.png", dpi=120, bbox_inches="tight")
         if not args.no_gui:
-            plt.show()
+            plt.show(block=False)
+            plt.pause(3)
+            plt.close()
         plt.close(fig)
 
     if pnl_series is not None and not pnl_series.empty:
@@ -1389,6 +1775,10 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     # ---- WHY diagnostics (always print top reasons) ----
     top = sorted(why.items(), key=lambda kv: kv[1], reverse=True)[:12]
     print(f"[WHY] {symbol} top reasons:", top)
+    # ---- REJ diagnostics (strategy-level rejects) ----
+    if hasattr(strat, "_rej"):
+        top_rej = sorted(strat._rej.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        print(f"[REJ] {symbol} top rejects:", top_rej)
 
     # Optional: still call out zero/low trade runs explicitly
     trades_ct = int(summary.get("Trades", 0) or 0)
@@ -1405,23 +1795,23 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     except Exception as e:
         print(f"[SANITY] netpnl check skipped: {e}")
 
+
+    if "dist_atr" in df.columns:
+        s = df["dist_atr"].dropna()
+        print("[DIST_ATR] count:", len(s))
+        print("[DIST_ATR] p50 p75 p90 p95 p99:",
+            s.quantile([0.50, 0.75, 0.90, 0.95, 0.99]).to_dict())
+
+    if hasattr(strat, "_rej"):
+        summary["TopRejects"] = sorted(strat._rej.items(), key=lambda kv: kv[1], reverse=True)[:20]
+
     write_artifacts(
         equity_full, 
         trades_df, 
         summary, 
         logs_dir=str(logs_dir), 
         write_equity=not args.light_artifacts
-        )
-    
-    # if int(summary.get("Trades", 0) or 0) == 0:
-    #     print(f"[WHY] {symbol} top reasons: {why.most_common(8)}")
-
-
-    if symbol == "XRP/USDT" and hasattr(strat, "_why"):
-        print("[WHY][RSI_MR] XRP gate counts (top 15):", strat._why.most_common(15))
-    if symbol == "XRP/USDT" and fallback is not None and hasattr(fallback, "_why"):
-        print("[WHY][RSI_MR] XRP fallback gate counts (top 15):", fallback._why.most_common(15))
-
+    )
 
     print(f"[RESULT] {symbol} Trades={summary.get('Trades', 0)} WinRate={summary.get('WinRate', 0):.1f}% "
           f"PF={summary.get('ProfitFactor')} NetPnL=${summary.get('NetPnL', 0):.2f} logs={logs_dir}")
@@ -1455,9 +1845,10 @@ def main():
     ap.add_argument("--symbol", default=None, help="Symbol (if not --all)")
     ap.add_argument("--csv", dest="csv", default=None, help="CSV path for backtest (overrides --csv-dir pattern)")
     ap.add_argument("--no-gui", action="store_true")
-    ap.add_argument("--fee-bps", type=float, default=1.0)
-    ap.add_argument("--fee-fixed", type=float, default=0.0)
-    ap.add_argument("--slip-bps", type=float, default=0.5)
+    ap.add_argument("--no-friction", action="store_true", help="Force comissions/exchange fees/notional fees/slippage to zero")
+    ap.add_argument("--fee-bps", type=float, default=None)
+    ap.add_argument("--fee-fixed", type=float, default=None)
+    ap.add_argument("--slip-bps", type=float, default=None)
     ap.add_argument("--latency-bars", dest="latency_bars", type=int, default=0)
     ap.add_argument("--starting-equity", type=float, default=25000.0)
     ap.add_argument("--risk-pct", type=float, default=0.01)
@@ -1468,9 +1859,28 @@ def main():
     ap.add_argument("--outdir", default=None, help="Artifacts output directory")
     ap.add_argument("--run-tag", default=None, help="Subfolder name under outdir (or under default bt_<symbol>)")
     ap.add_argument("--light-artifacts", action="store_true", help="Skip large artifacts (equity_curve.csv)")
+    ap.add_argument("--run-id", default=None, help="Unique id for this run (auto if omitted)")
+    ap.add_argument("--strict", action="store_true", help="Fail if key inputs are missing or defaulted")
 
 
     args = ap.parse_args()
+    import uuid
+    if not args.run_id:
+        args.run_id = uuid.uuid4().hex[:10]
+    print(f"[RUN.ID] {args.run_id}")
+    # --- Required run context guardrails ---
+    if not args.universe:
+        raise SystemExit("ERROR: --universe is required (no silent default).")
+
+    if not args.symbol and not args.all:
+        raise SystemExit("ERROR: pass --symbol or --all.")
+
+    if not args.csv and not args.csv_dir:
+        raise SystemExit("ERROR: pass --csv or --csv-dir (no guessing).")
+
+    # Optional but recommended: force explicit date window for reproducibility
+    if not args.start_date or not args.end_date:
+        raise SystemExit("ERROR: pass --start-date and --end-date for reproducible runs.")
 
     portfolio_cfg = _load_yaml_if_exists(args.portfolio)
 

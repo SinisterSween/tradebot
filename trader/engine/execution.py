@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 import pandas as pd
+import numpy as np
 from .utils import Order, Bracket, side_mult
 from .slippage import market_slippage
 @dataclass
@@ -42,38 +43,57 @@ class OrderManager:
         return round(px / t) * t if t > 0 else px
     # --- entry path ---
     def place_and_simulate(self, bar: pd.Series, order: Order):
-        # fill at bar open with slippage (latency means next bar open generally)
-        if getattr(self.pos, "qty", 0) != 0:
-            return
+        EPS = 1e-12
+
+        # Already in a position?
         try:
-            qty = float(order.qty)
+            pos_qty = float(getattr(self.pos, "qty", 0.0) or 0.0)
+        except Exception:
+            pos_qty = 0.0
+        if abs(pos_qty) > EPS:
+            return
+
+        # qty
+        try:
+            qty = float(getattr(order, "qty", 0.0) or 0.0)
         except Exception:
             return
-        if qty <= 0:
+        if not np.isfinite(qty) or qty <= EPS:
             return
-        
-        side = str(order.side).upper()
 
-        # fill at bar open with slippage (next bar open sim)
-        ref_px = float(bar["open"])
-        entry_px = market_slippage(ref_px, side, self.tick_size, bps=self.slip_bps)
-        entry_px = self._round_to_tick(entry_px)
+        # side
+        side = str(getattr(order, "side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            return
 
-        # fees: notional (bps/fixed) + per-contract
-        entry_fee = self._notional_fee(entry_px, qty) + self._per_contract_fee(qty)
-        self._last_entry_fee = entry_fee
+        # ref price
+        try:
+            ref_px = float(bar.get("open", bar.get("close")))
+        except Exception:
+            return
+        if not np.isfinite(ref_px) or ref_px <= 0:
+            return
 
-        # update position (IMPORTANT: keep crypto/equity qty as float)
+        fill_px = market_slippage(ref_px, side, self.tick_size, bps=self.slip_bps)
+        fill_px = self._round_to_tick(float(fill_px))
+
+        if not np.isfinite(fill_px) or fill_px <= 0:
+            return
+
+        entry_fee = self._notional_fee(fill_px, qty) + self._per_contract_fee(qty)
+        self._last_entry_fee = float(entry_fee)
+
+        # update position
         self.pos.side = side
-        self.pos.qty = qty
-        self.pos.avg_price = entry_px
+        self.pos.qty = float(qty)
+        self.pos.avg_price = float(fill_px)
 
-        # notional for logging
+        # notional
         if getattr(self, "crypto_like", False) or getattr(self, "equity_like", False):
-            notional = abs(entry_px * qty)
+            notional = abs(float(fill_px) * float(qty))
         else:
-            notional = abs(entry_px * self.dpp * qty)
-        # record trade
+            notional = abs(float(fill_px) * float(self.dpp) * float(qty))
+
         ts = getattr(order, "ts", None)
         if ts is None:
             ts = bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or bar.get("timestamp") or bar.name
@@ -81,35 +101,49 @@ class OrderManager:
         self.trades.append({
             "ts": ts,
             "action": "ENTRY",
-            "side": self.pos.side,
+            "side": side,
             "qty": float(qty),
-            "entry_price": entry_px,
-            "price": entry_px,             # keep legacy field for equity_curve()
+            "entry_price": float(fill_px),
+            "price": float(fill_px),
             "fees": float(entry_fee),
-            "fees_total": float(entry_fee),  # handy for consistency (optional but recommended)
+            "fees_total": float(entry_fee),
             "notional": float(notional),
-        })  
+        })
+
+
 
     # --- exit path (stop/target) ---
     def simulate_bracket(self, bar: pd.Series, oco: Bracket):
-        if float(self.pos.qty) <= 0:
+        EPS = 1e-12
+
+        # position must be open
+        try:
+            pos_qty = float(getattr(self.pos, "qty", 0.0) or 0.0)
+        except Exception:
+            return None
+        if not np.isfinite(pos_qty) or abs(pos_qty) <= EPS:
             return None
 
-        hi = float(bar.get("high", bar["close"]))
-        lo = float(bar.get("low",  bar["close"]))
+        hi = float(bar.get("high", bar.get("close", 0.0)))
+        lo = float(bar.get("low",  bar.get("close", 0.0)))
         close_px = float(bar.get("close", (hi + lo) / 2.0))
+        if not (np.isfinite(hi) and np.isfinite(lo) and np.isfinite(close_px)):
+            return None
 
-        side_u = str(self.pos.side).upper()
-        qty = float(self.pos.qty)  # IMPORTANT: keep crypto qty as float
-        entry_px = float(self.pos.avg_price)
-        stop_px = float(oco.stop_price)
-        tgt_px  = float(oco.target_price)
+        side_u = str(getattr(self.pos, "side", "")).upper().strip()
+        if side_u not in {"BUY", "SELL"}:
+            return None
 
-        # Intrabar hit (classic)
+        qty = abs(pos_qty)
+        entry_px = float(getattr(self.pos, "avg_price", close_px))
+        stop_px = float(getattr(oco, "stop_price", float("nan")))
+        tgt_px  = float(getattr(oco, "target_price", float("nan")))
+        if not (np.isfinite(entry_px) and np.isfinite(stop_px) and np.isfinite(tgt_px)):
+            return None
+
         stop_hit_intra   = (lo <= stop_px <= hi)
         target_hit_intra = (lo <= tgt_px  <= hi)
 
-        # Close-based fallback (handles flat OHLC bars)
         if side_u == "BUY":
             stop_hit_close   = close_px <= stop_px
             target_hit_close = close_px >= tgt_px
@@ -120,49 +154,75 @@ class OrderManager:
         stop_hit   = stop_hit_intra   or stop_hit_close
         target_hit = target_hit_intra or target_hit_close
 
-        exit_price = None
-        exit_reason = None
-
         if stop_hit and target_hit:
             exit_price, exit_reason = stop_px, "STOP"
         elif stop_hit:
             exit_price, exit_reason = stop_px, "STOP"
         elif target_hit:
             exit_price, exit_reason = tgt_px, "TARGET"
-        if exit_price is None:
+        else:
             return None
 
-        # slippage on exit
-        exit_px = market_slippage(float(exit_price), side_u, self.tick_size, bps=self.slip_bps)
-        exit_px = self._round_to_tick(exit_px)
+        # exit side is opposite of position side
+        exit_side = "SELL" if side_u == "BUY" else "BUY"
 
-        # fees on exit side
+        exit_px = market_slippage(float(exit_price), exit_side, self.tick_size, bps=self.slip_bps)
+        exit_px = self._round_to_tick(float(exit_px))
+        if not np.isfinite(exit_px):
+            return None
+
         exit_fee = self._notional_fee(exit_px, qty) + self._per_contract_fee(qty)
         total_fees = float(getattr(self, "_last_entry_fee", 0.0)) + float(exit_fee)
 
-        # gross pnl (ticks * qty * direction)
+                # --- DEBUG: print first N exits with full pnl inputs ---
+        if getattr(self, "_pnl_dbg_n", 0) < 30:
+            self._pnl_dbg_n = getattr(self, "_pnl_dbg_n", 0) + 1
+            print(
+                f"[PNL.DBG] sym={getattr(self.pos,'symbol',None)} reason={exit_reason} "
+                f"pos_side={side_u} exit_side={exit_side} "
+                f"hi/lo/close={hi:.2f}/{lo:.2f}/{close_px:.2f} "
+                f"entry={entry_px:.2f} stop={stop_px:.2f} tgt={tgt_px:.2f} exit_raw={exit_price:.2f} exit_px={exit_px:.2f} "
+                f"qty={qty:.6f} dpp={float(getattr(self,'dpp',1.0)):.6f} "
+                f"entry_fee={float(getattr(self,'_last_entry_fee',0.0)):.6f} exit_fee={float(exit_fee):.6f} total_fees={float(total_fees):.6f}"
+            )
+
+
         if getattr(self, "crypto_like", False) or getattr(self, "equity_like", False):
             gross_pnl = (exit_px - float(entry_px)) * qty * side_mult(side_u)
         else:
             gross_pnl = (exit_px - float(entry_px)) * float(self.dpp) * qty * side_mult(side_u)
+        if getattr(self, "_pnl_dbg_n2", 0) < 30:
+            self._pnl_dbg_n2 = getattr(self, "_pnl_dbg_n2", 0) + 1
+            print(
+                f"[PNL.DBG] gross_pnl={float(gross_pnl):.6f} net_pnl={float(gross_pnl - total_fees):.6f} "
+                f"side_mult={side_mult(side_u)} (pos_side={side_u})"
+            )
         net_pnl = gross_pnl - total_fees
         self.realized_pnl += net_pnl
 
-        # record exit trade (keep your legacy fields too)
         trade = {
             "ts": bar.name,
             "action": "EXIT",
             "reason": exit_reason,
             "side": side_u,
+            "exit_side": exit_side,
             "qty": float(qty),
             "price": float(entry_px),
             "entry_price": float(entry_px),
             "exit_price": float(exit_px),
-            "pnl": float(net_pnl),                                      
-            "fees_total": float(total_fees),           # entry + exit
+            "pnl": float(net_pnl),
+            "fees_total": float(total_fees),
             "notional": abs(exit_px * qty) if (getattr(self, "crypto_like", False) or getattr(self, "equity_like", False))
                         else abs(exit_px * self.dpp * qty),
         }
         self.trades.append(trade)
 
+        # flatten + clear fee carry
+        self.pos.qty = 0.0
+        self.pos.side = None
+        self.pos.avg_price = 0.0
+        self._last_entry_fee = 0.0
+
         return trade
+
+

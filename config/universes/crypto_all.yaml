@@ -36,27 +36,31 @@ strategy:
 
 symbols:
   - symbol: ETH/USDT
+    locked: true
+    version: vwap_rev_eth_v1
     strategy:
-      name: TrendPullback
+      name: vwap_reversion
       atr_len: 14
-      atr_mult: 1.2
-      target_R: 0.6
-      slope_min: 0.08
-      pullback_atr: 0.15
-      vwap_entry_min_atr: 0.5
-      vwap_entry_max_atr: 5.0
-      min_vwap_target_R: 0.2
-      stop_pad_ticks: 3
-      min_atr_pct: 0.0002
+      atr_mult: 1.0
+      target_R: 0.8
+      target_vwap: true
+      vwap_entry_min_atr: 1.0
+      vwap_entry_max_atr: 0.0
+      slope_max: 0.03
+      ema_slope_max: 0.03
+      ema_max_dist_atr: 3.0
+      stop_pad_ticks: 1
+      min_atr_pct: 0.00025
       max_bar_range_atr: 4.0
     execution:
       cooldown_bars: 5
-      max_hold_min: 45
+      max_hold_min: 30
 
   - symbol: SOL/USDT
-  # Locked do not change unless market changes
+    locked: true
+    version: vwap_rev_sol_v1
     strategy:
-      name: VwapReversion
+      name: vwap_reversion
       atr_len: 14
       atr_mult: 1.3
       target_R: 1.0
@@ -81,8 +85,8 @@ symbols:
       min_notional_usd: 10
 
   - symbol: XRP/USDT
-    # XRP RSI MR — baseline locked (validated IS + OOS)
-    # Do not modify without version bump
+    locked: true
+    version: rsi_mr_xrp_v1
     tick_size: 0.0001
     point_value: 1
     trade_min_qty: 1.0
@@ -130,9 +134,8 @@ symbols:
       min_notional_usd: 1
 
   - symbol: LTC/USDT
-    #Locked and approved RSI MR config
-    # LTC RSI MR — validated with BE=14
-    # Same BE logic as XRP, generalization confirmed
+    locked: true
+    version: rsi_mr_ltc_v1
     tick_size: 0.01
     point_value: 1
     trade_min_qty: 0.01
@@ -153,11 +156,13 @@ symbols:
       exit_ema_side: touch
       min_atr_pct: 0.00005
     execution:
-      be_lock_min: 14        # 👈 reuse XRP baseline
+      be_lock_min: 14
       be_req_profit_ticks: 1
       max_hold_min: 45
 
   - symbol: XLM/USDT
+    locked: false
+    version: rsi_mr_xlm_v1
     tick_size: 0.0001
     point_value: 1
     trade_min_qty: 1.0
@@ -205,7 +210,8 @@ symbols:
       min_notional_usd: 1
 
   - symbol: BCH/USDT
-    #Locked and approved RSI MR config
+    locked: true
+    version: rsi_mr_bch_v1
     tick_size: 0.01
     point_value: 1
     trade_min_qty: 0.01
@@ -253,6 +259,8 @@ symbols:
       min_notional_usd: 1
 
   - symbol: DOGE/USDT
+    locked: false
+    version: rsi_mr_doge_v1
     tick_size: 0.0001
     point_value: 1
     trade_min_qty: 1.0
@@ -299,3 +307,94 @@ symbols:
     risk:
       min_notional_usd: 1
 
+  - symbol: BTC/USDT
+    locked: false
+    version: btc_unlocked_v1
+    rotate: true
+
+  - symbol: ADA/USDT
+    locked: false
+    version: rsi_mr_ada_v1
+    rotate: true
+    tick_size: 0.0001
+    point_value: 1
+    trade_min_qty: 1.0
+    strategy:
+      name: rsi_mean_reversion
+      allow_shorts: false
+      allow_longs: true
+      rsi_len: 14
+      rsi_buy_below: 28
+      rsi_sell_above: 72
+      atr_len: 14
+      atr_mult: 1.0
+      target_R: 0.25
+      stop_pad_ticks: 15
+      exit_on_ema: true
+      exit_ema_len: 20
+      exit_ema_side: touch
+      min_atr_pct: 0.00005
+    execution:
+      be_lock_min: 14
+      be_req_profit_ticks: 1
+      max_hold_min: 45
+    risk:
+      min_notional_usd: 1
+
+  - symbol: AVAX/USDT
+    locked: false
+    version: rsi_mr_avax_v1
+    rotate: true
+    tick_size: 0.01
+    point_value: 1
+    trade_min_qty: 0.01
+    strategy:
+      name: rsi_mean_reversion
+      allow_shorts: false
+      allow_longs: true
+      rsi_len: 14
+      rsi_buy_below: 28
+      rsi_sell_above: 72
+      atr_len: 14
+      atr_mult: 1.0
+      target_R: 0.25
+      stop_pad_ticks: 15
+      exit_on_ema: true
+      exit_ema_len: 20
+      exit_ema_side: touch
+      min_atr_pct: 0.00005
+    execution:
+      be_lock_min: 14
+      be_req_profit_ticks: 1
+      max_hold_min: 45
+    risk:
+      min_notional_usd: 1
+
+  - symbol: LINK/USDT
+    locked: false
+    version: rsi_mr_link_v1
+    rotate: true
+    tick_size: 0.01
+    point_value: 1
+    trade_min_qty: 0.01
+    strategy:
+      name: rsi_mean_reversion
+      allow_shorts: false
+      allow_longs: true
+      rsi_len: 14
+      rsi_buy_below: 28
+      rsi_sell_above: 72
+      atr_len: 14
+      atr_mult: 1.0
+      target_R: 0.25
+      stop_pad_ticks: 15
+      exit_on_ema: true
+      exit_ema_len: 20
+      exit_ema_side: touch
+      min_atr_pct: 0.00005
+    execution:
+      be_lock_min: 14
+      be_req_profit_ticks: 1
+      max_hold_min: 45
+    risk:
+      min_notional_usd: 1

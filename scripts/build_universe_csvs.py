@@ -11,7 +11,6 @@ import yaml
 
 from trader.brokers.ibkr_fractional import IbkrFractional
 
-
 def _load_yaml(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f) or {}
@@ -20,6 +19,32 @@ def _load_yaml(path: str) -> dict:
 def _ensure_parent(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
 
+async def _ibkr_preflight(host: str, port: int, use_delayed: bool) -> None:
+    """
+    Fail fast if TWS/Gateway is wedged.
+    """
+    import asyncio
+    from trader.brokers.ibkr_fractional import IbkrFractional
+
+    broker = IbkrFractional(host, port, client_id=9999, market_data_only=True)
+    try:
+        # connect (readonly) with timeout
+        await asyncio.wait_for(broker.connect(readonly=True), timeout=20)
+
+        broker.set_market_data_type(3 if use_delayed else 1)
+
+        # qualify SPY with timeout
+        await asyncio.wait_for(broker.resolve_contract("SPY"), timeout=20)
+
+    except asyncio.TimeoutError:
+        raise SystemExit("[IB][FATAL] TWS/Gateway API not responding (timeout). Restart TWS/Gateway and retry.")
+    except Exception as e:
+        raise SystemExit(f"[IB][FATAL] TWS/Gateway preflight failed: {type(e).__name__}: {e}")
+    finally:
+        try:
+            await broker.disconnect()
+        except Exception:
+            pass
 
 def _append_bar(csv_path: Path, bar: dict) -> None:
     """
@@ -56,10 +81,16 @@ async def run_symbol_feeder(
     prefill_n: int,
     bar_size_secs: int,
     what_to_show: str,
+    build_only: bool = False,
+    run_minutes: int = 0,
 ):
     csv_path = out_dir / f"{symbol.upper()}_live_1m.csv"
-
-    broker = IbkrFractional(host, port, client_id=client_id)
+    
+    if not csv_path.exists():
+        with csv_path.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["datetime", "open", "high", "low", "close", "volume"])
+    broker = IbkrFractional(host, port, client_id=client_id, market_data_only=True)
     await broker.connect()
 
     # market data mode
@@ -68,6 +99,7 @@ async def run_symbol_feeder(
 
     # qualify contract
     await broker.resolve_contract(symbol)
+
 
     last_seen = {"dt": None}
     last_print = {"ts": 0.0}
@@ -86,11 +118,7 @@ async def run_symbol_feeder(
         # periodic heartbeat per symbol (every ~30s)
         now = asyncio.get_running_loop().time()
         if now - last_print["ts"] >= 30:
-            print(f"[FEED] {symbol} last={dt} rows_written={rows_written['n']} csv={csv_path}")
             last_print["ts"] = now
-
-    print(f"[START] {symbol} -> {csv_path} (clientId={client_id})")
-
     try:
         await broker.stream_realtime_bars(
             on_bar=on_bar,
@@ -98,6 +126,8 @@ async def run_symbol_feeder(
             bar_size_secs=bar_size_secs,
             preload_days=preload_days,
             prefill_n=prefill_n,
+            build_only=build_only,
+            run_minutes=run_minutes,
         )
     finally:
         await broker.disconnect()
@@ -117,6 +147,7 @@ async def run_crypto_symbol_feeder(
     limit_per_call: int = 1000,
     log_pages_every: int = 0,
     verbose: bool = False,
+    run_minutes: int = 0,
     ):
     """
     Writes: <out_dir>/<SYMBOL>_live_1m.csv
@@ -148,7 +179,7 @@ async def run_crypto_symbol_feeder(
         }
     )
 
-    
+    run_minutes = int(run_minutes or 0)
     try:
         if use_sandbox and hasattr(ex, "set_sandbox_mode"):
             ex.set_sandbox_mode(True)
@@ -264,7 +295,6 @@ async def run_crypto_symbol_feeder(
                     datetime.fromtimestamp(last_seen_ms / 1000, tz=timezone.utc).isoformat()
                     if last_seen_ms else "?"
                 )
-                print(f"[FEED][CRYPTO] {symbol} last={last_dt} rows_written={rows_written} csv={csv_path}")
                 last_print = now
 
             await asyncio.sleep(poll_secs)
@@ -327,34 +357,27 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--log-pages-every", type=int, default=0)
-    ap.add_argument("--universes", nargs="+", required=True,
-                    help="Universe names or paths. Example: sp500_fractional or config/universes/sp500_fractional.yaml")
-    ap.add_argument("--symbol", default=None,
-                    help='Only build one symbol, e.g. "XLM/USDT" or "LTC/USDT" or "SPY"')
-    ap.add_argument("--symbols", default=None,
-                    help='Only build these symbols (comma-separated), e.g. "XLM/USDT,LTC/USDT"')
-    ap.add_argument("--list-symbols", action="store_true",
-                    help="Print resolved symbols from the universe(s) then exit")
-
+    ap.add_argument("--universes", nargs="+", required=True, help="Universe names or paths. Example: sp500_fractional or config/universes/sp500_fractional.yaml")
+    ap.add_argument("--symbol", default=None, help='Only build one symbol, e.g. "XLM/USDT" or "LTC/USDT" or "SPY"')
+    ap.add_argument("--symbols", default=None, help='Only build these symbols (comma-separated), e.g. "XLM/USDT,LTC/USDT"')
+    ap.add_argument("--list-symbols", action="store_true",help="Print resolved symbols from the universe(s) then exit")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7497)
-    ap.add_argument("--client-id-start", type=int, default=50,
-                    help="ClientId base. Each symbol increments from here.")
-    ap.add_argument("--build-only", action="store_true",
-                help="Build historical CSVs then exit (no live polling/streaming).")
+    ap.add_argument("--client-id-start", type=int, default=50, help="ClientId base. Each symbol increments from here.")
+    ap.add_argument("--build-only", action="store_true", help="Build historical CSVs then exit (no live polling/streaming).")
     ap.add_argument("--delayed", action="store_true", help="Use delayed market data (reqMarketDataType=3)")
     ap.add_argument("--out-dir", default="data")
     ap.add_argument("--preload-days", type=int, default=2)
     ap.add_argument("--prefill-n", type=int, default=2000)
     ap.add_argument("--bar-size-secs", type=int, default=60)
     ap.add_argument("--what-to-show", default="TRADES")
-    ap.add_argument("--max-concurrency", type=int, default=6,
-                    help="How many symbols to stream at once (IB/TWS load control).")
-    ap.add_argument("--reset-csv", action="store_true",
-                help="Delete existing per-symbol CSV before writing (fresh rebuild).")
+    ap.add_argument("--max-concurrency", type=int, default=6, help="How many symbols to stream at once (IB/TWS load control).")
+    ap.add_argument("--reset-csv", action="store_true", help="Delete existing per-symbol CSV before writing (fresh rebuild).")
+    ap.add_argument("--run-minutes", type=int, default=0, help="How long to stream each symbol before rotating (0 = run forever).")
+
 
     args = ap.parse_args()
-
+    run_minutes = int(args.run_minutes or 0)
     # resolve universe paths
     universe_paths = []
     for u in args.universes:
@@ -373,11 +396,13 @@ async def main():
                 "symbol": s,
                 "asset_class": meta["asset_class"],
                 "exchange": meta["exchange"],
-                "preload_days": meta.get("preload_days", args.preload_days),
+                "preload_days": (meta.get("preload_days", args.preload_days) if meta["asset_class"] == "crypto" else args.preload_days),
                 "timeframe": meta.get("timeframe", "1m"),
                 "limit_per_call": meta.get("limit_per_call", 1000),
             })
-
+    has_non_crypto = any(e.get("asset_class") != "crypto" for e in entries)
+    if has_non_crypto:
+        await _ibkr_preflight(args.host, args.port, bool(args.delayed))
     # de-dupe by (asset_class, exchange, symbol) while preserving order
     seen = set()
     deduped = []
@@ -417,102 +442,125 @@ async def main():
 
         print(f"[PLAN] filtered symbols: {before} -> {len(entries)}")
 
-
-
-    print(f"[PLAN] universes={len(universe_paths)} symbols={len(entries)} out_dir={args.out_dir}")
     out_dir = Path(args.out_dir)
 
+
     sem = asyncio.Semaphore(args.max_concurrency)
+
     import ast
     async def _run_one(idx: int, e: dict):
         async with sem:
-            def _extract_symbol(e: dict) -> str:
-                """
-                e can be:
-                - normal: {"symbol": "ETH/USDT", ...}
-                - sometimes broken: {"symbol": "{'SYMBOL': 'ETH_USDT', ...}", ...}
-                - sometimes alternate: {"SYMBOL": "ETH_USDT", ...}
-                """
-                sym = e.get("symbol") or e.get("SYMBOL")
+            sym = e["symbol"]
+            client_id = args.client_id_start + idx
 
-                # If sym is already a dict for some reason
-                if isinstance(sym, dict):
-                    sym = sym.get("symbol") or sym.get("SYMBOL")
+            try:
+                def _extract_symbol(e: dict) -> str:
+                    """
+                    e can be:
+                    - normal: {"symbol": "ETH/USDT", ...}
+                    - sometimes broken: {"symbol": "{'SYMBOL': 'ETH_USDT', ...}", ...}
+                    - sometimes alternate: {"SYMBOL": "ETH_USDT", ...}
+                    """
+                    sym = e.get("symbol") or e.get("SYMBOL")
 
-                # If sym is a stringified dict like "{'SYMBOL': 'ETH_USDT', ...}"
-                if isinstance(sym, str):
-                    s = sym.strip()
-                    if s.startswith("{") and ("SYMBOL" in s or "symbol" in s):
-                        try:
-                            d = ast.literal_eval(s)
-                            if isinstance(d, dict):
-                                sym = d.get("symbol") or d.get("SYMBOL")
-                        except Exception:
-                            pass
+                    # If sym is already a dict for some reason
+                    if isinstance(sym, dict):
+                        sym = sym.get("symbol") or sym.get("SYMBOL")
 
-                if not isinstance(sym, str) or not sym.strip():
-                    raise ValueError(f"[CSV] could not extract symbol from entry: {e}")
+                    # If sym is a stringified dict like "{'SYMBOL': 'ETH_USDT', ...}"
+                    if isinstance(sym, str):
+                        s = sym.strip()
+                        if s.startswith("{") and ("SYMBOL" in s or "symbol" in s):
+                            try:
+                                d = ast.literal_eval(s)
+                                if isinstance(d, dict):
+                                    sym = d.get("symbol") or d.get("SYMBOL")
+                            except Exception:
+                                pass
 
-                return sym.strip()
+                    if not isinstance(sym, str) or not sym.strip():
+                        raise ValueError(f"[CSV] could not extract symbol from entry: {e}")
 
-            sym = _extract_symbol(e)
-
-            if e.get("asset_class") == "crypto":
-                # allow either "ETH/USDT" or "ETH_USDT" etc
-                sym_fs = sym.replace("/", "_").replace("-", "_").replace(":", "_").upper()
-                print(f"[DBG] entry_symbol_type={type(e.get('symbol'))} entry_symbol={repr(e.get('symbol'))[:120]}")
-                csv_path = out_dir / f"{sym_fs}_live_1m.csv"
-
-                if args.reset_csv:
-                    # avoid stat() on some weird long path edge cases
-                    try:
-                        if csv_path.exists():
-                            csv_path.unlink()
-                            print(f"[RESET] deleted {csv_path}")
-                    except OSError as ex:
-                        raise OSError(f"[RESET] bad csv_path={csv_path} sym={sym} entry_symbol={e.get('symbol')}") from ex
-
-                preload_days = int(e.get("preload_days", args.preload_days))
-                timeframe = str(e.get("timeframe", "1m"))
-                limit_per_call = int(e.get("limit_per_call", 1000))
-
-                await run_crypto_symbol_feeder(
-                    symbol=sym,
-                    out_dir=out_dir,
-                    exchange=(e.get("exchange") or "binanceus"),
-                    timeframe=timeframe,
-                    preload_days=preload_days,
-                    limit_per_call=limit_per_call,
-                    poll_secs=2.0,
-                    build_only=bool(args.build_only),
-                    log_pages_every=args.log_pages_every,
-                    verbose=args.verbose,
-                )
-                return  # important: don’t fall through to non-crypto
+                    return sym.strip()
             
-            # non-crypto
-            await run_symbol_feeder(
-                symbol=sym,
-                out_dir=out_dir,
-                host=args.host,
-                port=args.port,
-                client_id=args.client_id_start + idx,
-                use_delayed=bool(args.delayed),
-                preload_days=args.preload_days,
-                prefill_n=args.prefill_n,
-                bar_size_secs=args.bar_size_secs,
-                what_to_show=args.what_to_show,
-            )
+
+                sym = _extract_symbol(e)
+
+                
+                if e.get("asset_class") == "crypto":
+                    # allow either "ETH/USDT" or "ETH_USDT" etc
+                    sym_fs = sym.replace("/", "_").replace("-", "_").replace(":", "_").upper()
+                    print(f"[DBG] entry_symbol_type={type(e.get('symbol'))} entry_symbol={repr(e.get('symbol'))[:120]}")
+                    csv_path = out_dir / f"{sym_fs}_live_1m.csv"
+
+                    if args.reset_csv:
+                        # avoid stat() on some weird long path edge cases
+                        try:
+                            if csv_path.exists():
+                                csv_path.unlink()
+                                print(f"[RESET] deleted {csv_path}")
+                        except OSError as ex:
+                            raise OSError(f"[RESET] bad csv_path={csv_path} sym={sym} entry_symbol={e.get('symbol')}") from ex
+
+                    preload_days = int(e.get("preload_days", args.preload_days))
+                    timeframe = str(e.get("timeframe", "1m"))
+                    limit_per_call = int(e.get("limit_per_call", 1000))
+                    
+
+                    await run_crypto_symbol_feeder(
+                        symbol=sym,
+                        out_dir=out_dir,
+                        exchange=(e.get("exchange") or "binanceus"),
+                        timeframe=timeframe,
+                        preload_days=preload_days,
+                        limit_per_call=limit_per_call,
+                        poll_secs=2.0,
+                        build_only=bool(args.build_only),
+                        log_pages_every=args.log_pages_every,
+                        verbose=args.verbose,
+                        run_minutes=run_minutes,
+                    )
+                    return  # important: don’t fall through to non-crypto
+                
+                # non-crypto
+                try:
+                    t = asyncio.create_task(run_symbol_feeder(
+                        symbol=sym,
+                        out_dir=out_dir,
+                        host=args.host,
+                        port=args.port,
+                        client_id=args.client_id_start + idx,
+                        use_delayed=bool(args.delayed),
+                        preload_days=int(e.get("preload_days", args.preload_days)),
+                        prefill_n=args.prefill_n,
+                        bar_size_secs=args.bar_size_secs,
+                        what_to_show=args.what_to_show,
+                        build_only=bool(args.build_only),
+                        run_minutes=int(args.run_minutes or 0)
+                    ))
+                except Exception as ex:
+                    print(f"[ERROR][{sym}] {type(ex).__name__}: {ex}", flush=True)
+                    raise
+
+                if args.build_only and args.run_minutes > 0:
+                    t.cancel()
+                    print(f"[BUILD_ONLY] {sym} reached run_minutes={args.run_minutes} -> stopping")
+                    return
+                else:
+                    await t
+            except asyncio.TimeoutError as ex:
+                print(f"[ERROR][TIMEOUT] {e.get('symbol')} {type(ex).__name__}: {ex}")
+            except Exception as ex:
+                print(f"[ERROR] {e.get('symbol')} {type(ex).__name__}: {ex}")
 
     tasks = [asyncio.create_task(_run_one(i, e)) for i, e in enumerate(entries)]
-
-
+    
 
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         pass
-
+           
 
 if __name__ == "__main__":
     try:

@@ -8,6 +8,10 @@ execution:
   hard_cutoff_R: -0.25
   hard_cutoff_min: 10
   min_minutes_to_window_end: 10
+fees:
+  fee_bps: 0.0
+  fee_fixed: 0.0
+  slip_bps: 0.0
 
 # Leave strategy mostly empty in the crypto profile.
 # Universes should define strategy.name + knobs.

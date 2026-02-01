@@ -48,7 +48,7 @@ class StratConfig:
 
 
 class RsiMeanReversion:
-    def __init__(self, cfg: StratConfig):
+    def __init__(self, cfg: StratConfig, *, debug_cfg_echo: bool = False):
         self.cfg = cfg
         self._last_trade_ts = None          # pd.Timestamp
         self._day = None                    # datetime.date
@@ -56,6 +56,8 @@ class RsiMeanReversion:
         self._why = Counter()
         self._rej = Counter()
         print(f"[RsiMeanReversion] target_vwap={self.cfg.target_vwap}")
+        if debug_cfg_echo:
+            print(f"[STRAT.ECHO] RsiMeanReversion cfg={self.cfg}")
 
     def on_entry_submitted(self, ts) -> None:
         self._trades_today += 1

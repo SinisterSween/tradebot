@@ -1,6 +1,6 @@
 # trader/strategies/trend_pullback.py
 from dataclasses import dataclass
-from ..engine.utils import Order, Bracket, side_mult
+from ..engine.utils import Order, Bracket
 
 @dataclass
 class StratConfig:
@@ -19,6 +19,7 @@ class StratConfig:
 class TrendPullback:
     def __init__(self, cfg: StratConfig):
         self.cfg = cfg
+        self._dbg = 0
 
     def window_ok(self, ts_local_str: str, windows) -> bool:
         return any(w["start"] <= ts_local_str <= w["end"] for w in windows)
@@ -28,6 +29,7 @@ class TrendPullback:
         atr = float(bar.get("atr", 0.0) or 0.0)
         if atr <= 0:
             return None
+        
         if not self.window_ok(bar["t_local"], windows):
             return None
 
@@ -73,27 +75,36 @@ class TrendPullback:
             return None
 
         stop_dist_pts = abs(entry_price - stop)
-        qty = risk.position_size(stop_dist_pts, self.cfg.tick_size)
-        if qty <= 0:
-            return None
-
-        # Min notional gate (NOW valid because qty/entry_price exist)
-        min_notional_usd = float(self.cfg.min_notional_usd or 0.0)
-        if min_notional_usd > 0 and (entry_price * float(qty)) < min_notional_usd:
+        
+        if stop_dist_pts <= 0:
             return None
 
         target_pts = float(self.cfg.target_R) * stop_dist_pts
-        target = entry_price + target_pts * side_mult(side)
+        target = (entry_price + target_pts) if side == "BUY" else (entry_price - target_pts)
+
+        # sanity
+        if side == "BUY" and target <= entry_price:
+            raise RuntimeError(f"[TrendPullback] BUY target not above entry: entry={entry_price} target={target}")
+        if side == "SELL" and target >= entry_price:
+            raise RuntimeError(f"[TrendPullback] SELL target not below entry: entry={entry_price} target={target}")
 
         order_id = str(bar.get("ts") or bar.get("datetime") or bar.get("t_utc") or bar.get("timestamp") or bar.name)
+        
         order = Order(
             id=order_id,
-            ts=bar.name,          # bar index (DatetimeIndex in your runs)
+            ts=bar.name,
             symbol=bar["symbol"],
             side=side,
-            qty=qty,
+            qty=1,          # placeholder; engine will overwrite
             type="MARKET",
         )
-        bracket = Bracket(stop_price=stop, target_price=target)
-
-        return {"order": order, "bracket": bracket, "stop_dist_points": stop_dist_pts}
+        bracket = Bracket(stop_price=float(stop), target_price=float(target))
+        side = "BUY" if side == "SELL" else "SELL"
+        target = entry_price - (target - entry_price)
+        stop   = entry_price + (entry_price - stop)
+        return {
+            "order": order,
+            "bracket": bracket,
+            "stop_dist_points": float(stop_dist_pts),
+            "min_notional_usd": float(self.cfg.min_notional_usd or 0.0),
+        }

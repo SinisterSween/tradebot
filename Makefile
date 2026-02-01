@@ -68,8 +68,15 @@ help:
 PY := .venv/bin/python
 PP := PYTHONPATH=.
 PROFILE_EQ := config/profile/equities.yaml
-UNIV_CRYPTO := config/universes/crypto_all.yaml
-CSV_DIR := data
+UNIV_CRYPTO ?= config/universes/crypto_all.yaml
+UNIV_LEVERED ?= config/universes/levered_etf.yaml
+UNIV_SP500 ?= config/universes/sp500_fractional.yaml
+UNIV_TINY ?= config/universes/tiny_cap.yaml
+CSV_DIR ?= data
+
+CSV_CONCURRENCY_CRYPTO ?= 3
+CSV_CONCURRENCY_IBKR ?= 2
+CSV_PREFILL_N ?= 2000
 # Backtest defaults
 STARTING_EQUITY ?= 2000
 RISK_PCT ?= 0.01
@@ -83,10 +90,63 @@ END_DATE   ?= 2025-11-30
 # --- CSV generation (adjust flags to match your script if needed) ---
 
 crypto-csv-90-1m:
-	$(PP) $(PY) scripts/build_universe_csvs.py --universes $(UNIV_CRYPTO) --out-dir $(CSV_DIR) --preload-days 90 --bar-size-secs 60 --reset-csv
+	$(PP) $(PY) scripts/build_universe_csvs.py \
+	  --universes $(UNIV_CRYPTO) \
+	  --out-dir $(CSV_DIR) \
+	  --build-only \
+	  --reset-csv \
+	  --preload-days 90 \
+	  --max-concurrency $(CSV_CONCURRENCY_CRYPTO)
 
 crypto-csv-180-1m:
-	$(PP) $(PY) scripts/build_universe_csvs.py --universes $(UNIV_CRYPTO) --out-dir $(CSV_DIR) --preload-days 180 --bar-size-secs 60 --reset-csv
+	$(PP) $(PY) scripts/build_universe_csvs.py \
+	  --universes $(UNIV_CRYPTO) \
+	  --out-dir $(CSV_DIR) \
+	  --build-only \
+	  --reset-csv \
+	  --preload-days 180 \
+	  --max-concurrency $(CSV_CONCURRENCY_CRYPTO)
+
+levered-csv-30d-1m:
+	$(PP) $(PY) scripts/build_universe_csvs.py \
+	  --universes $(UNIV_LEVERED) \
+	  --out-dir $(CSV_DIR) \
+	  --delayed \
+	  --build-only \
+	  --run-minutes 2 \
+	  --reset-csv \
+	  --max-concurrency $(CSV_CONCURRENCY_IBKR) \
+	  --preload-days 30 \
+	  --prefill-n $(CSV_PREFILL_N)
+
+sp500-csv-30d-1m:
+	$(PP) $(PY) scripts/build_universe_csvs.py \
+	  --universes $(UNIV_SP500) \
+	  --out-dir $(CSV_DIR) \
+	  --delayed \
+	  --build-only \
+	  --run-minutes 2 \
+	  --reset-csv \
+	  --max-concurrency $(CSV_CONCURRENCY_IBKR) \
+	  --preload-days 30 \
+	  --prefill-n $(CSV_PREFILL_N)
+
+tiny-csv-30d-1m:
+	$(PP) $(PY) scripts/build_universe_csvs.py \
+	  --universes $(UNIV_TINY) \
+	  --out-dir $(CSV_DIR) \
+	  --delayed \
+	  --build-only \
+	  --run-minutes 2 \
+	  --reset-csv \
+	  --max-concurrency 1 \
+	  --preload-days 30 \
+	  --prefill-n $(CSV_PREFILL_N)
+
+csv-all-30d:
+	$(MAKE) levered-csv-30d-1m
+	$(MAKE) sp500-csv-30d-1m
+	$(MAKE) tiny-csv-30d-1m
 
 # --- Backtests ---
 

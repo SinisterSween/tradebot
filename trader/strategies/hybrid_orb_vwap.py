@@ -13,8 +13,10 @@ class StratConfig:
     tick_size: float
     tick_value: float
 class HybridOrbVwap:
-    def __init__(self, cfg: StratConfig):
+    def __init__(self, cfg: StratConfig, *, debug_cfg_echo: bool = False):
         self.cfg = cfg
+        if debug_cfg_echo:
+            print(f"[STRAT.ECHO] HybridOrbVwap cfg={self.cfg}")
     def window_ok(self, ts_local_str: str, windows) -> bool:
         return any(w["start"] <= ts_local_str <= w["end"] for w in windows)
     def maybe_signal(self, bar, windows, risk):

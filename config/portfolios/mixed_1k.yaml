@@ -3,6 +3,7 @@ microlots:
   - name: EQ-SWI
     cash_alloc: 500
     universe: sp500_fractional
+    profile: config/profile/equities.yaml
     broker: ibkr_fractional
     max_risk_per_trade: 0.02
     max_pos: 3
@@ -10,13 +11,15 @@ microlots:
   - name: EQ-TINY
     cash_alloc: 200
     universe: tiny_cap
+    profile: config/profile/equities.yaml
     broker: ibkr_fractional
     max_risk_per_trade: 0.01
     max_pos: 4
     day_trade_cap: 2
   - name: CRYPTO
     cash_alloc: 250
-    universe: crypto_micro
+    universe: crypto_all
+    profile: config/profile/crypto.yaml
     broker: binanceus
     max_risk_per_trade: 0.0075
     max_pos: 4
@@ -24,6 +27,7 @@ microlots:
   - name: ETF-SWING
     cash_alloc: 500
     universe: levered_etf
+    profile: config/profile/equities.yaml
     broker: ibkr_fractional
     max_risk_per_trade: 0.02
     max_pos: 2

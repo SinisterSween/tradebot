@@ -5,15 +5,15 @@ do not need to change.
 """
 import asyncio
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta
 from typing import Optional, List, Callable
+import time as pytime
 
-from ib_insync import IB, Stock, Order, MarketOrder, LimitOrder, StopOrder, Trade
+from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder, Trade
 from ib_insync.util import parseIBDatetime as dt_to_datetime
 
 # Re-use the *exact* data-class you already import in ibkr.py
 from trader.brokers.ibkr import BracketPrices   # brings in your dataclass
-
 pending = set()
 class IbkrFractional:
     """
@@ -23,21 +23,32 @@ class IbkrFractional:
     - returns ib_insync.Trade objects so the rest of your code is untouched
     """
 
-    def __init__(self, host: str, port: int, client_id: int, account: str = ""):
+    def __init__(self, host: str, port: int, client_id: int, account: str = "", market_data_only: bool = False):
         self.ib = IB()
         self.host, self.port, self.client_id = host, port, client_id
         self.account = account or None
         self.contract: Optional[Stock] = None
         self._md_type: int = 1          # 1=live, 3=delayed
         self.use_rtb_for_equities = False   # match flag you already set
-
+        self.market_data_only = market_data_only
+        self.ib.RequestTimeout = 30
     # ------------------------------------------------------------------
     # Connection helpers (same names as IbkrBroker)
     # ------------------------------------------------------------------
     async def connect(self, *, readonly: bool = False):
-        if not self.ib.isConnected():
-            await self.ib.connectAsync(self.host, self.port, clientId=self.client_id,
-                                       timeout=15, readonly=readonly)
+        if self.ib.isConnected():
+            return
+
+        # --- MD-only connect path: avoid ib_insync connectAsync post-sync calls ---
+        if self.market_data_only:
+            await self.ib.client.connectAsync(self.host, self.port, clientId=self.client_id, timeout=15)
+            # mark IB as connected (ib_insync uses this internal state)
+            self.ib._logger.info(f"[IBKR] connected (market_data_only) clientId={self.client_id}")
+            return
+
+        # --- Normal trading connect path ---
+        await self.ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=15, readonly=readonly)
+        await self._init_account_state()
 
     async def disconnect(self):
         if self.ib.isConnected():
@@ -67,20 +78,70 @@ class IbkrFractional:
     # ------------------------------------------------------------------
     # Contract resolution (stocks only)
     # ------------------------------------------------------------------
-    async def resolve_contract(self, symbol: str, exchange: str = "SMART",
-                               currency: str = "USD", *_, **__) -> Stock:
-        """
-        Resolve a stock contract and store it.
-        Extra positional/keyword args accepted so caller can keep futures args
-        without crashing.
-        """
-        cds = await self.ib.reqContractDetailsAsync(
-            Stock(symbol, exchange or "SMART", currency or "USD")
-        )
-        if not cds:
-            raise RuntimeError(f"IB could not qualify stock {symbol}")
-        self.contract = cds[0].contract
-        return self.contract
+    async def resolve_contract(
+        self, 
+        symbol: str, 
+        exchange: str = "SMART",
+        currency: str = "USD", 
+        *_, 
+        **__,
+    ) -> Stock:
+        sym = symbol
+        currency = currency or "USD"
+
+        # For ETFs, try specific venues first
+        exchange_candidates = []
+        if sym in {"TQQQ", "SQQQ"}:
+            exchange_candidates = ["NASDAQ", "SMART", "ARCA"]
+        elif sym in {"SOXL", "SOXS"}:
+            exchange_candidates = ["ARCA", "SMART", "NASDAQ"]
+        else:
+            exchange_candidates = [exchange or "SMART", "SMART", "ARCA", "NASDAQ"]
+
+        last_err = None
+
+        for ex in exchange_candidates:
+            try:
+                cds = await self.ib.reqContractDetailsAsync(Stock(sym, ex, currency))
+                if not cds:
+                    continue
+
+                c = cds[0].contract
+
+                # Probe: can we get *any* history fast?
+                try:
+                    bars = await asyncio.wait_for(
+                        self.ib.reqHistoricalDataAsync(
+                            c,
+                            endDateTime="",
+                            durationStr="1 D",
+                            barSizeSetting="1 min",
+                            whatToShow="TRADES",
+                            useRTH=False,
+                            formatDate=2,
+                            keepUpToDate=False,
+                        ),
+                        timeout=12,
+                    )
+                except Exception as e:
+                    bars = []
+                    last_err = e
+
+                if bars:
+                    self.contract = c
+                    print(f"[CONTRACT] {sym} exch={ex} conId={c.conId} (probe bars={len(bars)})", flush=True)
+                    return self.contract
+
+                print(f"[CONTRACT][NOHIST] {sym} exch={ex} conId={c.conId} probe_failed={type(last_err).__name__ if last_err else 'none'}", flush=True)
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise RuntimeError(f"IB could not qualify stock {sym} (last_err={last_err})")
+
+
+
 
     # ------------------------------------------------------------------
     # Order entry (cash-quantity style)
@@ -178,14 +239,15 @@ class IbkrFractional:
                                what_to_show: str = "TRADES",
                                bar_size_secs: int = 60,
                                preload_days: int = 2,
-                               prefill_n: int = 2000):
+                               prefill_n: int = 2000,
+                               build_only: bool = False,
+                               run_minutes: int = 0):
         """
         1-min bars using IB historical with keepUpToDate=True.
         Works with delayed data; avoids RealTimeBars which often doesn't.
         """
         import asyncio, inspect
         from datetime import timezone
-
         if self.contract is None:
             raise RuntimeError("Contract not resolved")
         
@@ -224,28 +286,148 @@ class IbkrFractional:
                 "close": float(b.close),
                 "volume": float(getattr(b, "volume", 0) or 0),
             }
+        what_candidates = [what_to_show] if what_to_show else []
+        for w in ["TRADES", "MIDPOINT", "BID_ASK"]:
+            if w not in what_candidates:
+                what_candidates.append(w)
 
-        # Backfill + live updates via historical keepUpToDate
-        bars = await self.ib.reqHistoricalDataAsync(
-            self.contract,
-            endDateTime="",
-            durationStr=f"{preload_days} D",
-            barSizeSetting="1 min",
-            whatToShow=what_to_show,
-            useRTH=False,              # IMPORTANT: allow outside RTH
-            formatDate=2,
-            keepUpToDate=True          # IMPORTANT: live updates
-        )
+        sym = getattr(self.contract, "symbol", "?")
+        conId = getattr(self.contract, "conId", None)
+        
+        if build_only:
+            all_bars =[]
+            end_dt = ""
+            days_left = int(preload_days)
+
+            chosen_what = None
+            last_err = None
+            while days_left > 0:
+                got_chunk = False
+
+                candidates = [chosen_what] if chosen_what else what_candidates
+
+                for w in candidates:
+                    try:
+                        print(
+                            f"[HIST][CHUNK][REQ] sym={sym} conId={conId} end={end_dt or 'NOW'} dur=1D what={w}",
+                            flush=True
+                        )
+                        chunk = await asyncio.wait_for(
+                            self.ib.reqHistoricalDataAsync(
+                                self.contract,
+                                endDateTime=end_dt,
+                                durationStr="1 D",
+                                barSizeSetting="1 min",
+                                whatToShow=w,
+                                useRTH=False,
+                                formatDate=2,
+                                keepUpToDate=False,  # IMPORTANT for build_only
+                            ),
+                            timeout=25,
+                        )
+                        if not chunk:
+                            print(f"[HIST][CHUNK][EMPTY] sym={sym} what={w}", flush=True)
+                            continue
+
+                        chosen_what = w
+                        all_bars.extend(chunk)
+                        got_chunk = True
+
+                        # move end_dt backwards to just before the oldest bar in this chunk
+                        oldest = chunk[0].date
+                        dt_oldest = dt_to_datetime(oldest) if not isinstance(oldest, datetime) else oldest
+                        if dt_oldest.tzinfo is None:
+                            dt_oldest = dt_oldest.replace(tzinfo=timezone.utc)
+                        else:
+                            dt_oldest = dt_oldest.astimezone(timezone.utc)
+
+                        prev_dt = dt_oldest - timedelta(minutes=1)
+                        end_dt = prev_dt.strftime("%Y%m%d %H:%M:%S")  # IB likes this
+
+                        days_left -= 1
+                        print(
+                            f"[HIST][CHUNK][GOT] sym={sym} what={w} bars={len(chunk)} days_left={days_left}",
+                            flush=True
+                        )
+
+                        # pacing to avoid IB throttling/timeouts
+                        await asyncio.sleep(0.25)
+
+                        break  # done with what_candidates for this day
+
+                    except asyncio.TimeoutError as e:
+                        last_err = e
+                        print(f"[HIST][CHUNK][TIMEOUT] sym={sym} what={w}", flush=True)
+                    except Exception as e:
+                        last_err = e
+                        print(f"[HIST][CHUNK][ERR] sym={sym} what={w} {type(e).__name__}: {e}", flush=True)
+
+                    # If we already found a working what earlier, don't keep cycling candidates forever
+                if not got_chunk:
+                    print(f"[HIST][CHUNK][STOP] sym={sym} could not fetch more history last_err={type(last_err).__name__ if last_err else ''}", flush=True)
+                    break
+
+            bars = all_bars
+            if not bars:
+                print(f"[HIST][WARN] {sym} got 0 bars after chunking.", flush=True)
+            return bars
+
+        else:
+            ku = True
+            bars = []
+            last_err = None
+            for attempt in (1, 2):
+                for w in what_candidates:
+                    try:
+                        bars = await asyncio.wait_for(
+                            self.ib.reqHistoricalDataAsync(
+                                self.contract,
+                                endDateTime="",
+                                durationStr=f"{preload_days} D",
+                                barSizeSetting="1 min",
+                                whatToShow=w,
+                                useRTH=False,
+                                formatDate=2,
+                                keepUpToDate=ku
+                            ),
+                            timeout=25
+                        )
+
+                        if bars:
+                            print(f"[HIST][GOT] sym={sym} what={w} bars_len={len(bars)}", flush=True)
+                            break
+                        else:
+                            print(f"[HIST][EMPTY] sym={sym} what={w}", flush=True)
+
+                    except asyncio.TimeoutError as e:
+                        last_err = e
+                        print(f"[HIST][ERR] sym={sym} what={w} {type(e).__name__}: {e}", flush=True)
+                        continue
+                    except Exception as e:
+                        last_err = e
+                        print(f"[HIST][ERR] sym={sym} what={w} attempt={attempt} {type(e).__name__}: {e}", flush=True)
+                        continue
+                if bars:
+                    break
+            if not bars:
+                print(f"[HIST][WARN] {sym} got 0 bars after fallbacks. last_err={last_err}", flush=True)
+            
+
         last_seen = None
         # Emit initial history
         n_emit = min(len(bars), prefill_n)
-        print(f"[HIST] about to emit n={n_emit} for {getattr(self.contract,'symbol','?')}")
+        print(f"[HIST] about to emit n={n_emit} for {sym}")
         for b in bars[-prefill_n:]:
             d = _bar_to_dict(b)
             last_seen = d["datetime"]
             await _emit(d)
-        print(f"[HIST] emitted n={n_emit} for {getattr(self.contract,'symbol','?')}")
+        
+        print(f"[HIST] emitted n={n_emit} for {sym}")
         print(f"[RTB] emitted history bars: {min(len(bars), prefill_n)}")
+        if build_only:
+            print(f"[BUILD_ONLY] history emitted for {sym} -> returning", flush=True)
+            return
+
 
 
         last_dbg = {"ts": 0.0}
@@ -274,22 +456,28 @@ class IbkrFractional:
 
             except Exception as e:
                 print(f"[HIST][UPDATE][ERROR] {type(e).__name__}: {e}")
+        print(f"[RTB] emitted history bars: {min(len(bars), prefill_n)}")
+
 
 
 
         bars.updateEvent += on_live_update
-        print(f"[STREAM] subscribed updateEvent for {getattr(self.contract,'symbol','?')} (keepUpToDate=True)")
-        print(f"[STREAM] entering live loop for {getattr(self.contract,'symbol','?')}")
-        print(f"[TEST] about to emit history for {getattr(self.contract,'symbol','?')} bars={len(bars)}")
+        print(f"[STREAM] subscribed updateEvent for {sym} (keepUpToDate=True)")
+        print(f"[STREAM] entering live loop for {sym}")
+        run_minutes = int(run_minutes or 0)  # if you have it as arg; otherwise remove
+        stop_at = pytime.monotonic() + (run_minutes * 60) if run_minutes > 0 else None
 
         try:
             n = 0
             while True:
                 await asyncio.sleep(1)
                 n += 1
+                if stop_at is not None and pytime.monotonic() >= stop_at:
+                    print(f"[STREAM] stopping {sym} (run_minutes={run_minutes})", flush=True)
+                    break
                 if n % 10 == 0:
                     # show last_seen so we know if anything moved
-                    print(f"[STREAM] alive {getattr(self.contract,'symbol','?')} last_seen={last_seen}")
+                    print(f"[STREAM] alive {sym} last_seen={last_seen}")
         except asyncio.CancelledError:
             pass
         finally:
