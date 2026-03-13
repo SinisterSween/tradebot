@@ -14,6 +14,9 @@ def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None, bars_per_da
     if equity is None or len(equity) == 0:
         return {}
 
+    # 1440 bars/day = 24h crypto; anything lower = equity/futures session-based
+    trading_days_per_year = 365 if bars_per_day >= 1440 else 252
+
     equity = equity.astype(float).sort_index()
     daily = _daily_from_equity(equity, bars_per_day=bars_per_day)
     rets = daily.pct_change()
@@ -23,7 +26,7 @@ def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None, bars_per_da
         span_days = max(1, (equity.index[-1] - equity.index[0]).days or 1)
         years = span_days / 365.0
     else:
-        years = max(1e-9, len(daily) / 252.0)
+        years = max(1e-9, len(daily) / float(trading_days_per_year))
 
     if len(rets):
         log_growth = np.log1p(rets).sum()
@@ -32,17 +35,15 @@ def summarize_equity(equity: pd.Series, trades: pd.DataFrame | None, bars_per_da
         cagr = 0.0
 
     if len(rets) >= 3 and np.isfinite(rets.std()) and rets.std() > 0:
-        sharpe = float((rets.mean() / (rets.std() + 1e-12)) * np.sqrt(252))
+        sharpe = float((rets.mean() / (rets.std() + 1e-12)) * np.sqrt(trading_days_per_year))
     else:
         sharpe = 0.0
     neg = rets[rets < 0]
 
     if len(rets) >= 3 and len(neg) >= 3 and np.isfinite(neg.std()) and neg.std() > 0:
-        sortino = float((rets.mean() / (neg.std() + 1e-12)) * np.sqrt(252))
+        sortino = float((rets.mean() / (neg.std() + 1e-12)) * np.sqrt(trading_days_per_year))
     else:
         sortino = 0.0
-
-    sortino = float((rets.mean() / (neg.std() + 1e-12)) * np.sqrt(252)) if len(neg) else 0.0
 
     # --- Max drawdown should be computed on the FULL curve ---
     eq = equity.astype(float).sort_index()

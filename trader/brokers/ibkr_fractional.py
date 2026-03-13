@@ -50,6 +50,14 @@ class IbkrFractional:
         await self.ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=15, readonly=readonly)
         await self._init_account_state()
 
+    async def _init_account_state(self):
+        """Resolve account ID from TWS and cache it."""
+        if not self.account:
+            managed = self.ib.managedAccounts()
+            if managed:
+                self.account = managed[0]
+        print(f"[IBKR] connected, account={self.account}")
+
     async def disconnect(self):
         if self.ib.isConnected():
             self.ib.disconnect()
@@ -342,7 +350,7 @@ class IbkrFractional:
                             dt_oldest = dt_oldest.astimezone(timezone.utc)
 
                         prev_dt = dt_oldest - timedelta(minutes=1)
-                        end_dt = prev_dt.strftime("%Y%m%d %H:%M:%S")  # IB likes this
+                        end_dt = prev_dt.strftime("%Y%m%d %H:%M:%S") + " UTC"  # suffix tells IB to treat as UTC, not TWS local (ET)
 
                         days_left -= 1
                         print(
@@ -351,7 +359,7 @@ class IbkrFractional:
                         )
 
                         # pacing to avoid IB throttling/timeouts
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(1.0)
 
                         break  # done with what_candidates for this day
 
@@ -370,7 +378,6 @@ class IbkrFractional:
             bars = all_bars
             if not bars:
                 print(f"[HIST][WARN] {sym} got 0 bars after chunking.", flush=True)
-            return bars
 
         else:
             ku = True
@@ -414,16 +421,17 @@ class IbkrFractional:
             
 
         last_seen = None
-        # Emit initial history
-        n_emit = min(len(bars), prefill_n)
+        # Emit initial history (build_only emits all bars; live mode caps at prefill_n)
+        emit_bars = bars if build_only else bars[-prefill_n:]
+        n_emit = len(emit_bars)
         print(f"[HIST] about to emit n={n_emit} for {sym}")
-        for b in bars[-prefill_n:]:
+        for b in emit_bars:
             d = _bar_to_dict(b)
             last_seen = d["datetime"]
             await _emit(d)
         
         print(f"[HIST] emitted n={n_emit} for {sym}")
-        print(f"[RTB] emitted history bars: {min(len(bars), prefill_n)}")
+        print(f"[RTB] emitted history bars: {n_emit}")
         if build_only:
             print(f"[BUILD_ONLY] history emitted for {sym} -> returning", flush=True)
             return

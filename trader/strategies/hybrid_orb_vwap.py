@@ -19,6 +19,29 @@ class HybridOrbVwap:
             print(f"[STRAT.ECHO] HybridOrbVwap cfg={self.cfg}")
     def window_ok(self, ts_local_str: str, windows) -> bool:
         return any(w["start"] <= ts_local_str <= w["end"] for w in windows)
+    
+    def score_decision(self, latest_row, decision) -> float:
+        if decision is None:
+            return float("-inf")
+
+        bracket = decision["bracket"]
+
+        entry = float(latest_row["close"])
+        stop = float(bracket.stop_price)
+        target = float(bracket.target_price)
+
+        risk = abs(entry - stop)
+        reward = abs(target - entry)
+        if risk <= 0:
+            return float("-inf")
+
+        return reward / risk
+
+    # Normalized interface — all strategies expose score_signal(bar, decision)
+    def score_signal(self, bar, decision) -> float:
+        return max(0.0, self.score_decision(bar, decision))
+
+
     def maybe_signal(self, bar, windows, risk):
         if bar["atr"] <= 0: return None
         if not self.window_ok(bar["t_local"], windows): return None

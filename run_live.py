@@ -1,16 +1,14 @@
-import asyncio, yaml, pandas as pd, signal, sys, argparse
-import os, json, csv
-from zoneinfo import ZoneInfo
-from datetime import datetime, timezone
-from contextlib import suppress
-from trader.telemetry.metrics import data_age_seconds
 import asyncio, yaml, pandas as pd, signal, sys, argparse, os, json, csv
+from dotenv import load_dotenv
+load_dotenv()
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from contextlib import suppress
 from typing import List, Dict, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from run_backtest import _symbol_to_csv_stem
+from trader.telemetry.metrics import data_age_seconds
 
 # --- make ib_insync play nicely with asyncio ---
 try:
@@ -24,13 +22,18 @@ from trader.brokers.ibkr import IbkrBroker
 from trader.brokers.ibkr_fractional import IbkrFractional
 
 try:
-    from trader.brokers.ccxt_binanceus import CcxtBinanceus
+    from trader.brokers.ccxt_binanceus import CcxtBinanceus, BracketOrphanError
 except ModuleNotFoundError as e:
     print(f"[WARN] ccxt/crypto broker unavailable: {e}")
     CcxtBinanceus = None
+    BracketOrphanError = Exception  # fallback so except clauses don't break
 from trader.engine.risk import RiskConfig, RiskGovernor
 from trader.engine.backtest import prepare_bars
-from trader.strategies.hybrid_orb_vwap import HybridOrbVwap, StratConfig
+from trader.strategies.hybrid_orb_vwap import HybridOrbVwap, StratConfig as OrbStratConfig
+from trader.strategies.rsi_mean_reversion import RsiMeanReversion, StratConfig as RsiStratConfig
+from trader.strategies.trend_pullback import TrendPullback, StratConfig as TrendStratConfig
+from trader.strategies.vwap_reversion import VwapReversion, StratConfig as VwapStratConfig
+from trader.engine.portfolio_selector import PortfolioSelector, Candidate
 from trader.telemetry.metrics import (
     start_metrics_server,
     orders_submitted,
@@ -43,6 +46,204 @@ from trader.telemetry.metrics import (
 from trader.telemetry.execution_log import log_submit, log_fill, log_flatten
 from trader.persistence.state_store import StateStore, OpenTradeState, RiskState
 
+# Keep the old name for any code paths that reference StratConfig directly
+StratConfig = OrbStratConfig
+
+# Map every name variant your universe YAMLs might use → canonical key
+_STRATEGY_NAME_MAP = {
+    "hybrid_orb_vwap":    "hybrid_orb_vwap",
+    "hybridorbvwap":      "hybrid_orb_vwap",
+    "orb":                "hybrid_orb_vwap",
+    "tinycapbreakout":    "hybrid_orb_vwap",   # tiny_cap.yaml uses ORB-style params
+    "leveredetfbreakout": "hybrid_orb_vwap",   # levered_etf.yaml uses ORB-style params
+    "rsi_mean_reversion": "rsi_mean_reversion",
+    "rsimeanreversion":   "rsi_mean_reversion",
+    "rsi":                "rsi_mean_reversion",
+    "trend_pullback":     "trend_pullback",
+    "trendpullback":      "trend_pullback",
+    "vwap_reversion":     "vwap_reversion",
+    "vwapreversion":      "vwap_reversion",
+    "vwap":               "vwap_reversion",
+}
+
+
+def _resolve_strategy_type(uni: dict, raw: dict) -> str:
+    """
+    Find the strategy type from the universe YAML, checking in priority order:
+      1. uni["strategy_type"]  – new canonical field
+      2. uni["strategy_name"]  – top-level descriptive name (sp500_fractional, tiny_cap, levered_etf)
+      3. raw["name"]           – nested strategy.name (crypto_micro_mr, crypto_micro)
+    Returns a canonical type string, defaulting to "hybrid_orb_vwap".
+    """
+    raw_name = (
+        uni.get("strategy_type")
+        or uni.get("strategy_name")
+        or raw.get("name")
+        or "hybrid_orb_vwap"
+    )
+    key = str(raw_name).lower().replace(" ", "_").replace("-", "_")
+    return _STRATEGY_NAME_MAP.get(key, "hybrid_orb_vwap")
+
+
+def build_strategy(strategy_type: str, raw: dict, tick_size: float, tick_value: float):
+    """
+    Build a strategy instance from a raw config dict.
+    Pass the result of _resolve_strategy_type() as strategy_type.
+    All four strategies expose: maybe_signal(bar, windows, risk) + score_signal(bar, decision).
+    """
+    t = str(strategy_type or "hybrid_orb_vwap").lower().strip()
+
+    if t == "rsi_mean_reversion":
+        return RsiMeanReversion(RsiStratConfig(
+            rsi_len=int(raw.get("rsi_len", 14)),
+            rsi_buy_below=float(raw.get("rsi_buy_below", 28.0)),
+            rsi_sell_above=float(raw.get("rsi_sell_above", 72.0)),
+            atr_mult=float(raw.get("atr_mult", 1.0)),
+            target_R=float(raw.get("target_R", 0.8)),
+            stop_pad_ticks=int(raw.get("stop_pad_ticks", 2)),
+            allow_longs=bool(raw.get("allow_longs", True)),
+            allow_shorts=bool(raw.get("allow_shorts", False)),
+            slope_max=float(raw.get("slope_max", 0.0)),
+            min_atr_pct=float(raw.get("min_atr_pct", 0.0)),
+            tick_size=float(tick_size),
+            tick_value=float(tick_value),
+            target_vwap=bool(raw.get("target_vwap", True)),
+            vwap_dist_atr_min=float(raw.get("vwap_dist_atr_min", 0.0)),
+            require_cross=bool(raw.get("require_cross", True)),
+            min_minutes_between_trades=int(raw.get("min_minutes_between_trades", 30)),
+            max_trades_per_day=int(raw.get("max_trades_per_day", 6)),
+            ema_slope_max=float(raw.get("ema_slope_max", 0.0)),
+            ema_slope_atr_min=float(raw.get("ema_slope_atr_min", -0.2)),
+            ema_dist_atr_min=float(raw.get("ema_dist_atr_min", 0.0)),
+            ema_dist_atr_max=float(raw.get("ema_dist_atr_max", 0.0)),
+            exit_on_ema=bool(raw.get("exit_on_ema", False)),
+            exit_ema_len=int(raw.get("exit_ema_len", 20)),
+            exit_ema_side=str(raw.get("exit_ema_side", "cross")),
+            min_vwap_target_R=float(raw.get("min_vwap_target_R", 0.0)),
+            vwap_entry_min_atr=float(raw.get("vwap_entry_min_atr", 0.0)),
+            vwap_entry_max_atr=float(raw.get("vwap_entry_max_atr", 0.0)),
+            use_session_open_stop=bool(raw.get("use_session_open_stop", False)),
+            session_open_stop_atr_pad=float(raw.get("session_open_stop_atr_pad", 0.0)),
+            use_early_range_target=bool(raw.get("use_early_range_target", False)),
+            early_range_mult=float(raw.get("early_range_mult", 1.0)),
+            early_min_range_atr=float(raw.get("early_min_range_atr", 0.0)),
+            require_early_done=bool(raw.get("require_early_done", True)),
+        ))
+
+    if t == "trend_pullback":
+        return TrendPullback(TrendStratConfig(
+            atr_len=int(raw.get("atr_len", 14)),
+            atr_mult=float(raw.get("atr_mult", 1.0)),
+            target_R=float(raw.get("target_R", 1.5)),
+            slope_min=float(raw.get("slope_min", 0.0)),
+            pullback_atr=float(raw.get("pullback_atr", 0.5)),
+            stop_pad_ticks=int(raw.get("stop_pad_ticks", 2)),
+            tick_size=float(tick_size),
+            tick_value=float(tick_value),
+            min_atr_pct=float(raw.get("min_atr_pct", 0.0)),
+            max_bar_range_atr=float(raw.get("max_bar_range_atr", 0.0)),
+            min_notional_usd=float(raw.get("min_notional_usd", 0.0)),
+        ))
+
+    if t == "vwap_reversion":
+        return VwapReversion(VwapStratConfig(
+            atr_len=int(raw.get("atr_len", 14)),
+            atr_mult=float(raw.get("atr_mult", 1.0)),
+            target_R=float(raw.get("target_R", 1.0)),
+            slope_max=float(raw.get("slope_max", 0.05)),
+            stop_pad_ticks=int(raw.get("stop_pad_ticks", 2)),
+            tick_size=float(tick_size),
+            tick_value=float(tick_value),
+            min_atr_pct=float(raw.get("min_atr_pct", 0.0)),
+            target_vwap=bool(raw.get("target_vwap", True)),
+            max_bar_range_atr=float(raw.get("max_bar_range_atr", 0.0)),
+        ))
+
+    # default: hybrid_orb_vwap
+    return HybridOrbVwap(OrbStratConfig(
+        orb_minutes=int(raw.get("orb_minutes", 15)),
+        atr_len=int(raw.get("atr_len", 14)),
+        break_eps_ticks=int(raw.get("break_eps_ticks", 2)),
+        atr_mult=float(raw.get("atr_mult", 1.0)),
+        target_R=float(raw.get("target_R", 1.0)),
+        slope_min=float(raw.get("slope_min", 0.0)),
+        stop_pad_ticks=int(raw.get("stop_pad_ticks", 2)),
+        trail_pad_ticks=int(raw.get("trail_pad_ticks", 2)),
+        tick_size=float(tick_size),
+        tick_value=float(tick_value),
+    ))
+
+def load_features_from_csv(csv_path: str, *, tz: str, orb_minutes: int, symbol: str, tail_n: int = 2500):
+    """
+    Reads last N rows from a symbol CSV, builds feature DF via prepare_bars, returns it.
+    Assumes CSV has: datetime, open, high, low, close, volume
+    datetime is ISO string (UTC).
+    """
+    p = Path(csv_path)
+    if not p.exists():
+        return None
+
+    try:
+        # tail read (fast enough for N~2500). If you want super-fast later, we can do file tail parsing.
+        df = pd.read_csv(p)
+        if df.empty:
+            return None
+        if len(df) > tail_n:
+            df = df.iloc[-tail_n:]
+
+        # normalize
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        df = df.dropna(subset=["datetime"])
+        if df.empty:
+            return None
+
+        # prepare_bars expects columns: datetime, ohlcv, symbol + tz/orb
+        return prepare_bars(df, tz, orb_minutes, symbol=symbol, verbose=False)
+    except Exception:
+        return None
+
+def pick_best_signal_for_universe(
+    *,
+    symbols: list[str],
+    csv_dir: str,
+    strat,
+    windows,
+    risk,
+    tz: str,
+    orb_minutes: int,
+    min_score: float = 0.0,
+):
+    """
+    For each symbol:
+      - build features from CSV
+      - run maybe_signal on latest bar
+      - score_signal and keep best
+    Returns (best_symbol, best_decision, best_score, best_bar) or (None, None, 0.0, None)
+    """
+    best = (None, None, 0.0, None)
+
+    for sym in symbols:
+        csv_path = str(Path(csv_dir) / f"{sym.strip().replace('/','_').upper()}_live_1m.csv")
+        fdf = load_features_from_csv(csv_path, tz=tz, orb_minutes=orb_minutes, symbol=sym)
+        if fdf is None or fdf.empty:
+            continue
+
+        bar = fdf.iloc[-1]
+        try:
+            decision = strat.maybe_signal(bar, windows, risk)
+            if not decision:
+                continue
+
+            score = float(getattr(strat, "score_signal")(bar, decision))
+            if score < float(min_score):
+                continue
+
+            if score > best[2]:
+                best = (sym, decision, score, bar)
+        except Exception:
+            continue
+
+    return best
 
 class RollingBars:
     def __init__(self, tz: str, orb_minutes: int, symbol: str, max_rows: int = 2000):
@@ -64,8 +265,7 @@ class RollingBars:
             return None
         tmp = self.df.copy()
         tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
-        tmp["symbol"] = self.symbol
-        return prepare_bars(tmp, self.tz, self.orb_minutes)
+        return prepare_bars(tmp, self.tz, self.orb_minutes, symbol=self.symbol, verbose=False)
 
 
 class TradeTracker:
@@ -1169,7 +1369,7 @@ async def run_portfolio(args):
             pass
 
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
         pass
     finally:
@@ -1188,6 +1388,9 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     stop = stop_all
     name = lot["name"]
     is_live = False
+
+    # per-lot dry_run: true overrides global flag (but global --dry-run also forces all lots dry)
+    dry_run = dry_run or bool(lot.get("dry_run", False))
 
     print(
         f"[{name}] starting microlot (universe={lot['universe']}, broker={lot['broker']})"
@@ -1221,19 +1424,27 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     with open(uni_path, "r") as f:
         uni = yaml.safe_load(f)
 
-    symbols: list[str] = uni["symbols"]
+    # Normalize symbols: can be list[str] OR list[dict] (crypto_all per-symbol format).
+    # Dicts with "locked: false" are skipped (not yet tuned).
+    _symbols_raw = uni["symbols"]
+    _sym_overrides: dict = {}
+    _sym_list: list = []
+    for _s in _symbols_raw:
+        if isinstance(_s, dict):
+            _sym_str = _s.get("symbol", "")
+            if not _sym_str:
+                continue
+            if "locked" in _s and not _s["locked"]:
+                continue
+            _sym_overrides[_sym_str] = _s
+            _sym_list.append(_sym_str)
+        else:
+            _sym_list.append(str(_s))
+    symbols = _sym_list
+
     if not symbols:
         raise ValueError(f"[{name}] Universe {lot['universe']} has no symbols")
     rotate = bool(uni.get("rotate", False))
-    # session windows from universe yaml
-    # expected in yaml: session_windows: - ["09:30", "16:00"]
-    raw_windows = uni.get("session_windows") or []
-    windows = [{"start": a, "end": b} for (a, b) in raw_windows]
-
-    # safety fallback so you don't silently block trading if yaml is missing
-    if not windows:
-        windows = [{"start": "00:00", "end": "23:59"}]
-
     tick_size = float(uni.get("tick_size", 0.01))
     point_value = float(uni.get("point_value", 1.0))
 
@@ -1249,6 +1460,11 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         "trail_pad_ticks": 2,
     }
     strat_cfg_raw = {**strat_defaults, **uni.get("strategy", {})}
+
+    # session_windows: prefer strategy-level (where all our YAMLs put it),
+    # fall back to root-level, then default to 24/7
+    _raw_win = strat_cfg_raw.get("session_windows") or uni.get("session_windows") or []
+    windows = _norm_windows(_raw_win) or [{"start": "00:00", "end": "23:59"}]
 
     orb_min = int(strat_cfg_raw["orb_minutes"])
 
@@ -1269,7 +1485,11 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         broker = broker_cls("127.0.0.1", 7497, client_id=client_id)
         use_delayed = True  # matches your existin delayed config
 
-    await broker.connect()
+    try:
+        await broker.connect()
+    except Exception as e:
+        print(f"[{name}] broker connect failed: {e} – skipping microlot")
+        return
 
     # market data mode (no-op for ccxt broker)
     try:
@@ -1281,13 +1501,53 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
 
     # ------------------------------------------------------------------
     # 4. pick and resolve a tradable symbol
-    #    try multiple symbols from the universe instead of just one
+    #    pre-score all candidates from CSV, then try in score order
     # ------------------------------------------------------------------
     candidates = symbols.copy()
     if rotate and len(candidates) > 1:
         import random
-
         random.shuffle(candidates)
+
+    # Pre-score: build per-symbol strategy, run against latest CSV bar, rank with PortfolioSelector
+    class _DummyRisk:
+        """Minimal stand-in for pre-scoring only (hybrid_orb_vwap calls risk.position_size)."""
+        def position_size(self, *a, **kw): return 1
+        def can_trade_now(self, *a, **kw): return True
+
+    _prescore_candidates: List[Candidate] = []
+    _csv_dir = "data"
+    _uni_tz = uni.get("timezone", "America/Chicago")
+
+    for _sym in candidates:
+        try:
+            _ov = _sym_overrides.get(_sym, {})
+            _s_raw = {**strat_cfg_raw, **_ov.get("strategy", {})}
+            _s_tick = float(_ov.get("tick_size", tick_size))
+            _s_pv   = float(_ov.get("point_value", point_value))
+            _s_orb  = int(_s_raw.get("orb_minutes", orb_min))
+            _s_type = _resolve_strategy_type(uni, _s_raw)
+            _s_strat = build_strategy(_s_type, _s_raw, _s_tick, _s_pv)
+            _s_win = _norm_windows(_s_raw.get("session_windows") or []) or windows
+
+            _csv = str(Path(_csv_dir) / f"{_symbol_to_csv_stem(_sym)}_live_1m.csv")
+            _fdf = load_features_from_csv(_csv, tz=_uni_tz, orb_minutes=_s_orb, symbol=_sym)
+            if _fdf is None or _fdf.empty:
+                continue
+
+            _bar = _fdf.iloc[-1]
+            _dec = _s_strat.maybe_signal(_bar, _s_win, _DummyRisk())
+            _score = float(_s_strat.score_signal(_bar, _dec)) if _dec else 0.0
+            _prescore_candidates.append(Candidate(symbol=_sym, action=_dec, score=_score, meta={}))
+        except Exception:
+            pass
+
+    _ranked = PortfolioSelector().choose(_prescore_candidates)
+    if _ranked:
+        # move winner to front of candidates list
+        candidates = [_ranked.symbol] + [s for s in candidates if s != _ranked.symbol]
+        print(f"[{name}] pre-score winner: {_ranked.symbol} score={_ranked.score:.3f}")
+    else:
+        print(f"[{name}] pre-score: no signal – trying candidates in order")
 
     symbol = None
     for sym in candidates:
@@ -1307,6 +1567,17 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         )
         await broker.disconnect()
         return
+
+    # Apply per-symbol config overrides (crypto_all dict-format: tick_size, strategy, etc.)
+    if symbol in _sym_overrides:
+        ov = _sym_overrides[symbol]
+        if "tick_size" in ov:
+            tick_size = float(ov["tick_size"])
+        if "point_value" in ov:
+            point_value = float(ov["point_value"])
+        if "strategy" in ov:
+            strat_cfg_raw = {**strat_cfg_raw, **ov["strategy"]}
+        orb_min = int(strat_cfg_raw.get("orb_minutes", orb_min))
 
     # ------------------------------------------------------------------
     # 4b. microlot state file (JSON)
@@ -1328,29 +1599,20 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     # ------------------------------------------------------------------
     # 5. Rolling bars + strategy + risk
     # ------------------------------------------------------------------
-    rb = RollingBars("America/Chicago", orb_min, symbol)
+    rb = RollingBars(_uni_tz, orb_min, symbol)
 
-    strat_cfg = StratConfig(
-        orb_minutes=int(strat_cfg_raw["orb_minutes"]),
-        atr_len=int(strat_cfg_raw["atr_len"]),
-        break_eps_ticks=int(strat_cfg_raw["break_eps_ticks"]),
-        atr_mult=float(strat_cfg_raw["atr_mult"]),
-        target_R=float(strat_cfg_raw["target_R"]),
-        slope_min=float(strat_cfg_raw["slope_min"]),
-        stop_pad_ticks=int(strat_cfg_raw["stop_pad_ticks"]),
-        trail_pad_ticks=int(strat_cfg_raw["trail_pad_ticks"]),
-        tick_size=float(tick_size),
-        tick_value=float(point_value),
-    )
-    strat = HybridOrbVwap(strat_cfg)
+    strategy_type = _resolve_strategy_type(uni, strat_cfg_raw)
+    strat = build_strategy(strategy_type, strat_cfg_raw, tick_size, point_value)
+    print(f"[{name}] strategy={strategy_type}")
 
+    _risk_uni = uni.get("risk", {})
     risk_cfg = RiskConfig(
         account_equity=float(lot["cash_alloc"]),
         risk_pct=float(lot["max_risk_per_trade"]),
-        max_daily_loss_R=2.0,
-        max_consec_losses=3,
+        max_daily_loss_R=float(_risk_uni.get("max_daily_loss_R", 2.0)),
+        max_consec_losses=int(_risk_uni.get("max_consec_losses", 3)),
         tick_value=float(point_value),
-        flat_time="16:00",
+        flat_time=str(_risk_uni.get("flat_time", "16:00")),
         news_lockout_minutes=0,
     )
     risk = RiskGovernor(risk_cfg)
@@ -1360,7 +1622,7 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     # ------------------------------------------------------------------
     print(f"[{name}] CWD={os.getcwd()}")
 
-    bar_log_path = Path("data") / f"{symbol}_live_1m.csv"
+    bar_log_path = Path("data") / f"{_symbol_to_csv_stem(symbol)}_live_1m.csv"
     bar_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def append_bar_to_csv(bar_norm: dict) -> None:
@@ -1385,6 +1647,87 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     MIN_FEATURE_ROWS = 5
     throttle = {"last_print_ts": 0.0,
                 "last_signal_dt": None} # throttle console spam
+    _pos = {"open": False, "entry_ts": None, "sl_id": None, "tp_id": None}
+
+    # ------------------------------------------------------------------
+    # Trade log + notifications (best-effort — never crashes the bot)
+    # ------------------------------------------------------------------
+    _trades_csv = Path("logs/trades.csv")
+    _trades_csv.parent.mkdir(parents=True, exist_ok=True)
+    _csv_header = ["ts", "lot", "symbol", "event", "side", "stop", "target", "reason"]
+    if not _trades_csv.exists():
+        with open(_trades_csv, "w", newline="") as _f:
+            csv.writer(_f).writerow(_csv_header)
+
+    def _log_trade(event: str, side: str = "", stop: float = 0.0,
+                   target: float = 0.0, reason: str = ""):
+        """Append one row to logs/trades.csv and send a Slack message."""
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        row = [ts, name, symbol, event, side, f"{stop:.4f}", f"{target:.4f}", reason]
+        try:
+            with open(_trades_csv, "a", newline="") as _f:
+                csv.writer(_f).writerow(row)
+        except Exception as _e:
+            print(f"[{name}] trade log write error: {_e}")
+        try:
+            import scripts.notify_slack as _ns
+            emoji = "🟢" if event == "ENTRY" else ("🔴" if "STOP" in reason.upper() else "🏁")
+            msg = f"{emoji} **{name}** {event} {side} {symbol}"
+            if event == "ENTRY":
+                msg += f"  stop={stop:.4f}  target={target:.4f}"
+            elif reason:
+                msg += f"  ({reason})"
+            _ns.notify(msg)
+        except Exception:
+            pass  # no webhook configured — silently skip
+
+    # Exit params (read once from config so on_bar doesn't re-parse every bar)
+    _max_hold_min = uni.get("execution", {}).get("max_hold_min")
+    _exit_on_ema  = bool(strat_cfg_raw.get("exit_on_ema", False))
+    _exit_ema_len = int(strat_cfg_raw.get("exit_ema_len", 20))
+    _exit_ema_side = str(strat_cfg_raw.get("exit_ema_side", "cross"))
+    _exit_ema_col  = f"ema_exit_{_exit_ema_len}"
+
+    # EOD flat time for IBKR lots (e.g. "15:55" ET) — ignored for crypto
+    _flat_time_str  = str(uni.get("risk", {}).get("flat_time", "")) or ""
+    _flat_fired     = {"done": False}  # reset each day via date tracking
+    _flat_last_date = {"date": None}
+
+    async def _force_close(reason: str):
+        """Cancel bracket orders and market-sell the open position (CCXT only)."""
+        if CcxtBinanceus is None or not isinstance(broker, CcxtBinanceus):
+            return
+        # Stop the bracket poll so it doesn't fire on_fill after we close
+        if hasattr(broker, '_bracket_task') and broker._bracket_task and not broker._bracket_task.done():
+            broker._bracket_task.cancel()
+        # Cancel both open orders
+        for oid, label in [(_pos.get("sl_id"), "stop"), (_pos.get("tp_id"), "target")]:
+            if oid:
+                try:
+                    await broker.exchange.cancel_order(oid, symbol)
+                    print(f"[{name}] cancelled {label} order {oid}")
+                except Exception as e:
+                    print(f"[{name}] cancel {label} {oid} error: {e}")
+        # Market sell whatever base-currency balance we hold
+        try:
+            base = symbol.split('/')[0]  # e.g. "LTC" from "LTC/USDT"
+            bal = await broker.exchange.fetch_balance()
+            coin_qty = float((bal.get(base) or {}).get('free', 0))
+            mkt = broker.exchange.markets.get(symbol, {})
+            min_amt = float(((mkt.get('limits') or {}).get('amount') or {}).get('min') or 0)
+            if coin_qty > 0 and coin_qty >= min_amt:
+                coin_qty = broker.exchange.amount_to_precision(symbol, coin_qty)
+                await broker.exchange.create_order(symbol, 'market', 'sell', coin_qty)
+                print(f"[{name}] FORCE CLOSE ({reason}): sold {coin_qty} {base}")
+                _log_trade("EXIT", reason=f"FORCE:{reason}")
+            else:
+                print(f"[{name}] FORCE CLOSE ({reason}): no {base} balance to sell ({coin_qty})")
+        except Exception as e:
+            print(f"[{name}] FORCE CLOSE error: {e} — CHECK BINANCE.US MANUALLY")
+        _pos["open"]     = False
+        _pos["entry_ts"] = None
+        _pos["sl_id"]    = None
+        _pos["tp_id"]    = None
 
     async def on_bar(bar: dict):
         if stop.is_set():
@@ -1435,6 +1778,35 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
 
         import datetime as dt
         import pytz
+
+        # --- EOD flat for IBKR lots (crypto ignored — flat_time_str is empty) ---
+        if _flat_time_str and hasattr(broker, 'flatten_all'):
+            try:
+                _tz_et = pytz.timezone("America/New_York")
+                _now_et = datetime.now(timezone.utc).astimezone(_tz_et)
+                _today  = _now_et.date()
+                # Reset the fired flag each new calendar day
+                if _flat_last_date["date"] != _today:
+                    _flat_last_date["date"] = _today
+                    _flat_fired["done"]     = False
+                if not _flat_fired["done"]:
+                    _fh, _fm = map(int, _flat_time_str.split(":"))
+                    _flat_dt = _tz_et.localize(dt.datetime.combine(_today, dt.time(_fh, _fm)))
+                    if datetime.now(timezone.utc) >= _flat_dt.astimezone(timezone.utc):
+                        print(f"[{name}] EOD flat: cancelling orders and flattening positions at {_flat_time_str} ET")
+                        _flat_fired["done"] = True
+                        _log_trade("EXIT", reason="EOD_FLAT")
+                        try:
+                            await broker.flatten_all()
+                        except Exception as _fe:
+                            print(f"[{name}] EOD flatten_all error: {_fe}")
+                        _pos["open"]     = False
+                        _pos["entry_ts"] = None
+                        _pos["sl_id"]    = None
+                        _pos["tp_id"]    = None
+            except Exception as _eod_e:
+                print(f"[{name}] EOD flat check error: {_eod_e}")
+
         # Make sure latest has t_local, since the strategy uses it.
         # If your RollingBars.features() already includes t_local, this won't overwrite it.
         if "t_local" not in latest.index:
@@ -1458,6 +1830,34 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         order = decision["order"]
         bracket = decision["bracket"]
 
+        if _pos["open"]:
+            # --- time-based exit ---
+            if _max_hold_min and _pos.get("entry_ts"):
+                try:
+                    import datetime as _dt2
+                    entry_dt  = _dt2.datetime.fromisoformat(str(_pos["entry_ts"]).replace("Z", "+00:00"))
+                    cur_dt    = _dt2.datetime.fromisoformat(str(bar_norm["datetime"]).replace("Z", "+00:00"))
+                    elapsed_m = (cur_dt - entry_dt).total_seconds() / 60.0
+                    if elapsed_m >= _max_hold_min:
+                        await _force_close(f"max_hold_min={_max_hold_min} elapsed={elapsed_m:.0f}m")
+                        return
+                except Exception as _e:
+                    print(f"[{name}] max_hold_min parse error: {_e}")
+            # --- EMA touch/cross exit (for long mean-reversion positions) ---
+            if _exit_on_ema and _exit_ema_col in latest.index:
+                try:
+                    ema_val   = float(latest[_exit_ema_col])
+                    close_val = float(latest["close"])
+                    hit = (close_val >= ema_val) if _exit_ema_side == "touch" else (close_val > ema_val)
+                    if hit:
+                        await _force_close(
+                            f"exit_on_ema({_exit_ema_side}) close={close_val:.4f} ema={ema_val:.4f}"
+                        )
+                        return
+                except Exception as _e:
+                    print(f"[{name}] exit_on_ema check error: {_e}")
+            return  # still in position, no exit triggered
+
         state.trade_count += 1
         state.last_decision_ts = now_iso
         state.last_side = order.side
@@ -1475,32 +1875,115 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         tif = "DAY" if lot["broker"].startswith("ibkr") else None
         outside_rth = False if lot["broker"].startswith("ibkr") else None
 
+        # For CCXT: qty=1 from strategy is a placeholder; replace with risk-based USD notional.
+        # place_bracket_market expects qty in USD (it divides by price to get coin amount).
+        if CcxtBinanceus is not None and isinstance(broker, CcxtBinanceus):
+            cash_alloc = float(lot.get("cash_alloc", 100))
+            stop_dist = abs(float(bracket.stop_price) - float(latest["close"]))
+            if stop_dist > 0:
+                risk_usd = cash_alloc * float(lot.get("max_risk_per_trade", 0.0075))
+                order_qty = risk_usd * float(latest["close"]) / stop_dist
+            else:
+                order_qty = cash_alloc * 0.5
+            # hard cap: never spend more than the lot's cash allocation in one trade
+            order_qty = min(order_qty, cash_alloc)
+        else:
+            order_qty = int(order.qty)
+
         try:
             trades = await broker.place_bracket_market(
                 side=order.side,
-                qty=int(order.qty),
+                qty=order_qty,
                 stop_price=float(bracket.stop_price),
                 target_price=float(bracket.target_price),
                 tif=tif,
                 outsideRth=outside_rth,
             )
-            print(f"[{name}] submitted bracket for {order.symbol}, trades={trades}")
+            # trades: [0]=market parent, [1]=stop_loss, [2]=target limit
+            sl_id = str(trades[1].order.orderId)
+            tp_id = str(trades[2].order.orderId)
+            _pos["open"]     = True
+            _pos["entry_ts"] = bar_norm["datetime"]
+            _pos["sl_id"]    = sl_id
+            _pos["tp_id"]    = tp_id
+            print(f"[{name}] submitted bracket for {order.symbol} sl={sl_id} tp={tp_id}")
+            _log_trade("ENTRY", side=order.side,
+                       stop=float(bracket.stop_price), target=float(bracket.target_price))
+
+            # CCXT: start background OCA monitor (cancels loser when winner fills)
+            if hasattr(broker, 'watch_bracket'):
+                def _on_fill(filled_id):
+                    reason = "TARGET" if filled_id == tp_id else "STOP"
+                    print(f"[{name}] bracket closed: {reason}")
+                    _log_trade("EXIT", reason=reason)
+                    _pos["open"]     = False
+                    _pos["entry_ts"] = None
+                    _pos["sl_id"]    = None
+                    _pos["tp_id"]    = None
+                broker.watch_bracket(sl_id, tp_id, on_fill=_on_fill)
+
+        except BracketOrphanError as e:
+            # Market buy succeeded but bracket + emergency close both failed.
+            # Lock the lot to prevent re-entry — manual close required on Binance.US.
+            print(f"[{name}] CRITICAL: orphaned position — {e}")
+            print(f"[{name}] Lot LOCKED until manual close — sell {symbol} on Binance.US then restart")
+            _pos["open"]     = True
+            _pos["entry_ts"] = bar_norm["datetime"]
+            _pos["sl_id"]    = None
+            _pos["tp_id"]    = None
+
         except Exception as e:
             print(f"[{name}] ERROR placing bracket: {e}")
 
 
     # ------------------------------------------------------------------
-    # 7. start stream + wait
+    # 7. crash-recovery: restore _pos from any open bracket on Binance.US
+    # ------------------------------------------------------------------
+    if CcxtBinanceus is not None and isinstance(broker, CcxtBinanceus) and not dry_run:
+        try:
+            open_orders = await broker.exchange.fetch_open_orders(symbol)
+            stop_orders   = [o for o in open_orders if o.get('type') in ('stop_loss_limit', 'stop', 'stop_loss')]
+            target_orders = [o for o in open_orders if o.get('type') == 'limit']
+            if stop_orders and target_orders:
+                recovered_sl = str(stop_orders[0]['id'])
+                recovered_tp = str(target_orders[0]['id'])
+                _pos["open"]     = True
+                _pos["sl_id"]    = recovered_sl
+                _pos["tp_id"]    = recovered_tp
+                # Use current time so max_hold_min countdown starts fresh after restart
+                _pos["entry_ts"] = datetime.now(timezone.utc).isoformat()
+                print(f"[{name}] RECOVERY: open bracket found — sl={recovered_sl} tp={recovered_tp} — resuming watch")
+                if hasattr(broker, 'watch_bracket'):
+                    def _on_fill_recovered(filled_id):
+                        reason = "TARGET" if filled_id == _pos["tp_id"] else "STOP"
+                        print(f"[{name}] recovered bracket closed: {reason}")
+                        _pos["open"]     = False
+                        _pos["entry_ts"] = None
+                        _pos["sl_id"]    = None
+                        _pos["tp_id"]    = None
+                    broker.watch_bracket(recovered_sl, recovered_tp, on_fill=_on_fill_recovered)
+            elif open_orders:
+                print(f"[{name}] RECOVERY: {len(open_orders)} open order(s) found but can't match stop+target "
+                      f"— check Binance.US manually. Types: {[o.get('type') for o in open_orders]}")
+            else:
+                print(f"[{name}] RECOVERY: no open orders on {symbol} — clean startup")
+        except Exception as e:
+            print(f"[{name}] RECOVERY check failed: {e} — assuming clean startup")
+
+    # ------------------------------------------------------------------
+    # 8. start stream + wait
     # ------------------------------------------------------------------
     def _task_done(t: asyncio.Task):
+        if t.cancelled():
+            return
         exc = t.exception()
         if exc:
             print(f"[{name}] bar_task crashed: {type(exc).__name__}: {exc}")
         else:
             print(f"[{name}] bar_task ended cleanly")
-    
-    
-    
+
+
+
     bar_task = asyncio.create_task(
         broker.stream_realtime_bars(
             on_bar=on_bar,

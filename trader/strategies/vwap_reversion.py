@@ -183,3 +183,24 @@ class VwapReversion:
 
         return {"order": order, "bracket": bracket, "stop_dist_points": abs(entry_price - stop)}
 
+    def score_signal(self, bar, decision) -> float:
+        if not decision:
+            return 0.0
+        try:
+            atr = float(bar.get("atr", 0.0) or 0.0)
+            if atr <= 0:
+                return 0.0
+            entry_px = float(bar.get("close", 0.0) or 0.0)
+            vwap = float(bar.get("vwap", entry_px) or entry_px)
+            stop_dist = float(decision.get("stop_dist_points", 0.0) or 0.0)
+            if stop_dist <= 0:
+                return 0.0
+            target_px = float(decision["bracket"].target_price)
+            tgt_dist = abs(target_px - entry_px)
+            rr = tgt_dist / stop_dist
+            # Mean-reversion quality: more extended from VWAP = stronger setup
+            dist_atr = abs(entry_px - vwap) / atr
+            return float(rr + 0.5 * dist_atr)
+        except Exception:
+            return 0.0
+

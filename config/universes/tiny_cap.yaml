@@ -1,15 +1,11 @@
 symbols:
-  - F
-  - NOK
-  - SIRI
-  - LYG
-  - ITUB
-  - HBAN
-  - SNDL
-  - GSAT
+  - SOFI
+  - MARA
+  - JOBY
 
 asset_class: equity
 exchange: ibkr
+timezone: America/New_York
 
 backfill:
   days: 30
@@ -21,6 +17,9 @@ rotate: true
 
 strategy_name: TinyCapBreakout
 strategy:
+  session_windows:
+    - start: "09:30"
+      end: "15:55"
   orb_minutes: 5
   atr_len: 14
   break_eps_ticks: 3

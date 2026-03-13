@@ -185,22 +185,27 @@ def _norm_strat_name(name: str) -> str:
     key = s.replace("-", "_").replace(" ", "_").lower()
 
     aliases = {
-        # ORB
-        "hybrid_orb_vwap": "HybridOrbVwap",
-        "hybridorbvwap": "HybridOrbVwap",
-        "orb_vwap": "HybridOrbVwap",
+        # ORB / breakout variants
+        "hybrid_orb_vwap":    "HybridOrbVwap",
+        "hybridorbvwap":      "HybridOrbVwap",
+        "orb_vwap":           "HybridOrbVwap",
+        "orb":                "HybridOrbVwap",
+        "tinycapbreakout":    "HybridOrbVwap",   # tiny_cap.yaml uses ORB params
+        "leveredetfbreakout": "HybridOrbVwap",   # levered_etf.yaml uses ORB params
 
-        # Reversion
-        "vwap_reversion": "VwapReversion",
-        "vwapreversion": "VwapReversion",
+        # VWAP reversion
+        "vwap_reversion":     "VwapReversion",
+        "vwapreversion":      "VwapReversion",
+        "vwap":               "VwapReversion",
 
-        # Pullback
-        "trend_pullback": "TrendPullback",
-        "trendpullback": "TrendPullback",
+        # Trend pullback
+        "trend_pullback":     "TrendPullback",
+        "trendpullback":      "TrendPullback",
 
-        # RSI Mean Reversion
+        # RSI mean reversion
         "rsi_mean_reversion": "RsiMeanReversion",
-        "rsimeanreversion": "RsiMeanReversion",
+        "rsimeanreversion":   "RsiMeanReversion",
+        "rsi":                "RsiMeanReversion",
     }
 
     return aliases.get(key, s)  # if already "VwapReversion", keep it
@@ -667,10 +672,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     # base_strategy_cfg = dict((cfg.get("strategy") or {}))
     base_strategy_name = (base_strategy_cfg.get("name") or "").strip()
 
-    print(f"[UNI.CFG] is_none={universe_cfg is None} type={type(universe_cfg)} keys={list((universe_cfg or {}).keys())}")
-    rows = (universe_cfg or {}).get("symbols")
-    print(f"[UNI.SYMS] type={type(rows)} len={len(rows) if isinstance(rows, list) else 'NA'} sample0={rows[0] if isinstance(rows, list) and rows else None}")
-    print(f"[UNI.SYM.NORM] target={_norm_sym(symbol)} sample0_norm={_norm_sym(rows[0].get('symbol')) if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None}")
 
     # ✅ Per-symbol overrides (NEW)
     sym_row = _find_symbol_row(universe_cfg, symbol)
@@ -698,9 +699,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
             cfg.setdefault("risk", {})
             cfg["risk"] = deep_merge(cfg.get("risk", {}), sym_row.get("risk", {}))
 
-        print(f"[SYM.OVR] {symbol} applied keys={list(sym_row.keys())}")
-    else:
-        print(f"[SYM.OVR] {symbol} none")
 
     # ---- Contract / fees ----
     ct = _resolve_contract_for_symbol(symbol, args.contracts, universe_cfg)
@@ -738,7 +736,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     tick_value = float(cfg["fees"]["tick_value"])
     fees["dpp"] = float(fees["tick_value"]) / float(fees["tick_size"])
     dpp = float(fees["dpp"])
-    print(f"[DPP] {symbol} dollars_per_point={dpp} (tick_value={tick_value}, tick_size={tick_size})")
 
     asset_class = str((universe_cfg or {}).get("asset_class", "")).lower()
     if asset_class == "crypto" and abs(dpp - 1.0) > 1e-6:
@@ -762,10 +759,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         "fees": cfg.get("fees"),
         "timezone": cfg.get("timezone"),
     }
-    print(f"[RUN.FP] {symbol} fp={_fingerprint(finger_obj)}")
-
-    print(f"[CT] {symbol} ct={ct}")
-    print(f"[FEES] {symbol} fees={cfg['fees']}")
 
     if not csv_path or not os.path.exists(csv_path):
         return {
@@ -798,80 +791,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         exit_ema_len=int(cfg["strategy"].get("exit_ema_len", 20)),
     )
 
-    sc = cfg["strategy"]
-    print(
-        f"[EMA CFG] {symbol} exit_on_ema={bool(sc.get('exit_on_ema', False))} "
-        f"exit_ema_len={int(sc.get('exit_ema_len', 20))} "
-        f"exit_ema_side={str(sc.get('exit_ema_side', 'cross')).strip().lower()}"
-    )
-
-    if bool(sc.get("exit_on_ema", False)):
-        col = f"ema_exit_{int(sc.get('exit_ema_len', 20))}"
-        print(f"[EMA COL] {symbol} has={col in df.columns}")
-
-
-    # ---- Sanity: EMA exit column exists ----
-    if bool(cfg["strategy"].get("exit_on_ema", False)):
-        col = f"ema_exit_{int(cfg['strategy'].get('exit_ema_len', 20))}"
-        print(
-            "[CHK] exit ema col exists:",
-            col in df.columns,
-            "head:",
-            df[col].head(3).tolist() if col in df.columns else None,
-        )
-
-
-    print("[CHK] cols:", [c for c in ["ema_slope_atr","ema_dist_atr","ema_slope","atr"] if c in df.columns])
-    print("[CHK] ema_slope_atr head:", df["ema_slope_atr"].head(3).tolist())
-    # ---- DIAG: TrendPullback sanity (ATR + slope scaling) ----
-    # Make sure these exist; if not, you'll see it immediately.
-    for c in ["close", "atr", "ema_slope_atr"]:
-        if c not in df.columns:
-            print(f"[DIAG][MISSING] {symbol} missing column: {c}")
-
-    # Coerce to numeric and clean
-    close_s = pd.to_numeric(df.get("close"), errors="coerce")
-    atr_s   = pd.to_numeric(df.get("atr"), errors="coerce")
-    slope_atr_s = pd.to_numeric(df.get("ema_slope_atr"), errors="coerce")
-
-    # ATR percent of price
-    atr_pct = (atr_s / close_s).replace([np.inf, -np.inf], np.nan)
-
-    def _q(series, name):
-        s = series.dropna()
-        if len(s) == 0:
-            print(f"[DIAG] {symbol} {name}: EMPTY after dropna")
-            return
-        q = s.quantile([0.5, 0.9, 0.99]).to_dict()
-        print(f"[DIAG] {symbol} {name} p50/p90/p99: {q} (n={len(s)})")
-
-    _q(atr_s, "atr")
-    _q(atr_pct, "atr_pct")
-    _q(slope_atr_s, "ema_slope_atr")
-
-
-    if symbol == "XRP/USDT":
-        s = pd.to_numeric(df["ema_slope"], errors="coerce").dropna()
-        a = pd.to_numeric(df["atr"], errors="coerce").replace(0, np.nan)
-        s_atr = (s / a).replace([np.inf, -np.inf], np.nan).dropna()
-
-        print("[DIAG][XRP] ema_slope p50/p90/p99:", s.quantile([0.5,0.9,0.99]).to_dict())
-        print("[DIAG][XRP] ema_slope_atr p50/p90/p99:", s_atr.quantile([0.5,0.9,0.99]).to_dict())
-        print("[DIAG][XRP] ema_dist_atr p50/p90/p99:", pd.to_numeric(df["ema_dist_atr"], errors="coerce").dropna().quantile([0.5,0.9,0.99]).to_dict())
-        print("[DIAG][XRP] vwap_slope p50/p90/p99:", pd.to_numeric(df["vwap_slope"], errors="coerce").dropna().quantile([0.5,0.9,0.99]).to_dict())
-
-    ratio = (df["close"] - df["vwap"]).abs() / df["atr"].replace(0, np.nan)
-    ratio = ratio.replace([np.inf, -np.inf], np.nan)
-    print(f"[DIAG] dist_from_vwap_atr valid={ratio.notna().mean():.4f} nan={ratio.isna().mean():.4f}")
-    print(f"[DIAG] dist_from_vwap_atr pct>=0.9: {(ratio >= 0.9).mean():.4f}")
-    print(f"[DIAG] dist_from_vwap_atr pct>=1.5: {(ratio >= 1.5).mean():.4f}")
-    print(f"[DIAG] dist_from_vwap_atr p50/p90/p99: {ratio.quantile([0.5,0.9,0.99]).to_dict()}")
-
-    # ---- DEBUG: timestamp sanity (do this BEFORE any filtering/sorting) ----
-    print(f"[TSCHK] {symbol} index[:3] = {list(df.index[:3])}")
-    print(f"[TSCHK] {symbol} t_local head3 = {df['t_local'].head(3).tolist()}")
-    print(f"[TSCHK] {symbol} t_local tail3 = {df['t_local'].tail(3).tolist()}")
-    print(f"[TSCHK] {symbol} date head/tail = {df['date'].iloc[0]} -> {df['date'].iloc[-1]}")
 
     #df = prepare_bars(df, tz=tz, orb_minutes=orb_minutes)
 
@@ -947,10 +866,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     print(
         f"[SANITY] {symbol} bars={len(df)} tradable={int(tradable.sum())} tradable_pct={float(tradable.mean()) if len(df) else 0.0}"
     )
-    print(f"[SANITY] {symbol} index first/last: {df.index[0]} -> {df.index[-1]}")
-    print(f"[SANITY] {symbol} tod min/max: {df.index.strftime('%H:%M').min()} -> {df.index.strftime('%H:%M').max()}")
-
-    print(f"[SANITY] {symbol} dates: {df['date'].min()} -> {df['date'].max()}")
 
     # ---- Order manager / execution ----
     dpp = float(fees["dpp"])  # dollars per full point
@@ -977,13 +892,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         fee_fixed  = 0.0
         slip_bps   = 0.0
 
-    print(
-    f"[FRICTION] {symbol} commission={commission} exch_fees={exch_fees} "
-    f"fee_bps={fee_bps} fee_fixed={fee_fixed} slip_bps={slip_bps} "
-    f"no_friction={getattr(args,'no_friction', False)}\n"
-    f"[FEES.EFF] {symbol} tick_size={fees.get('tick_size')} tick_value={fees.get('tick_value')} "
-    f"commission={commission} exch={exch_fees} fee_bps={fee_bps} fee_fixed={fee_fixed} slip_bps={slip_bps}"
-    )
 
 
     om = OrderManager(
@@ -999,7 +907,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     
 
     # ---- Strategy ----
-    print(f"[CFG] {symbol} orb={sc.get('orb_minutes')} atr_mult={sc.get('atr_mult')} slope_min={sc.get('slope_min')}")
 
     raw_name = (
         (cfg.get("strategy") or {}).get("name")
@@ -1017,7 +924,6 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
     assert_locked_strategy_complete(cfg, symbol=symbol, strategy_name=strategy_name, strategy_cfg=cfg.get("strategy"))
 
     strat = build_strategy(strategy_name, cfg["strategy"], fees)
-    print(f"[STRAT.CFG] {symbol} {type(strat).__name__} cfg={getattr(strat, 'cfg', None)}")
 
     # ---- Run manifest (after strategy exists; before sim loop) ----
     strat_cfg_obj = getattr(strat, "cfg", None)
@@ -1177,6 +1083,7 @@ def run_one_symbol(*, args, symbol: str, csv_path: str, universe_cfg: dict | Non
         })
 
         om.realized_pnl = float(getattr(om, "realized_pnl", 0.0)) + float(pnl)
+        om._flat()  # clear internal position so new-day reset doesn't re-open it
         if crypto_like and abs((float(cfg["fees"]["tick_value"]) / float(cfg["fees"]["tick_size"])) - 1.0) > 1e-6:
             print(f"[WARN] crypto_like but dpp != 1: tick_value={cfg['fees']['tick_value']} tick_size={cfg['fees']['tick_size']}")
         print(f"[PNL.DBG] {symbol} side={side} qty={qty} entry={entry_px} exit={px} pnl={pnl} crypto_like={crypto_like} dpp={locals().get('dpp', None)}")
@@ -1905,6 +1812,8 @@ def main():
 
 
 
+    if args.universe:
+        args.universe = _resolve_universe_path(args.universe)
     universe_cfg = _load_yaml_if_exists(args.universe) or {}
 
     asset_class = (universe_cfg.get("asset_class") or "").lower()

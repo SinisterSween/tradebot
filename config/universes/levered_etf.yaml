@@ -6,6 +6,7 @@ symbols:
 
 asset_class: equity
 exchange: ibkr
+timezone: America/New_York
 
 backfill:
   days: 30
@@ -17,6 +18,9 @@ rotate: true
 
 strategy_name: LeveredEtfBreakout
 strategy:
+  session_windows:
+    - start: "09:30"
+      end: "15:55"
   
   orb_minutes: 10
   atr_len: 14

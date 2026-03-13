@@ -83,6 +83,48 @@ class RsiMeanReversion:
         # both should be tz-aware timestamps
         delta = ts_now - self._last_trade_ts
         return delta.total_seconds() / 60.0
+    
+    def score_signal(self, bar, decision) -> float:
+        """
+        Higher score = better setup.
+        Uses only fields already required by maybe_signal().
+        """
+        if not decision:
+            return 0.0
+
+        try:
+            close = float(bar.get("close", 0.0) or 0.0)
+            atr = float(bar.get("atr", 0.0) or 0.0)
+            if close <= 0 or atr <= 0:
+                return 0.0
+
+            side = str(decision["order"].side).upper()
+            rsi = float(bar.get("rsi", 50.0) or 50.0)
+
+            # How stretched from VWAP (ATR-normalized) — you already gate on this
+            dist_vwap_atr = float(bar.get("dist_from_vwap_atr", 0.0) or 0.0)
+
+            # Mean reversion likes flatter VWAP slope and acceptable EMA regime
+            vwap_slope = abs(float(bar.get("vwap_slope", 0.0) or 0.0))
+            ema_slope_atr = abs(float(bar.get("ema_slope_atr", 0.0) or 0.0))
+
+            # RSI extremeness: lower RSI for BUY, higher RSI for SELL
+            if side == "BUY":
+                rsi_edge = max(0.0, float(self.cfg.rsi_buy_below) - rsi)
+            else:
+                rsi_edge = max(0.0, rsi - float(self.cfg.rsi_sell_above))
+
+            # Favor bigger stretch + bigger RSI edge, penalize trending regimes
+            score = 0.0
+            score += 2.0 * dist_vwap_atr
+            score += 0.5 * (rsi_edge / 10.0)          # normalize a bit
+            score -= 1.0 * vwap_slope
+            score -= 0.5 * ema_slope_atr
+
+            return float(score)
+        except Exception:
+            return 0.0
+
 
     def maybe_signal(self, bar, windows, risk):
         def reject(reason: str):

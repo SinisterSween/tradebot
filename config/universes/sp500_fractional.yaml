@@ -15,6 +15,7 @@ symbols:
   - CRM
 asset_class: equity
 exchange: ibkr
+timezone: America/New_York
 
 backfill:
   days: 30
@@ -25,9 +26,9 @@ point_value: 1
 fractional: true
 rotate: true
 
-strategy_name: TrendPullback
+strategy_name: hybrid_orb_vwap
 strategy:
-  orb_minutes: 10
+  orb_minutes: 15
   atr_len: 14
   break_eps_ticks: 2
   atr_mult: 1.0
@@ -35,6 +36,9 @@ strategy:
   slope_min: 0.06
   stop_pad_ticks: 2
   trail_pad_ticks: 2
+  session_windows:
+    - start: "09:30"
+      end: "15:55"
 
 execution:
   max_hold_min: 60

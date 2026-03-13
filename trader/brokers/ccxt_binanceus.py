@@ -11,6 +11,15 @@ import ccxt.pro as ccxt  # async ccxt
 from ib_insync import Trade, Order, MarketOrder, LimitOrder, StopOrder
 
 
+class BracketOrphanError(Exception):
+    """
+    Raised when a market entry succeeded but bracket placement failed AND
+    the emergency close also failed.  The position is open on Binance.US
+    with no protective orders — the caller must lock _pos and alert the user.
+    """
+    pass
+
+
 class CcxtBinanceus:
     def __init__(self, api_key: str, secret: str, sandbox: bool = False):
         self.exchange = ccxt.binanceus({
@@ -23,6 +32,7 @@ class CcxtBinanceus:
         self.symbols: List[str] = []          # set later
         self.contract: Optional[str] = None   # "BTC/USDC"
         self._balances = {}
+        self._bracket_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Connection helpers
@@ -78,37 +88,62 @@ class CcxtBinanceus:
         if self.contract is None:
             raise RuntimeError("Contract not resolved")
 
-        # 1) current price
-        ticker = await self.exchange.watch_ticker(self.contract)
+        # 1) current price via REST (no persistent subscription)
+        ticker = await self.exchange.fetch_ticker(self.contract)
         price = float(ticker['last'])
-        await self.exchange.stop_ticker(self.contract)  # stop the watch stream
 
-        # 2) base currency amount
+        # 2) base currency amount (qty is USD notional)
         amount = qty / price
-        min_amount = self.exchange.markets[self.contract]['limits']['amount']['min']
+        min_amount = self.exchange.markets[self.contract]['limits']['amount']['min'] or 0.0
         if amount < min_amount:
-            amount = min_amount  # floor to exchange minimum
+            amount = min_amount
         amount = self.exchange.amount_to_precision(self.contract, amount)
 
-        # 3) create orders
+        # 2b) USDT balance check — don't enter if we can't afford it
+        quote_currency = self.contract.split('/')[1]  # e.g. "USDT" from "LTC/USDT"
+        bal = await self.exchange.fetch_balance()
+        usdt_free = float(bal.get(quote_currency, {}).get('free', 0))
+        cost_estimate = float(amount) * price
+        if usdt_free < cost_estimate * 1.01:  # 1% buffer for fees
+            raise RuntimeError(
+                f"[BINANCEUS] {self.contract}: insufficient {quote_currency} balance "
+                f"({usdt_free:.2f} available, ~{cost_estimate:.2f} needed) — skipping order"
+            )
+
+        # 3) create orders: [market, stop_loss, target]
         trades = []
-        # parent market
-        params = {}
-        order = await self.exchange.create_order(self.contract, 'market', side.lower(), amount, params=params)
-        parent_trade = self._to_fake_ib_trade(order)
-        trades.append(parent_trade)
+        entry_order = await self.exchange.create_order(self.contract, 'market', side.lower(), amount)
+        trades.append(self._to_fake_ib_trade(entry_order))
 
-        # stop loss
-        stop_side = 'sell' if side.lower() == 'buy' else 'buy'
-        stop_order = await self.exchange.create_order(self.contract, 'stop_loss_limit', stop_side,
-                                                      amount, stop_price, params={'stopPrice': stop_price})
-        trades.append(self._to_fake_ib_trade(stop_order))
+        # 3b) wait 1s for settlement so coins are available for stop/target sell orders
+        await asyncio.sleep(1)
 
-        # target
-        target_side = 'sell' if side.lower() == 'buy' else 'buy'
-        target_order = await self.exchange.create_order(self.contract, 'limit', target_side,
-                                                        amount, target_price)
-        trades.append(self._to_fake_ib_trade(target_order))
+        # stop + target — if either fails, emergency-close the entry position
+        close_side = 'sell' if side.lower() == 'buy' else 'buy'
+        try:
+            # stop loss — market order triggered at stop_price (fills even through gaps)
+            stop_order = await self.exchange.create_order(
+                self.contract, 'stop_loss', close_side, amount,
+                params={'stopPrice': self.exchange.price_to_precision(self.contract, stop_price)}
+            )
+            trades.append(self._to_fake_ib_trade(stop_order))
+
+            # target limit
+            target_order = await self.exchange.create_order(self.contract, 'limit', close_side,
+                                                            amount, target_price)
+            trades.append(self._to_fake_ib_trade(target_order))
+        except Exception as e:
+            print(f"[BINANCEUS] bracket placement failed after entry: {e} — emergency closing position")
+            try:
+                await self.exchange.create_order(self.contract, 'market', close_side, amount)
+                print(f"[BINANCEUS] emergency close sent for {self.contract}")
+            except Exception as e2:
+                # Entry is open, bracket failed, emergency close failed — caller must lock the lot
+                raise BracketOrphanError(
+                    f"entry placed but bracket+emergency_close both failed: {e2}"
+                ) from e
+            raise
+
         return trades
 
     async def place_bracket_limit(self, side: str, qty: int, limit_price: float,
@@ -119,30 +154,29 @@ class CcxtBinanceus:
         if self.contract is None:
             raise RuntimeError("Contract not resolved")
 
-        ticker = await self.exchange.watch_ticker(self.contract)
+        ticker = await self.exchange.fetch_ticker(self.contract)
         price = float(ticker['last'])
-        await self.exchange.stop_ticker(self.contract)
 
         amount = qty / price
-        min_amount = self.exchange.markets[self.contract]['limits']['amount']['min']
+        min_amount = self.exchange.markets[self.contract]['limits']['amount']['min'] or 0.0
         if amount < min_amount:
             amount = min_amount
         amount = self.exchange.amount_to_precision(self.contract, amount)
 
         trades = []
-        # parent limit
-        params = {}
-        order = await self.exchange.create_order(self.contract, 'limit', side.lower(), amount,
-                                                 limit_price, params=params)
+        order = await self.exchange.create_order(self.contract, 'limit', side.lower(), amount, limit_price)
         trades.append(self._to_fake_ib_trade(order))
 
-        # stop
         stop_side = 'sell' if side.lower() == 'buy' else 'buy'
-        stop_order = await self.exchange.create_order(self.contract, 'stop_loss_limit', stop_side,
-                                                      amount, stop, params={'stopPrice': stop})
+        stop_limit = self.exchange.price_to_precision(
+            self.contract, stop * (0.995 if stop_side == 'sell' else 1.005)
+        )
+        stop_order = await self.exchange.create_order(
+            self.contract, 'stop_loss_limit', stop_side, amount, stop_limit,
+            params={'stopPrice': self.exchange.price_to_precision(self.contract, stop)}
+        )
         trades.append(self._to_fake_ib_trade(stop_order))
 
-        # target
         target_side = 'sell' if side.lower() == 'buy' else 'buy'
         target_order = await self.exchange.create_order(self.contract, 'limit', target_side,
                                                         amount, target)
@@ -171,9 +205,22 @@ class CcxtBinanceus:
             else:
                 on_bar(d)
 
-        # 1) historical back-fill
+        # 1) historical back-fill (retry on timeout — 4 symbols hit API simultaneously)
         since = self.exchange.milliseconds() - preload_days * 24 * 60 * 60 * 1000
-        ohlcv = await self.exchange.fetch_ohlcv(self.contract, timeframe='1m', since=since, limit=prefill_n)
+        ohlcv = []
+        for attempt in range(5):
+            try:
+                ohlcv = await self.exchange.fetch_ohlcv(self.contract, timeframe='1m', since=since, limit=prefill_n)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if attempt == 4:
+                    print(f"[BINANCEUS] {self.contract} backfill failed after 5 attempts: {e} — continuing with empty history")
+                    break
+                wait = 10 * (attempt + 1)
+                print(f"[BINANCEUS] {self.contract} backfill retry {attempt+1}/5 in {wait}s: {e}")
+                await asyncio.sleep(wait)
         for row in ohlcv[-prefill_n:]:
             ts, o, h, l, c, v = row
             await _emit({
@@ -217,8 +264,53 @@ class CcxtBinanceus:
             await self.exchange.create_order(symbol, 'market', side, amount)
 
     def on_exec_details(self, handler: Callable):
-        # CCXT has no unified execDetails event; we ignore for now
-        pass
+        # stored but not used in microlot path (microlot uses watch_bracket instead)
+        self._exec_handler = handler
+
+    # ------------------------------------------------------------------
+    # Bracket order monitor (OCA equivalent for spot)
+    # ------------------------------------------------------------------
+    def watch_bracket(self, stop_id: str, target_id: str, on_fill=None):
+        """
+        Start a background task that polls stop/target orders every 30s.
+        When one fills, cancels the other and calls on_fill(filled_id).
+        """
+        if self._bracket_task and not self._bracket_task.done():
+            self._bracket_task.cancel()
+        self._bracket_task = asyncio.create_task(
+            self._bracket_poll(stop_id, target_id, on_fill)
+        )
+
+    async def _bracket_poll(self, stop_id: str, target_id: str, on_fill=None):
+        while True:
+            await asyncio.sleep(30)
+            try:
+                s = await self.exchange.fetch_order(stop_id, self.contract)
+                t = await self.exchange.fetch_order(target_id, self.contract)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[BINANCEUS] bracket poll error: {e}")
+                continue
+
+            if s.get('status') in ('closed', 'filled'):
+                try:
+                    await self.exchange.cancel_order(target_id, self.contract)
+                except Exception as e:
+                    print(f"[BINANCEUS] cancel target {target_id}: {e}")
+                print(f"[BINANCEUS] {self.contract} STOP filled — target cancelled")
+                if on_fill:
+                    on_fill(stop_id)
+                break
+            elif t.get('status') in ('closed', 'filled'):
+                try:
+                    await self.exchange.cancel_order(stop_id, self.contract)
+                except Exception as e:
+                    print(f"[BINANCEUS] cancel stop {stop_id}: {e}")
+                print(f"[BINANCEUS] {self.contract} TARGET filled — stop cancelled")
+                if on_fill:
+                    on_fill(target_id)
+                break
 
     async def start_pnl_stream(self, account: Optional[str], conId: Optional[int], handler: Callable):
         # polling version

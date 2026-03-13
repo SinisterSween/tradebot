@@ -1,0 +1,47 @@
+symbols:
+  - LTC/USDT
+asset_class: crypto
+exchange: binanceus
+timezone: UTC
+
+backfill:
+  days: 180
+  timeframe: "1m"
+  limit_per_call: 1000
+
+tick_size: 0.01
+point_value: 1
+trade_min_qty: 0.01
+
+risk:
+  flat_time: "23:59"
+  max_notional_pct: 0.10
+  min_notional_usd: 10
+  max_daily_loss_R: 999
+  max_consec_losses: 999
+
+execution:
+  be_lock_min: 14
+  be_req_profit_ticks: 1
+  max_hold_min: 45
+
+strategy_name: rsi_mean_reversion
+strategy:
+  allow_longs: true
+  allow_shorts: false
+  rsi_len: 14
+  rsi_buy_below: 28
+  rsi_sell_above: 72
+  atr_len: 14
+  atr_mult: 0.8
+  target_R: 0.25
+  stop_pad_ticks: 15
+  exit_on_ema: true
+  exit_ema_len: 20
+  exit_ema_side: touch
+  ema_dist_atr_min: 5.0
+  target_vwap: false
+  min_atr_pct: 0.00005
+  session_windows:
+    - start: "00:00"
+      end: "23:59"

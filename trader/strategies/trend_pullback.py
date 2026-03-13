@@ -23,6 +23,37 @@ class TrendPullback:
 
     def window_ok(self, ts_local_str: str, windows) -> bool:
         return any(w["start"] <= ts_local_str <= w["end"] for w in windows)
+    
+    def score_signal(self, bar, decision) -> float:
+        if not decision:
+            return 0.0
+
+        try:
+            atr = float(bar.get("atr", 0.0) or 0.0)
+            if atr <= 0:
+                return 0.0
+
+            slope = abs(float(bar.get("vwap_slope", 0.0) or 0.0))
+
+            stop_dist_pts = float(decision.get("stop_dist_points", 0.0) or 0.0)
+            if stop_dist_pts <= 0:
+                return 0.0
+
+            entry_px = float(bar.get("close", 0.0) or 0.0)
+            target_px = float(decision["bracket"].target_price)
+            tgt_dist = abs(target_px - entry_px)
+            r_mult = tgt_dist / stop_dist_pts if stop_dist_pts > 0 else 0.0
+
+            # Trend wants stronger slope, but avoid insane risk distance
+            score = 0.0
+            score += 3.0 * slope
+            score += 1.0 * r_mult
+            score -= 0.25 * (stop_dist_pts / atr)  # smaller stop (in ATR units) is nicer
+
+            return float(score)
+        except Exception:
+            return 0.0
+
 
     def maybe_signal(self, bar, windows, risk):
         # Hard guards
@@ -99,9 +130,6 @@ class TrendPullback:
             type="MARKET",
         )
         bracket = Bracket(stop_price=float(stop), target_price=float(target))
-        side = "BUY" if side == "SELL" else "SELL"
-        target = entry_price - (target - entry_price)
-        stop   = entry_price + (entry_price - stop)
         return {
             "order": order,
             "bracket": bracket,

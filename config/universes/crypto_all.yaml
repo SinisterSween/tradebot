@@ -37,11 +37,11 @@ strategy:
 symbols:
   - symbol: ETH/USDT
     locked: true
-    version: vwap_rev_eth_v1
+    version: vwap_rev_eth_v2
     strategy:
       name: vwap_reversion
       atr_len: 14
-      atr_mult: 1.0
+      atr_mult: 0.8
       target_R: 0.8
       target_vwap: true
       vwap_entry_min_atr: 1.0
@@ -58,12 +58,12 @@ symbols:
 
   - symbol: SOL/USDT
     locked: true
-    version: vwap_rev_sol_v1
+    version: vwap_rev_sol_v2
     strategy:
       name: vwap_reversion
       atr_len: 14
-      atr_mult: 1.3
-      target_R: 1.0
+      atr_mult: 1.0
+      target_R: 1.5
       slope_max: 0.08
       stop_pad_ticks: 1 #When going live flip to 2 then after a few weeks can drop to 1
       orb_minutes: 10
@@ -86,7 +86,7 @@ symbols:
 
   - symbol: XRP/USDT
     locked: true
-    version: rsi_mr_xrp_v1
+    version: rsi_mr_xrp_v2
     tick_size: 0.0001
     point_value: 1
     trade_min_qty: 1.0
@@ -101,7 +101,7 @@ symbols:
       rsi_buy_below: 28
       rsi_sell_above: 72
       atr_len: 14
-      atr_mult: 1.0
+      atr_mult: 0.8
       target_R: 0.25
       stop_pad_ticks: 15
       require_cross: false
@@ -111,7 +111,7 @@ symbols:
       slope_max: 0.02
       ema_slope_atr_min: -999
       ema_slope_max: 0.0
-      ema_dist_atr_min: 14
+      ema_dist_atr_min: 8.0
       ema_dist_atr_max: 999
       exit_on_ema: true
       exit_ema_len: 20
@@ -121,8 +121,8 @@ symbols:
       min_vwap_target_R: 0.0
       use_early_range_target: true
       early_range_mult: 1.0
-      early_min_range_atr: 0.05     # optional; require early move big enough
-      require_early_done: false     # don’t trade before early window completes
+      early_min_range_atr: 0.05
+      require_early_done: false
       use_session_open_stop: true
       session_open_stop_atr_pad: 0.15
     execution:
@@ -135,7 +135,7 @@ symbols:
 
   - symbol: LTC/USDT
     locked: true
-    version: rsi_mr_ltc_v1
+    version: rsi_mr_ltc_v2
     tick_size: 0.01
     point_value: 1
     trade_min_qty: 0.01
@@ -148,12 +148,13 @@ symbols:
       rsi_buy_below: 28
       rsi_sell_above: 72
       atr_len: 14
-      atr_mult: 1.0
+      atr_mult: 0.8
       target_R: 0.25
       stop_pad_ticks: 15
       exit_on_ema: true
       exit_ema_len: 20
       exit_ema_side: touch
+      ema_dist_atr_min: 5.0
       min_atr_pct: 0.00005
     execution:
       be_lock_min: 14
@@ -210,7 +211,7 @@ symbols:
       min_notional_usd: 1
 
   - symbol: BCH/USDT
-    locked: true
+    locked: false
     version: rsi_mr_bch_v1
     tick_size: 0.01
     point_value: 1

@@ -22,10 +22,12 @@ def prepare_bars(
     symbol: str | None = None,
     exit_on_ema: bool = False,
     exit_ema_len: int = 20,
+    verbose: bool = True,
 ) -> pd.DataFrame:
     df = df.copy()
 
-    print(f"[PREP] tz={tz} orb={orb_minutes} rsi_len={rsi_len} atr_len={atr_len} ema_fast_len={ema_fast_len}")
+    if verbose:
+        print(f"[PREP] tz={tz} orb={orb_minutes} rsi_len={rsi_len} atr_len={atr_len} ema_fast_len={ema_fast_len}")
     # --- 1) Resolve timestamp column ---
     ts_col = None
     for c in ["datetime", "ts", "t_utc", "timestamp", "date_time", "time"]:
@@ -174,10 +176,11 @@ def prepare_bars(
     df["dist_from_vwap_atr"] = pd.to_numeric(df["dist_from_vwap_atr"], errors="coerce").fillna(0.0).astype("float64")
     
 
-    print("[SANITY.FEAT] vwap nan%:", float(df["vwap"].isna().mean()))
-    print("[SANITY.FEAT] atr  nan%:", float(df["atr"].isna().mean()))
-    print("[SANITY.FEAT] atr<=0 %:", float((df["atr"] <= 0).mean()))
-    print("[SANITY.FEAT] volume<=0 %:", float((df["volume"] <= 0).mean()) if "volume" in df.columns else -1)
+    if verbose:
+        print("[SANITY.FEAT] vwap nan%:", float(df["vwap"].isna().mean()))
+        print("[SANITY.FEAT] atr  nan%:", float(df["atr"].isna().mean()))
+        print("[SANITY.FEAT] atr<=0 %:", float((df["atr"] <= 0).mean()))
+        print("[SANITY.FEAT] volume<=0 %:", float((df["volume"] <= 0).mean()) if "volume" in df.columns else -1)
 
     # Opening range
     df = add_opening_range(df, minutes=orb_minutes, session_key="date")
@@ -209,6 +212,7 @@ def prepare_bars(
         errors="coerce"
     )  # keep NaN
 
-    print(f"[FEATURES] rsi_len={rsi_len} ready")
+    if verbose:
+        print(f"[FEATURES] rsi_len={rsi_len} ready")
 
     return df

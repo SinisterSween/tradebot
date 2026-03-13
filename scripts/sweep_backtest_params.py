@@ -20,13 +20,44 @@ def now_tag() -> str:
 
 
 def find_symbol_block(universe: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    """
+    Return the mutable dict where per-symbol params live.
+
+    Supports two universe YAML formats:
+
+    Format A – list of dicts (crypto_all.yaml style):
+        symbols:
+          - symbol: ETH/USDT
+            strategy: { ... }
+
+    Format B – flat list of strings (sp500_fractional, tiny_cap, levered_etf, etc.):
+        symbols:
+          - SPY
+          - QQQ
+        strategy: { ... }   # top-level strategy block applies to all symbols
+
+    In Format B we return the universe dict itself, so dot-path overrides like
+    "strategy.atr_mult" land on the top-level strategy block — which is correct
+    because that block controls every symbol in the flat-list format.
+    """
     symbols = universe.get("symbols")
     if not isinstance(symbols, list):
         raise ValueError("Universe YAML missing top-level 'symbols:' list")
+
+    # Format A: list of dicts
     for item in symbols:
         if isinstance(item, dict) and item.get("symbol") == symbol:
             return item
-    raise ValueError(f"Symbol '{symbol}' not found in universe YAML")
+
+    # Format B: flat list of strings — verify symbol exists, return top-level dict
+    flat = [s for s in symbols if isinstance(s, str)]
+    if symbol in flat:
+        return universe   # params set directly on universe root (strategy.x, execution.x)
+
+    raise ValueError(
+        f"Symbol '{symbol}' not found in universe YAML. "
+        f"Available: {[s for s in symbols if isinstance(s, str)] or [d.get('symbol') for d in symbols if isinstance(d, dict)]}"
+    )
 
 
 def deep_set(d: Dict[str, Any], path: str, value: Any) -> None:

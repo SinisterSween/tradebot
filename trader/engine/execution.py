@@ -174,29 +174,10 @@ class OrderManager:
         exit_fee = self._notional_fee(exit_px, qty) + self._per_contract_fee(qty)
         total_fees = float(getattr(self, "_last_entry_fee", 0.0)) + float(exit_fee)
 
-                # --- DEBUG: print first N exits with full pnl inputs ---
-        if getattr(self, "_pnl_dbg_n", 0) < 30:
-            self._pnl_dbg_n = getattr(self, "_pnl_dbg_n", 0) + 1
-            print(
-                f"[PNL.DBG] sym={getattr(self.pos,'symbol',None)} reason={exit_reason} "
-                f"pos_side={side_u} exit_side={exit_side} "
-                f"hi/lo/close={hi:.2f}/{lo:.2f}/{close_px:.2f} "
-                f"entry={entry_px:.2f} stop={stop_px:.2f} tgt={tgt_px:.2f} exit_raw={exit_price:.2f} exit_px={exit_px:.2f} "
-                f"qty={qty:.6f} dpp={float(getattr(self,'dpp',1.0)):.6f} "
-                f"entry_fee={float(getattr(self,'_last_entry_fee',0.0)):.6f} exit_fee={float(exit_fee):.6f} total_fees={float(total_fees):.6f}"
-            )
-
-
         if getattr(self, "crypto_like", False) or getattr(self, "equity_like", False):
             gross_pnl = (exit_px - float(entry_px)) * qty * side_mult(side_u)
         else:
             gross_pnl = (exit_px - float(entry_px)) * float(self.dpp) * qty * side_mult(side_u)
-        if getattr(self, "_pnl_dbg_n2", 0) < 30:
-            self._pnl_dbg_n2 = getattr(self, "_pnl_dbg_n2", 0) + 1
-            print(
-                f"[PNL.DBG] gross_pnl={float(gross_pnl):.6f} net_pnl={float(gross_pnl - total_fees):.6f} "
-                f"side_mult={side_mult(side_u)} (pos_side={side_u})"
-            )
         net_pnl = gross_pnl - total_fees
         self.realized_pnl += net_pnl
 
