@@ -99,16 +99,24 @@ class CcxtBinanceus:
             amount = min_amount
         amount = self.exchange.amount_to_precision(self.contract, amount)
 
-        # 2b) USDT balance check — don't enter if we can't afford it
+        # 2b) USDT balance check — scale down if needed, skip only if truly too small
         quote_currency = self.contract.split('/')[1]  # e.g. "USDT" from "LTC/USDT"
         bal = await self.exchange.fetch_balance()
         usdt_free = float(bal.get(quote_currency, {}).get('free', 0))
         cost_estimate = float(amount) * price
-        if usdt_free < cost_estimate * 1.01:  # 1% buffer for fees
+        MIN_ORDER_USD = 5.0  # hard floor — not worth trading below this
+        if usdt_free < MIN_ORDER_USD:
             raise RuntimeError(
-                f"[BINANCEUS] {self.contract}: insufficient {quote_currency} balance "
-                f"({usdt_free:.2f} available, ~{cost_estimate:.2f} needed) — skipping order"
+                f"[BINANCEUS] {self.contract}: {quote_currency} balance too low to trade "
+                f"({usdt_free:.2f} available, minimum ${MIN_ORDER_USD}) — skipping order"
             )
+        if usdt_free < cost_estimate * 1.01:
+            # Not enough for the full allocation — scale down to what's available
+            scaled_notional = usdt_free * 0.98  # 2% buffer for fees
+            amount = scaled_notional / price
+            amount = self.exchange.amount_to_precision(self.contract, amount)
+            print(f"[BINANCEUS] {self.contract}: scaling order to {usdt_free:.2f} {quote_currency} "
+                  f"(full allocation was ~{cost_estimate:.2f})")
 
         # 3) create orders: [market, stop_loss, target]
         trades = []

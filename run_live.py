@@ -1909,6 +1909,16 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
             print(f"[{name}] submitted bracket for {order.symbol} sl={sl_id} tp={tp_id}")
             _log_trade("ENTRY", side=order.side,
                        stop=float(bracket.stop_price), target=float(bracket.target_price))
+            # Tell the strategy an entry was submitted so min_minutes_between_trades works
+            if hasattr(strat, 'on_entry_submitted'):
+                try:
+                    import pandas as _pd
+                    _ts = _pd.Timestamp(bar_norm["datetime"])
+                    if _ts.tzinfo is None:
+                        _ts = _ts.tz_localize('UTC')
+                    strat.on_entry_submitted(_ts)
+                except Exception as _oe:
+                    print(f"[{name}] on_entry_submitted error: {_oe}")
 
             # CCXT: start background OCA monitor (cancels loser when winner fills)
             if hasattr(broker, 'watch_bracket'):
@@ -1965,8 +1975,37 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
             elif open_orders:
                 print(f"[{name}] RECOVERY: {len(open_orders)} open order(s) found but can't match stop+target "
                       f"— check Binance.US manually. Types: {[o.get('type') for o in open_orders]}")
+                # Lock the lot so we don't re-enter while orphaned orders exist
+                _pos["open"]     = True
+                _pos["entry_ts"] = datetime.now(timezone.utc).isoformat()
+                _pos["sl_id"]    = None
+                _pos["tp_id"]    = None
+                _log_trade("RECOVERY_LOCKED", reason="unmatched_orders")
             else:
-                print(f"[{name}] RECOVERY: no open orders on {symbol} — clean startup")
+                # No open orders — but check if we're holding coins without protection
+                try:
+                    base = symbol.split('/')[0]
+                    bal = await broker.exchange.fetch_balance()
+                    coin_qty = float((bal.get(base) or {}).get('total', 0))
+                    mkt = broker.exchange.markets.get(symbol, {})
+                    min_amt = float(((mkt.get('limits') or {}).get('amount') or {}).get('min') or 0)
+                    cash_alloc = float(lot.get("cash_alloc", 100))
+                    ticker = await broker.exchange.fetch_ticker(symbol)
+                    coin_usd = coin_qty * float(ticker['last'])
+                    # If holding coins worth more than 10% of allocation — something is wrong
+                    if coin_qty > min_amt and coin_usd > cash_alloc * 0.10:
+                        print(f"[{name}] RECOVERY: UNPROTECTED position detected — "
+                              f"holding {coin_qty:.6f} {base} (~${coin_usd:.2f}) with no open orders!")
+                        print(f"[{name}] Lot LOCKED — sell {base} on Binance.US then restart")
+                        _pos["open"]     = True
+                        _pos["entry_ts"] = datetime.now(timezone.utc).isoformat()
+                        _pos["sl_id"]    = None
+                        _pos["tp_id"]    = None
+                        _log_trade("RECOVERY_LOCKED", reason=f"unprotected_coins_{coin_qty:.6f}{base}")
+                    else:
+                        print(f"[{name}] RECOVERY: no open orders on {symbol} — clean startup")
+                except Exception as _be:
+                    print(f"[{name}] RECOVERY: balance check failed: {_be} — assuming clean startup")
         except Exception as e:
             print(f"[{name}] RECOVERY check failed: {e} — assuming clean startup")
 
