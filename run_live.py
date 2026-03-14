@@ -2,7 +2,7 @@ import asyncio, yaml, pandas as pd, signal, sys, argparse, os, json, csv
 from dotenv import load_dotenv
 load_dotenv()
 from zoneinfo import ZoneInfo
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import suppress
 from typing import List, Dict, Any
 from dataclasses import dataclass, asdict
@@ -1865,6 +1865,20 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         if _orphan_until["ts"] and datetime.now(timezone.utc) < _orphan_until["ts"]:
             return
 
+        # Skip order placement on historical/backfill bars.
+        # During backfill, 1000s of bars are emitted at full speed; any signal that
+        # fires triggers a real buy → bracket fails (coins not settled) → emergency close
+        # → _pos stays False → next bar fires again → fee-burning loop.
+        # Guard: if the bar's close timestamp is more than 5 minutes old, it's historical.
+        try:
+            _bar_dt = datetime.fromisoformat(bar_norm["datetime"].replace("Z", "+00:00"))
+            if _bar_dt.tzinfo is None:
+                _bar_dt = _bar_dt.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - _bar_dt) > timedelta(minutes=5):
+                return  # historical bar — let indicators build, no live orders
+        except Exception:
+            pass  # if datetime parse fails, proceed normally
+
         state.trade_count += 1
         state.last_decision_ts = now_iso
         state.last_side = order.side
@@ -1955,6 +1969,16 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
 
         except Exception as e:
             print(f"[{name}] ERROR placing bracket: {e}")
+            # Even though the bracket failed (emergency close fired), call on_entry_submitted
+            # so the strategy's min_minutes_between_trades cooldown engages.
+            # Without this, the strategy fires again on the very next bar, burning fees in a loop.
+            if hasattr(strat, 'on_entry_submitted'):
+                try:
+                    import pandas as _pd
+                    _ts_err = _pd.Timestamp.now(tz='UTC')
+                    strat.on_entry_submitted(_ts_err)
+                except Exception:
+                    pass
 
 
     # ------------------------------------------------------------------

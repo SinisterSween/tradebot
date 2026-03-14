@@ -123,35 +123,65 @@ class CcxtBinanceus:
         entry_order = await self.exchange.create_order(self.contract, 'market', side.lower(), amount)
         trades.append(self._to_fake_ib_trade(entry_order))
 
-        # 3b) wait 1s for settlement so coins are available for stop/target sell orders
-        await asyncio.sleep(1)
-
-        # stop + target — if either fails, emergency-close the entry position
+        # 3b) Wait for coins to appear as free balance.
+        # On Binance.US under load 1s is not enough — poll up to 10s.
+        base = self.contract.split('/')[0]
         close_side = 'sell' if side.lower() == 'buy' else 'buy'
+        _settled_amount = float(amount)  # fallback if poll skipped
+        for _wait_attempt in range(10):
+            await asyncio.sleep(1)
+            try:
+                _bal = await self.exchange.fetch_balance()
+                _base_free = float(_bal.get(base, {}).get('free', 0))
+                if _base_free >= float(amount) * 0.99:
+                    _settled_amount = _base_free  # use actual free balance
+                    break
+                print(f"[BINANCEUS] {self.contract}: waiting for settlement "
+                      f"({_base_free:.6f} of {amount} {base} free, attempt {_wait_attempt+1}/10)")
+            except Exception as _be:
+                print(f"[BINANCEUS] {self.contract}: balance poll error: {_be}")
+
+        # Use the settled (actually available) coin amount for bracket orders
+        bracket_amount = self.exchange.amount_to_precision(self.contract, _settled_amount)
+
+        # Use OCO (One-Cancels-Other) via direct Binance.US API call.
+        # CCXT's unified create_order('oco', ...) is not reliably supported for binanceus;
+        # private_post_order_oco() calls POST /api/v3/order/oco directly.
         try:
-            # stop loss limit (Binance.US spot does not support stop_loss market orders)
             stop_limit = self.exchange.price_to_precision(
                 self.contract, stop_price * (0.995 if close_side == 'sell' else 1.005)
             )
-            stop_order = await self.exchange.create_order(
-                self.contract, 'stop_loss_limit', close_side, amount, stop_limit,
-                params={'stopPrice': self.exchange.price_to_precision(self.contract, stop_price)}
-            )
-            trades.append(self._to_fake_ib_trade(stop_order))
-
-            # target limit
-            target_order = await self.exchange.create_order(self.contract, 'limit', close_side,
-                                                            amount, target_price)
-            trades.append(self._to_fake_ib_trade(target_order))
+            oco_response = await self.exchange.private_post_order_oco({
+                'symbol':                self.exchange.market_id(self.contract),
+                'side':                  close_side.upper(),
+                'quantity':              bracket_amount,
+                'price':                 self.exchange.price_to_precision(self.contract, target_price),
+                'stopPrice':             self.exchange.price_to_precision(self.contract, stop_price),
+                'stopLimitPrice':        stop_limit,
+                'stopLimitTimeInForce':  'GTC',
+            })
+            # Raw Binance response has orderReports at top level (not under 'info')
+            reports = oco_response.get('orderReports', [])
+            stop_report   = next((r for r in reports if r.get('type') == 'STOP_LOSS_LIMIT'), None)
+            target_report = next((r for r in reports if r.get('type') == 'LIMIT_MAKER'),    None)
+            if stop_report is None or target_report is None:
+                if len(reports) >= 2:
+                    stop_report, target_report = reports[0], reports[1]
+                else:
+                    raise RuntimeError(f"OCO response missing orderReports: {oco_response}")
+            trades.append(self._to_fake_ib_trade({'id': str(stop_report['orderId'])}))
+            trades.append(self._to_fake_ib_trade({'id': str(target_report['orderId'])}))
+            print(f"[BINANCEUS] {self.contract} OCO placed: "
+                  f"stop={stop_report['orderId']} target={target_report['orderId']}")
         except Exception as e:
-            print(f"[BINANCEUS] bracket placement failed after entry: {e} — emergency closing position")
+            print(f"[BINANCEUS] OCO bracket placement failed after entry: {e} — emergency closing position")
+            # OCO is atomic: if it failed, no orders were placed, coins are free
             try:
-                await self.exchange.create_order(self.contract, 'market', close_side, amount)
+                await self.exchange.create_order(self.contract, 'market', close_side, bracket_amount)
                 print(f"[BINANCEUS] emergency close sent for {self.contract}")
             except Exception as e2:
-                # Entry is open, bracket failed, emergency close failed — caller must lock the lot
                 raise BracketOrphanError(
-                    f"entry placed but bracket+emergency_close both failed: {e2}"
+                    f"entry placed but OCO+emergency_close both failed: {e2}"
                 ) from e
             raise
 
