@@ -129,9 +129,12 @@ class CcxtBinanceus:
         # stop + target — if either fails, emergency-close the entry position
         close_side = 'sell' if side.lower() == 'buy' else 'buy'
         try:
-            # stop loss — market order triggered at stop_price (fills even through gaps)
+            # stop loss limit (Binance.US spot does not support stop_loss market orders)
+            stop_limit = self.exchange.price_to_precision(
+                self.contract, stop_price * (0.995 if close_side == 'sell' else 1.005)
+            )
             stop_order = await self.exchange.create_order(
-                self.contract, 'stop_loss', close_side, amount,
+                self.contract, 'stop_loss_limit', close_side, amount, stop_limit,
                 params={'stopPrice': self.exchange.price_to_precision(self.contract, stop_price)}
             )
             trades.append(self._to_fake_ib_trade(stop_order))

@@ -1693,6 +1693,9 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     _flat_fired     = {"done": False}  # reset each day via date tracking
     _flat_last_date = {"date": None}
 
+    # Orphan cooldown — after a BracketOrphanError, block re-entry for 60 min
+    _orphan_until   = {"ts": None}
+
     async def _force_close(reason: str):
         """Cancel bracket orders and market-sell the open position (CCXT only)."""
         if CcxtBinanceus is None or not isinstance(broker, CcxtBinanceus):
@@ -1858,6 +1861,10 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
                     print(f"[{name}] exit_on_ema check error: {_e}")
             return  # still in position, no exit triggered
 
+        # Orphan cooldown — skip entry if a recent BracketOrphanError occurred
+        if _orphan_until["ts"] and datetime.now(timezone.utc) < _orphan_until["ts"]:
+            return
+
         state.trade_count += 1
         state.last_decision_ts = now_iso
         state.last_side = order.side
@@ -1941,6 +1948,10 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
             _pos["entry_ts"] = bar_norm["datetime"]
             _pos["sl_id"]    = None
             _pos["tp_id"]    = None
+            # Set cooldown so even after force-close, lot waits 60 min before re-entering
+            _orphan_until["ts"] = datetime.now(timezone.utc).replace(
+                second=0, microsecond=0
+            ) + __import__('datetime').timedelta(minutes=60)
 
         except Exception as e:
             print(f"[{name}] ERROR placing bracket: {e}")
