@@ -35,7 +35,7 @@ strategy:
   target_vwap: false
   slope_max: 0.08
   stop_pad_ticks: 1
-  min_atr_pct: 0.003
+  min_atr_pct: 0.001
   max_bar_range_atr: 6.0
   vwap_entry_min_atr: 0.5
   vwap_entry_max_atr: 3.5

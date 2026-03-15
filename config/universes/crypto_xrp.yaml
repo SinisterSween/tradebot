@@ -21,8 +21,8 @@ risk:
   max_consec_losses: 999
 
 execution:
-  be_lock_min: 14
-  be_req_profit_ticks: 1
+  be_lock_min: 999999
+  be_req_profit_ticks: 999999
   max_hold_min: 45
   min_minutes_to_window_end: 10
 
@@ -42,7 +42,7 @@ strategy:
   require_cross: false
   min_minutes_between_trades: 0
   max_trades_per_day: 0
-  min_atr_pct: 0.001
+  min_atr_pct: 0.00005
   slope_max: 0.02
   ema_slope_atr_min: -999
   ema_slope_max: 0.0

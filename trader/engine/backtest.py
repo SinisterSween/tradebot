@@ -193,6 +193,7 @@ def prepare_bars(
 
     df["ema_fast"] = df["close"].ewm(span=ema_fast_len, adjust=False).mean()
     df[f"ema_exit_{exit_ema_len}"] = df["close"].ewm(span=exit_ema_len, adjust=False).mean()
+    df["ema_200"]  = df["close"].ewm(span=200, adjust=False).mean()   # long-term regime filter
     df["ema"] = df["ema_fast"]
     df["ema_slope"] = df["ema_fast"].diff(ema_slope_lookback)
     df["ema_slope"] = pd.to_numeric(df["ema_slope"], errors="coerce").fillna(0.0).astype("float64")

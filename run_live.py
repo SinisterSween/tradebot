@@ -157,6 +157,16 @@ def build_strategy(strategy_type: str, raw: dict, tick_size: float, tick_value: 
             min_atr_pct=float(raw.get("min_atr_pct", 0.0)),
             target_vwap=bool(raw.get("target_vwap", True)),
             max_bar_range_atr=float(raw.get("max_bar_range_atr", 0.0)),
+            min_vwap_target_R=float(raw.get("min_vwap_target_R", 0.0)),
+            ema_slope_max=float(raw.get("ema_slope_max", 0.0)),
+            ema_max_dist_atr=float(raw.get("ema_max_dist_atr", 0.0)),
+            vwap_entry_min_atr=float(raw.get("vwap_entry_min_atr", 0.0)),
+            vwap_entry_max_atr=float(raw.get("vwap_entry_max_atr", 0.0)),
+            orb_minutes=int(raw.get("orb_minutes", 0)),
+            allow_longs=bool(raw.get("allow_longs", True)),
+            allow_shorts=bool(raw.get("allow_shorts", True)),
+            ema_slope_buy_min=float(raw.get("ema_slope_buy_min", -999.0)),
+            ema_slope_sell_max=float(raw.get("ema_slope_sell_max", 999.0)),
         ))
 
     # default: hybrid_orb_vwap
@@ -1339,15 +1349,42 @@ async def run_portfolio(args):
 
     stop_all = asyncio.Event()
 
+    # Shared status dict for heartbeat + daily summary
+    lot_status: Dict[str, Dict] = {
+        lot["name"]: {
+            "trades_today":  0,
+            "targets_today": 0,
+            "stops_today":   0,
+            "pnl_today":     0.0,
+            "open":          False,
+            "open_symbol":   "",
+            "open_side":     "",
+        }
+        for lot in pf.get("microlots", [])
+    }
+
     tasks: List[asyncio.Task] = []
 
     # Start microlots
     for i, lot in enumerate(pf.get("microlots", [])):
         t = asyncio.create_task(
-            run_microlot(lot, args.dry_run, client_id=2 + i, stop_all=stop_all),
+            run_microlot(lot, args.dry_run, client_id=2 + i, stop_all=stop_all,
+                         lot_status=lot_status),
             name=f"microlot:{lot.get('name','?')}"
         )
         tasks.append(t)
+
+    # Start heartbeat + daily summary background task
+    try:
+        from scripts.heartbeat import heartbeat_loop as _heartbeat_loop
+        ht_task = asyncio.create_task(
+            _heartbeat_loop(lot_status, stop_all),
+            name="heartbeat"
+        )
+        tasks.append(ht_task)
+        print("[PORTFOLIO] heartbeat task started (ping every 4 h, daily summary at midnight UTC)")
+    except Exception as _he:
+        print(f"[PORTFOLIO] heartbeat unavailable: {_he}")
 
     print(f"[PORTFOLIO] started {len(tasks)} microlots")
 
@@ -1380,7 +1417,7 @@ async def run_portfolio(args):
 
 
 
-async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_all: asyncio.Event):
+async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_all: asyncio.Event, lot_status: Dict = None):
     """
     Run a *single* microlot (EQ-SWI, CRYPTO, etc.) in its own event-loop task.
     Each gets its own broker instance, risk governor, rolling bars, etc.
@@ -1647,7 +1684,9 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     MIN_FEATURE_ROWS = 5
     throttle = {"last_print_ts": 0.0,
                 "last_signal_dt": None} # throttle console spam
-    _pos = {"open": False, "entry_ts": None, "sl_id": None, "tp_id": None}
+    _pos = {"open": False, "entry_ts": None, "sl_id": None, "tp_id": None,
+             "entry_px": 0.0, "stop_px": 0.0, "target_px": 0.0,
+             "side": "", "risk_usd": 0.0, "be_done": False}
 
     # ------------------------------------------------------------------
     # Trade log + notifications (best-effort — never crashes the bot)
@@ -1681,12 +1720,43 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         except Exception:
             pass  # no webhook configured — silently skip
 
+        # ── Update lot_status for heartbeat / daily-summary ──────────────────
+        if lot_status is not None and name in lot_status:
+            ls = lot_status[name]
+            if event == "ENTRY":
+                ls["trades_today"] += 1
+                ls["open"]         = True
+                ls["open_symbol"]  = symbol
+                ls["open_side"]    = side
+            elif event == "EXIT":
+                ls["open"]        = False
+                ls["open_symbol"] = ""
+                ls["open_side"]   = ""
+                # Estimate P&L from stored bracket info (R-based approximation)
+                ep = _pos.get("entry_px",  0.0)
+                sp = _pos.get("stop_px",   0.0)
+                tp = _pos.get("target_px", 0.0)
+                ru = _pos.get("risk_usd",  0.0)
+                if ru > 0 and ep > 0 and sp > 0:
+                    if "TARGET" in reason.upper() and tp > 0:
+                        d_stop    = abs(sp - ep)
+                        d_target  = abs(tp - ep)
+                        pnl_est   = (d_target / d_stop * ru) if d_stop > 0 else 0.0
+                        ls["targets_today"] += 1
+                    else:
+                        pnl_est = -ru
+                        ls["stops_today"] += 1
+                    ls["pnl_today"] += pnl_est
+
     # Exit params (read once from config so on_bar doesn't re-parse every bar)
-    _max_hold_min = uni.get("execution", {}).get("max_hold_min")
-    _exit_on_ema  = bool(strat_cfg_raw.get("exit_on_ema", False))
-    _exit_ema_len = int(strat_cfg_raw.get("exit_ema_len", 20))
-    _exit_ema_side = str(strat_cfg_raw.get("exit_ema_side", "cross"))
-    _exit_ema_col  = f"ema_exit_{_exit_ema_len}"
+    _max_hold_min     = uni.get("execution", {}).get("max_hold_min")
+    _be_lock_min      = uni.get("execution", {}).get("be_lock_min")
+    _be_req_ticks     = int(uni.get("execution", {}).get("be_req_profit_ticks", 1))
+    _exit_on_ema      = bool(strat_cfg_raw.get("exit_on_ema", False))
+    _exit_ema_len     = int(strat_cfg_raw.get("exit_ema_len", 20))
+    _exit_ema_side    = str(strat_cfg_raw.get("exit_ema_side", "cross"))
+    _exit_ema_col     = f"ema_exit_{_exit_ema_len}"
+    _regime_skip_bear = bool(strat_cfg_raw.get("regime_skip_bear", False))
 
     # EOD flat time for IBKR lots (e.g. "15:55" ET) — ignored for crypto
     _flat_time_str  = str(uni.get("risk", {}).get("flat_time", "")) or ""
@@ -1846,6 +1916,28 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
                         return
                 except Exception as _e:
                     print(f"[{name}] max_hold_min parse error: {_e}")
+            # --- breakeven lock: after be_lock_min minutes, market-sell if in profit --------
+            # For LTC/XRP: be_lock_min=14, be_req_profit_ticks=1 (from execution config)
+            # For ETH/SOL: be_lock_min=999999 → effectively disabled
+            if (_be_lock_min and _be_lock_min < 999998
+                    and not _pos.get("be_done")
+                    and _pos.get("entry_ts") and _pos.get("entry_px")):
+                try:
+                    import datetime as _dt2
+                    entry_dt   = _dt2.datetime.fromisoformat(str(_pos["entry_ts"]).replace("Z", "+00:00"))
+                    cur_dt     = _dt2.datetime.fromisoformat(str(bar_norm["datetime"]).replace("Z", "+00:00"))
+                    elapsed_m  = (cur_dt - entry_dt).total_seconds() / 60.0
+                    if elapsed_m >= _be_lock_min:
+                        direction    = 1.0 if _pos.get("side", "BUY").upper() == "BUY" else -1.0
+                        profit_ticks = (float(latest["close"]) - _pos["entry_px"]) * direction / tick_size
+                        if profit_ticks >= _be_req_ticks:
+                            _pos["be_done"] = True
+                            await _force_close(
+                                f"be_lock(t={elapsed_m:.0f}m,{profit_ticks:.1f}tck)"
+                            )
+                            return
+                except Exception as _be_e:
+                    print(f"[{name}] be_lock check error: {_be_e}")
             # --- EMA touch/cross exit (for long mean-reversion positions) ---
             if _exit_on_ema and _exit_ema_col in latest.index:
                 try:
@@ -1879,6 +1971,12 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         except Exception:
             pass  # if datetime parse fails, proceed normally
 
+        # Regime filter: skip BUY entries when price is below the 200-bar trend EMA
+        # Enable per-universe with `regime_skip_bear: true` in the strategy: block of the YAML
+        if _regime_skip_bear and "ema_200" in latest.index:
+            if order.side.upper() == "BUY" and float(latest["close"]) < float(latest["ema_200"]):
+                return  # bear trend guard — suppress mean-reversion buy
+
         state.trade_count += 1
         state.last_decision_ts = now_iso
         state.last_side = order.side
@@ -1889,47 +1987,105 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         state.save(state_path)
 
         if dry_run:
+            entry_approx = float(bar_norm.get("close", 0))
+            _side_emoji  = "📈" if order.side.upper() == "BUY" else "📉"
+            _dry_msg = (
+                f"{_side_emoji} **PAPER SIGNAL [{name}]**\n"
+                f"`{order.side}` **{order.symbol}** @ ~${entry_approx:.2f}\n"
+                f"Stop: **${bracket.stop_price:.2f}** | Target: **${bracket.target_price:.2f}**\n"
+                f"_(Paper only — enter manually if desired, exit at stop/target)_"
+            )
             print(f"[{name}] DRY-RUN signal {order.side} {order.qty} {order.symbol} "
-                f"stop={bracket.stop_price:.4f} target={bracket.target_price:.4f}")
+                f"entry~={entry_approx:.2f} stop={bracket.stop_price:.4f} target={bracket.target_price:.4f}")
+            try:
+                import scripts.notify_slack as _ns
+                _ns.notify(_dry_msg)
+            except Exception:
+                pass
+            # Count dry-run signals in lot_status so the heartbeat shows activity
+            if lot_status is not None and name in lot_status:
+                lot_status[name]["trades_today"] += 1
             return
 
         tif = "DAY" if lot["broker"].startswith("ibkr") else None
         outside_rth = False if lot["broker"].startswith("ibkr") else None
 
         # For CCXT: qty=1 from strategy is a placeholder; replace with risk-based USD notional.
-        # place_bracket_market expects qty in USD (it divides by price to get coin amount).
+        # place_bracket_limit expects qty in USD (it divides by price to get coin amount).
+        _use_ccxt_maker = False
         if CcxtBinanceus is not None and isinstance(broker, CcxtBinanceus):
             cash_alloc = float(lot.get("cash_alloc", 100))
-            stop_dist = abs(float(bracket.stop_price) - float(latest["close"]))
+            _last_close = float(latest["close"])
+            stop_dist = abs(float(bracket.stop_price) - _last_close)
             if stop_dist > 0:
                 risk_usd = cash_alloc * float(lot.get("max_risk_per_trade", 0.0075))
-                order_qty = risk_usd * float(latest["close"]) / stop_dist
+                order_qty = risk_usd * _last_close / stop_dist
             else:
                 order_qty = cash_alloc * 0.5
             # hard cap: never spend more than the lot's cash allocation in one trade
             order_qty = min(order_qty, cash_alloc)
+
+            # Maker limit price: 1 tick inside the spread so the order rests as a
+            # post-only maker (4 bps fee vs 10 bps taker).  place_bracket_limit will
+            # fall back to a market order automatically if not filled within 45s.
+            _maker_px = (
+                _last_close - tick_size if order.side.upper() == "BUY"
+                else _last_close + tick_size
+            )
+            _stop_dist   = abs(float(bracket.stop_price)  - _last_close)
+            _target_dist = abs(float(bracket.target_price) - _last_close)
+            if order.side.upper() == "BUY":
+                _adj_stop   = _maker_px - _stop_dist
+                _adj_target = _maker_px + _target_dist
+            else:
+                _adj_stop   = _maker_px + _stop_dist
+                _adj_target = _maker_px - _target_dist
+            _use_ccxt_maker = True
         else:
             order_qty = int(order.qty)
 
         try:
-            trades = await broker.place_bracket_market(
-                side=order.side,
-                qty=order_qty,
-                stop_price=float(bracket.stop_price),
-                target_price=float(bracket.target_price),
-                tif=tif,
-                outsideRth=outside_rth,
-            )
+            if _use_ccxt_maker:
+                # Limit order (post-only) → maker fee; falls back to market on timeout
+                trades = await broker.place_bracket_limit(
+                    side=order.side,
+                    qty=order_qty,
+                    limit_price=_maker_px,
+                    stop=_adj_stop,
+                    target=_adj_target,
+                    tif=tif,
+                    outsideRth=outside_rth,
+                )
+            else:
+                trades = await broker.place_bracket_market(
+                    side=order.side,
+                    qty=order_qty,
+                    stop_price=float(bracket.stop_price),
+                    target_price=float(bracket.target_price),
+                    tif=tif,
+                    outsideRth=outside_rth,
+                )
             # trades: [0]=market parent, [1]=stop_loss, [2]=target limit
             sl_id = str(trades[1].order.orderId)
             tp_id = str(trades[2].order.orderId)
-            _pos["open"]     = True
-            _pos["entry_ts"] = bar_norm["datetime"]
-            _pos["sl_id"]    = sl_id
-            _pos["tp_id"]    = tp_id
+            _pos["open"]      = True
+            _pos["entry_ts"]  = bar_norm["datetime"]
+            _pos["sl_id"]     = sl_id
+            _pos["tp_id"]     = tp_id
+            _pos["entry_px"]  = _maker_px if _use_ccxt_maker else float(latest["close"])
+            _pos["stop_px"]   = _adj_stop   if _use_ccxt_maker else float(bracket.stop_price)
+            _pos["target_px"] = _adj_target if _use_ccxt_maker else float(bracket.target_price)
+            _pos["side"]      = order.side
+            _pos["risk_usd"]  = (
+                float(lot.get("cash_alloc", 100)) * float(lot.get("max_risk_per_trade", 0.0075))
+                if CcxtBinanceus is not None and isinstance(broker, CcxtBinanceus)
+                else 0.0
+            )
+            _pos["be_done"]   = False   # reset BE lock for this new trade
             print(f"[{name}] submitted bracket for {order.symbol} sl={sl_id} tp={tp_id}")
             _log_trade("ENTRY", side=order.side,
-                       stop=float(bracket.stop_price), target=float(bracket.target_price))
+                       stop=_adj_stop   if _use_ccxt_maker else float(bracket.stop_price),
+                       target=_adj_target if _use_ccxt_maker else float(bracket.target_price))
             # Tell the strategy an entry was submitted so min_minutes_between_trades works
             if hasattr(strat, 'on_entry_submitted'):
                 try:

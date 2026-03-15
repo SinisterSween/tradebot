@@ -173,6 +173,10 @@ def run_one_job(
         "--run-tag", run_tag,
         "--light-artifacts",
     ]
+    if args_dict.get("fee_bps") is not None:
+        cmd += ["--fee-bps", str(args_dict["fee_bps"])]
+    if args_dict.get("slip_bps") is not None:
+        cmd += ["--slip-bps", str(args_dict["slip_bps"])]
 
     proc = subprocess.run(
         cmd,
@@ -222,6 +226,8 @@ def main() -> int:
     ap.add_argument("--outdir", default="logs/sweeps")
     ap.add_argument("--jobs", type=int, default=1, help="Parallel workers (subprocesses)")
     ap.add_argument("--keep-going", action="store_true", help="Continue even if some runs fail")
+    ap.add_argument("--fee-bps", type=float, default=None, help="Round-trip fee in bps (passed to run_backtest.py)")
+    ap.add_argument("--slip-bps", type=float, default=None, help="Slippage in bps per side (passed to run_backtest.py)")
 
     ap.add_argument(
         "--params",
@@ -273,6 +279,8 @@ def main() -> int:
         csv=args.csv,
         start_date=args.start_date,
         end_date=args.end_date,
+        fee_bps=args.fee_bps,
+        slip_bps=args.slip_bps,
     )
 
     print(f"[SWEEP] runs={total} jobs={args.jobs} out={sweep_root.relative_to(repo_root)}")

@@ -196,38 +196,180 @@ class CcxtBinanceus:
     async def place_bracket_limit(self, side: str, qty: int, limit_price: float,
                                   stop: float, target: float, *,
                                   tif: Optional[str] = None,
-                                  outsideRth: Optional[bool] = None) -> List[Trade]:
-        """Same as above but parent is a limit order."""
+                                  outsideRth: Optional[bool] = None,
+                                  fill_timeout_s: int = 45) -> List[Trade]:
+        """
+        Post-only (LIMIT_MAKER) entry to earn maker fee (~4 bps vs 10 bps taker).
+
+        Flow:
+          1. Post limit at limit_price with postOnly=True (rejected by exchange if it
+             would immediately cross as taker — guarantees maker fee or no fill).
+          2. Poll every second up to fill_timeout_s for fill confirmation.
+          3. On fill: wait for coin settlement then place OCO bracket (identical to
+             place_bracket_market path).
+          4. On timeout or post-only rejection: cancel the limit order and fall back
+             to place_bracket_market (no worse than current behaviour).
+
+        Caller should set limit_price to close - 1 tick (BUY) or close + 1 tick (SELL)
+        so the order sits at the bid/ask as a resting maker order.
+        """
         if self.contract is None:
             raise RuntimeError("Contract not resolved")
 
+        # 1. Amount calculation (same as market path)
         ticker = await self.exchange.fetch_ticker(self.contract)
         price = float(ticker['last'])
-
         amount = qty / price
         min_amount = self.exchange.markets[self.contract]['limits']['amount']['min'] or 0.0
         if amount < min_amount:
             amount = min_amount
         amount = self.exchange.amount_to_precision(self.contract, amount)
 
-        trades = []
-        order = await self.exchange.create_order(self.contract, 'limit', side.lower(), amount, limit_price)
-        trades.append(self._to_fake_ib_trade(order))
+        # 1b. Balance check (same as market path)
+        quote_currency = self.contract.split('/')[1]
+        bal = await self.exchange.fetch_balance()
+        usdt_free = float(bal.get(quote_currency, {}).get('free', 0))
+        cost_estimate = float(amount) * price
+        MIN_ORDER_USD = 5.0
+        if usdt_free < MIN_ORDER_USD:
+            raise RuntimeError(
+                f"[BINANCEUS] {self.contract}: {quote_currency} balance too low to trade "
+                f"({usdt_free:.2f} available, minimum ${MIN_ORDER_USD}) — skipping order"
+            )
+        if usdt_free < cost_estimate * 1.01:
+            scaled_notional = usdt_free * 0.98
+            amount = scaled_notional / price
+            amount = self.exchange.amount_to_precision(self.contract, amount)
+            print(f"[BINANCEUS] {self.contract}: scaling order to {usdt_free:.2f} {quote_currency}")
 
-        stop_side = 'sell' if side.lower() == 'buy' else 'buy'
-        stop_limit = self.exchange.price_to_precision(
-            self.contract, stop * (0.995 if stop_side == 'sell' else 1.005)
-        )
-        stop_order = await self.exchange.create_order(
-            self.contract, 'stop_loss_limit', stop_side, amount, stop_limit,
-            params={'stopPrice': self.exchange.price_to_precision(self.contract, stop)}
-        )
-        trades.append(self._to_fake_ib_trade(stop_order))
+        # 2. Post LIMIT_MAKER (post-only: exchange rejects if order would cross as taker)
+        limit_price_str = self.exchange.price_to_precision(self.contract, limit_price)
+        try:
+            entry_order = await self.exchange.create_order(
+                self.contract, 'limit', side.lower(), amount, limit_price,
+                params={'postOnly': True},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # -2010 = "Order would immediately match and take" (post-only rejection)
+            err = str(e)
+            if any(k in err.upper() for k in ('WOULD_MATCH', '-2010', 'FILTER_FAILURE', 'POST_ONLY')):
+                print(f"[BINANCEUS] {self.contract} post-only rejected ({e}), falling back to market")
+                return await self.place_bracket_market(side, qty, stop, target)
+            raise
 
-        target_side = 'sell' if side.lower() == 'buy' else 'buy'
-        target_order = await self.exchange.create_order(self.contract, 'limit', target_side,
-                                                        amount, target)
-        trades.append(self._to_fake_ib_trade(target_order))
+        order_id = str(entry_order['id'])
+        print(f"[BINANCEUS] {self.contract} LIMIT_MAKER posted id={order_id} "
+              f"px={limit_price_str} side={side} (timeout={fill_timeout_s}s)")
+
+        # 3. Poll for fill
+        filled = False
+        fill_price = limit_price
+        filled_amount = float(amount)
+
+        for _ in range(fill_timeout_s):
+            await asyncio.sleep(1)
+            try:
+                fetched = await self.exchange.fetch_order(order_id, self.contract)
+                status = fetched.get('status', '')
+                if status in ('closed', 'filled'):
+                    filled = True
+                    fill_price = float(fetched.get('average') or fetched.get('price') or limit_price)
+                    filled_amount = float(fetched.get('filled') or amount)
+                    print(f"[BINANCEUS] {self.contract} LIMIT_MAKER filled @ {fill_price:.6f} "
+                          f"(MAKER FEE ~4 bps saved)")
+                    break
+                if status in ('canceled', 'rejected', 'expired'):
+                    print(f"[BINANCEUS] {self.contract} LIMIT_MAKER {status}, "
+                          f"falling back to market")
+                    return await self.place_bracket_market(side, qty, stop, target)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[BINANCEUS] {self.contract} limit poll error: {e}")
+
+        if not filled:
+            # Timeout — cancel and check for partial fill
+            print(f"[BINANCEUS] {self.contract} LIMIT_MAKER timeout after {fill_timeout_s}s "
+                  f"— cancelling, market fallback")
+            try:
+                await self.exchange.cancel_order(order_id, self.contract)
+                fetched = await self.exchange.fetch_order(order_id, self.contract)
+                part = float(fetched.get('filled') or 0)
+                if part > 0:
+                    fill_price = float(fetched.get('average') or fetched.get('price') or limit_price)
+                    filled_amount = part
+                    filled = True
+                    print(f"[BINANCEUS] {self.contract} partial fill: {part:.6f} @ {fill_price:.6f}, "
+                          f"proceeding with bracket")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[BINANCEUS] {self.contract} cancel/partial check error: {e}")
+
+            if not filled:
+                return await self.place_bracket_market(side, qty, stop, target)
+
+        # 4. Entry filled — settle coins then place OCO bracket (same as place_bracket_market)
+        base = self.contract.split('/')[0]
+        close_side = 'sell' if side.lower() == 'buy' else 'buy'
+        _settled_amount = filled_amount
+        for _wait_attempt in range(10):
+            await asyncio.sleep(1)
+            try:
+                _bal = await self.exchange.fetch_balance()
+                _base_free = float(_bal.get(base, {}).get('free', 0))
+                if _base_free >= filled_amount * 0.99:
+                    _settled_amount = _base_free
+                    break
+                print(f"[BINANCEUS] {self.contract}: waiting for settlement "
+                      f"({_base_free:.6f} of {filled_amount:.6f} {base} free, "
+                      f"attempt {_wait_attempt+1}/10)")
+            except Exception as _be:
+                print(f"[BINANCEUS] {self.contract}: balance poll error: {_be}")
+
+        bracket_amount = self.exchange.amount_to_precision(
+            self.contract, _settled_amount * 0.999
+        )
+
+        trades = [self._to_fake_ib_trade(entry_order)]
+        try:
+            stop_limit = self.exchange.price_to_precision(
+                self.contract, stop * (0.995 if close_side == 'sell' else 1.005)
+            )
+            oco_response = await self.exchange.private_post_order_oco({
+                'symbol':               self.exchange.market_id(self.contract),
+                'side':                 close_side.upper(),
+                'quantity':             bracket_amount,
+                'price':                self.exchange.price_to_precision(self.contract, target),
+                'stopPrice':            self.exchange.price_to_precision(self.contract, stop),
+                'stopLimitPrice':       stop_limit,
+                'stopLimitTimeInForce': 'GTC',
+            })
+            reports = oco_response.get('orderReports', [])
+            stop_report   = next((r for r in reports if r.get('type') == 'STOP_LOSS_LIMIT'), None)
+            target_report = next((r for r in reports if r.get('type') == 'LIMIT_MAKER'),    None)
+            if stop_report is None or target_report is None:
+                if len(reports) >= 2:
+                    stop_report, target_report = reports[0], reports[1]
+                else:
+                    raise RuntimeError(f"OCO response missing orderReports: {oco_response}")
+            trades.append(self._to_fake_ib_trade({'id': str(stop_report['orderId'])}))
+            trades.append(self._to_fake_ib_trade({'id': str(target_report['orderId'])}))
+            print(f"[BINANCEUS] {self.contract} OCO placed after LIMIT_MAKER fill: "
+                  f"stop={stop_report['orderId']} target={target_report['orderId']}")
+        except Exception as e:
+            print(f"[BINANCEUS] OCO bracket failed after limit entry: {e} — emergency closing position")
+            try:
+                await self.exchange.create_order(self.contract, 'market', close_side, bracket_amount)
+                print(f"[BINANCEUS] emergency close sent for {self.contract}")
+            except Exception as e2:
+                raise BracketOrphanError(
+                    f"limit entry filled but OCO+emergency_close both failed: {e2}"
+                ) from e
+            raise
+
         return trades
 
     # ------------------------------------------------------------------

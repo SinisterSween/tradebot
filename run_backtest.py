@@ -350,7 +350,10 @@ def build_strategy(strategy_name: str, s_cfg: dict, fees: dict):
             vwap_entry_max_atr=float(s_cfg.get("vwap_entry_max_atr", 0.0)),
             min_vwap_target_R=float(s_cfg.get("min_vwap_target_R", 0.0)),
             orb_minutes=int(s_cfg.get("orb_minutes", 0)),
-
+            allow_longs=_as_bool(s_cfg.get("allow_longs", True)),
+            allow_shorts=_as_bool(s_cfg.get("allow_shorts", True)),
+            ema_slope_buy_min=float(s_cfg.get("ema_slope_buy_min", -999.0)),
+            ema_slope_sell_max=float(s_cfg.get("ema_slope_sell_max", 999.0)),
         )
         cfg = RevCfg(**_filter_kwargs(RevCfg, rev_kwargs))
         return VwapReversion(cfg, debug_cfg_echo=debug_echo)

@@ -1,5 +1,5 @@
 symbols:
-  - LTC/USDT
+  - ADA/USDT
 asset_class: crypto
 exchange: binanceus
 timezone: UTC
@@ -9,9 +9,9 @@ backfill:
   timeframe: "1m"
   limit_per_call: 1000
 
-tick_size: 0.01
+tick_size: 0.0001
 point_value: 1
-trade_min_qty: 0.01
+trade_min_qty: 1.0
 
 risk:
   flat_time: "23:59"
@@ -21,8 +21,8 @@ risk:
   max_consec_losses: 999
 
 execution:
-  be_lock_min: 999999
-  be_req_profit_ticks: 999999
+  be_lock_min: 14
+  be_req_profit_ticks: 1
   max_hold_min: 45
 
 strategy_name: rsi_mean_reversion
@@ -41,7 +41,7 @@ strategy:
   exit_ema_side: touch
   ema_dist_atr_min: 5.0
   target_vwap: false
-  min_atr_pct: 0.00005
+  min_atr_pct: 0.001
   session_windows:
     - start: "00:00"
       end: "23:59"

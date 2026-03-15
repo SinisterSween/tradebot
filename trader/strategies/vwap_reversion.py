@@ -22,6 +22,11 @@ class StratConfig:
     vwap_entry_min_atr: float = 0.0
     vwap_entry_max_atr: float = 0.0
     orb_minutes: int = 0
+    # Directional regime gates (separate from symmetric ema_slope_max)
+    allow_longs: bool = True    # set False to disable BUY signals entirely
+    allow_shorts: bool = True   # set False to disable SELL signals entirely
+    ema_slope_buy_min: float = -999.0   # block BUY when ema_slope_atr < this (default: off)
+    ema_slope_sell_max: float = 999.0   # block SELL when ema_slope_atr > this (default: off)
 
 class VwapReversion:
     def __init__(self, cfg: StratConfig, *, debug_cfg_echo: bool = False):
@@ -141,10 +146,24 @@ class VwapReversion:
         if atr_pts <= 0:
             return reject("atr_pts<=0")
 
+        # Read directional regime fields (safe getattr for backward compat)
+        allow_longs  = bool(getattr(self.cfg, "allow_longs",  True))
+        allow_shorts = bool(getattr(self.cfg, "allow_shorts", True))
+        ema_slope_buy_min  = float(getattr(self.cfg, "ema_slope_buy_min",  -999.0) or -999.0)
+        ema_slope_sell_max = float(getattr(self.cfg, "ema_slope_sell_max",  999.0) or  999.0)
+
+        # Resolve ema_slope_atr for directional gates (same field used by ema_slope_max above)
+        _ema_sa = bar.get("ema_slope_atr", None)
+        _ema_slope_val: float = float(_ema_sa or 0.0) if _ema_sa is not None else 0.0
+
         side = None
         entry_price = px
 
         if px >= vwap + atr_pts:
+            if not allow_shorts:
+                return reject("shorts_disabled")
+            if _ema_slope_val > ema_slope_sell_max:
+                return reject("ema_slope_sell_max")
             side = "SELL"
             stop = entry_price + atr_pts + self.cfg.stop_pad_ticks * self.cfg.tick_size
             target = vwap if self.cfg.target_vwap else entry_price - self.cfg.target_R * abs(entry_price - stop)
@@ -155,6 +174,10 @@ class VwapReversion:
                     return reject("min_vwap_target_R")
 
         elif px <= vwap - atr_pts:
+            if not allow_longs:
+                return reject("longs_disabled")
+            if _ema_slope_val < ema_slope_buy_min:
+                return reject("ema_slope_buy_min")
             side = "BUY"
             stop = entry_price - atr_pts - self.cfg.stop_pad_ticks * self.cfg.tick_size
             target = vwap if self.cfg.target_vwap else entry_price + self.cfg.target_R * abs(entry_price - stop)
