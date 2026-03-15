@@ -42,7 +42,7 @@ strategy:
   require_cross: false
   min_minutes_between_trades: 0
   max_trades_per_day: 0
-  min_atr_pct: 0.00005
+  min_atr_pct: 0.001
   slope_max: 0.02
   ema_slope_atr_min: -999
   ema_slope_max: 0.0

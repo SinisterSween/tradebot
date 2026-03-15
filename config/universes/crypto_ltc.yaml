@@ -41,7 +41,7 @@ strategy:
   exit_ema_side: touch
   ema_dist_atr_min: 5.0
   target_vwap: false
-  min_atr_pct: 0.00005
+  min_atr_pct: 0.001
   session_windows:
     - start: "00:00"
       end: "23:59"

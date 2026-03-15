@@ -141,8 +141,14 @@ class CcxtBinanceus:
             except Exception as _be:
                 print(f"[BINANCEUS] {self.contract}: balance poll error: {_be}")
 
-        # Use the settled (actually available) coin amount for bracket orders
-        bracket_amount = self.exchange.amount_to_precision(self.contract, _settled_amount)
+        # Use the settled (actually available) coin amount for bracket orders.
+        # Multiply by 0.999 before precision rounding because:
+        # 1. Binance deducts ~0.1% trading fee from received coins, so _settled_amount
+        #    (actual free balance) may land just below the step boundary.
+        # 2. amount_to_precision() may ROUND UP on some CCXT builds, making bracket_amount
+        #    exceed the actual free balance → "insufficient balance" on the OCO SELL.
+        # The 0.001 buffer leaves at most ~$0.06 unprotected dust on a $62 lot.
+        bracket_amount = self.exchange.amount_to_precision(self.contract, _settled_amount * 0.999)
 
         # Use OCO (One-Cancels-Other) via direct Binance.US API call.
         # CCXT's unified create_order('oco', ...) is not reliably supported for binanceus;

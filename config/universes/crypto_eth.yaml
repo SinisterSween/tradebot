@@ -38,7 +38,7 @@ strategy:
   ema_slope_max: 0.03
   ema_max_dist_atr: 3.0
   stop_pad_ticks: 1
-  min_atr_pct: 0.00025
+  min_atr_pct: 0.003
   max_bar_range_atr: 4.0
   session_windows:
     - start: "00:00"
