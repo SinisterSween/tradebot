@@ -1,0 +1,56 @@
+# Dynamic crypto universe: scans all Binance.US USDT pairs at startup,
+# ranks by ATR*trend quality, and trades the top-scoring symbol.
+# Strategy: trend_pullback (only enters when EMA slope is positive — natural
+# bear-market gate, no entries until the coin starts trending up).
+
+symbols:
+  - ETH/USDT        # fallback if scanner fails to return results
+asset_class: crypto
+exchange: binanceus
+timezone: UTC
+
+# Scanner config — replaces the static symbols list at startup
+scan_universe: true
+scan_params:
+  top_n: 5                   # score top 5, try in order until one resolves
+  min_volume_usd: 100000     # minimum 24h USD volume
+  min_atr_pct: 0.003         # ATR must be >= 0.3% of price (avoid dead coins)
+  prefer_trending: true      # rank by trend strength (good for TrendPullback)
+  rescan_interval_min: 60    # re-rank all pairs every 60 min; rotate if #1 changes
+
+backfill:
+  days: 30
+  timeframe: "1m"
+  limit_per_call: 1000
+
+tick_size: 0.01
+point_value: 1
+trade_min_qty: 0.0001
+
+risk:
+  flat_time: "23:59"
+  max_notional_pct: 0.10
+  min_notional_usd: 10
+  max_daily_loss_R: 999
+  max_consec_losses: 999
+
+execution:
+  cooldown_bars: 10
+  max_hold_min: 60
+  be_lock_min: 999999
+  be_req_profit_ticks: 999999
+
+strategy_name: trend_pullback
+strategy:
+  atr_len: 14
+  atr_mult: 0.8
+  target_R: 1.5
+  slope_min: 0.1             # EMA slope must be >= 0.1 ATR/bar — no signal in flat/bear market
+  pullback_atr: 0.5          # price must be within 0.5 ATR of VWAP for entry
+  stop_pad_ticks: 2
+  min_atr_pct: 0.003
+  max_bar_range_atr: 5.0
+  regime_skip_bear: true     # also guard with ema_200 regime filter
+  session_windows:
+    - start: "00:00"
+      end: "23:59"

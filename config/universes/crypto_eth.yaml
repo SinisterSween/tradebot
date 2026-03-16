@@ -40,6 +40,7 @@ strategy:
   stop_pad_ticks: 1
   min_atr_pct: 0.00025
   max_bar_range_atr: 4.0
+  regime_skip_bear: true
   session_windows:
     - start: "00:00"
       end: "23:59"

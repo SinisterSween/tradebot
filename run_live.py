@@ -1423,6 +1423,7 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     Each gets its own broker instance, risk governor, rolling bars, etc.
     """
     stop = stop_all
+    _lot_stop = asyncio.Event()   # lot-local stop; set on symbol rotation (≠ global stop_all)
     name = lot["name"]
     is_live = False
 
@@ -1544,6 +1545,64 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     if rotate and len(candidates) > 1:
         import random
         random.shuffle(candidates)
+
+    # Dynamic scanner: when scan_universe: true in the universe YAML, replace the
+    # static symbol list with a live-scanned ranking.
+    # - Crypto (Binance.US): scans all ~100 USDT pairs by ATR×trend
+    # - Equity (IBKR):       scores the universe symbol list by ATR×trend+gap
+    # Runs at lot startup; falls back to static symbols on any error.
+    _scan_universe = bool(uni.get("scan_universe", False))
+    _scan_cfg = uni.get("scan_params", {})
+    if _scan_universe and CcxtBinanceus is not None and isinstance(broker, CcxtBinanceus):
+        # --- Crypto path ---
+        try:
+            from trader.engine.crypto_scanner import scan_top_symbols
+            _scanned = await scan_top_symbols(
+                broker.exchange,
+                top_n=int(_scan_cfg.get("top_n", 5)),
+                min_volume_usd=float(_scan_cfg.get("min_volume_usd", 100_000)),
+                min_atr_pct=float(_scan_cfg.get("min_atr_pct", 0.003)),
+                prefer_trending=bool(_scan_cfg.get("prefer_trending", True)),
+                verbose=True,
+            )
+            if _scanned:
+                print(f"[{name}] scanner selected {len(_scanned)} candidates: {_scanned}")
+                candidates = _scanned
+                try:
+                    from scripts.heartbeat import notify_lot_started
+                    notify_lot_started(name, _scanned[0], _scanned)
+                except Exception:
+                    pass
+            else:
+                print(f"[{name}] scanner returned no results — using static symbols")
+        except Exception as _scan_e:
+            print(f"[{name}] scanner error: {_scan_e} — using static symbols")
+
+    elif _scan_universe and isinstance(broker, (IbkrBroker, IbkrFractional)):
+        # --- Equity path: score the universe symbol list via IBKR historical bars ---
+        try:
+            from trader.engine.equity_scanner import scan_top_symbols as scan_equity
+            _scanned = await scan_equity(
+                broker,
+                symbols,
+                top_n=int(_scan_cfg.get("top_n", 3)),
+                lookback_days=int(_scan_cfg.get("lookback_days", 3)),
+                prefer_trending=bool(_scan_cfg.get("prefer_trending", True)),
+                inter_request_sleep=float(_scan_cfg.get("inter_request_sleep", 1.5)),
+                verbose=True,
+            )
+            if _scanned:
+                print(f"[{name}] equity scanner selected: {_scanned}")
+                candidates = _scanned
+                try:
+                    from scripts.heartbeat import notify_lot_started
+                    notify_lot_started(name, _scanned[0], _scanned)
+                except Exception:
+                    pass
+            else:
+                print(f"[{name}] equity scanner returned no results — using static symbols")
+        except Exception as _scan_e:
+            print(f"[{name}] equity scanner error: {_scan_e} — using static symbols")
 
     # Pre-score: build per-symbol strategy, run against latest CSV bar, rank with PortfolioSelector
     class _DummyRisk:
@@ -1803,7 +1862,7 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
         _pos["tp_id"]    = None
 
     async def on_bar(bar: dict):
-        if stop.is_set():
+        if stop.is_set() or _lot_stop.is_set():
             return
         # normalize incoming bar shape
         dt = bar.get("datetime") or bar.get("ts")
@@ -2214,6 +2273,49 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
 
 
 
+    # ------------------------------------------------------------------
+    # 7b. Periodic re-scan task (scan_universe lots only)
+    # When the scanner finds a better symbol and the lot is flat, sets
+    # _lot_stop so this lot exits cleanly, then self-restarts via a new
+    # asyncio task — picking the new top candidate on the next startup scan.
+    # ------------------------------------------------------------------
+    _rescan_task = None
+    if _scan_universe and CcxtBinanceus is not None and isinstance(broker, CcxtBinanceus):
+        _rescan_interval_min = int(_scan_cfg.get("rescan_interval_min", 60))
+        if _rescan_interval_min > 0:
+            async def _rescan_fn():
+                await asyncio.sleep(_rescan_interval_min * 60)
+                while not stop.is_set() and not _lot_stop.is_set():
+                    if not _pos["open"]:
+                        try:
+                            from trader.engine.crypto_scanner import scan_top_symbols as _scan_fn
+                            _new = await _scan_fn(
+                                broker.exchange,
+                                top_n=int(_scan_cfg.get("top_n", 5)),
+                                min_volume_usd=float(_scan_cfg.get("min_volume_usd", 100_000)),
+                                min_atr_pct=float(_scan_cfg.get("min_atr_pct", 0.003)),
+                                prefer_trending=bool(_scan_cfg.get("prefer_trending", True)),
+                                verbose=False,
+                            )
+                            if _new and _new[0] != symbol:
+                                print(f"[{name}] RESCAN: new top coin {_new[0]} (was {symbol}) — rotating")
+                                try:
+                                    from scripts.heartbeat import notify_rotation
+                                    notify_rotation(name, symbol, _new[0])
+                                except Exception:
+                                    pass
+                                _lot_stop.set()
+                                return
+                            else:
+                                top = _new[0] if _new else "none"
+                                print(f"[{name}] RESCAN: top={top} unchanged, keeping {symbol}")
+                        except Exception as _re:
+                            print(f"[{name}] rescan error: {_re}")
+                    else:
+                        print(f"[{name}] RESCAN: position open, deferring rotation check")
+                    await asyncio.sleep(_rescan_interval_min * 60)
+            _rescan_task = asyncio.create_task(_rescan_fn())
+
     bar_task = asyncio.create_task(
         broker.stream_realtime_bars(
             on_bar=on_bar,
@@ -2239,13 +2341,17 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
     bar_task.add_done_callback(_task_done)
 
     try:
-        # run until cancelled from outside (Ctrl-C or SIGINT in run_portfolio)
-        while not stop.is_set():
+        # run until global shutdown OR lot-local rotation trigger
+        while not stop.is_set() and not _lot_stop.is_set():
             await asyncio.sleep(0.2)
 
     except asyncio.CancelledError:
         pass
     finally:
+        if _rescan_task:
+            _rescan_task.cancel()
+            with suppress(Exception):
+                await _rescan_task
         bar_task.cancel()
         watch_task.cancel()
         with suppress(Exception):
@@ -2254,6 +2360,15 @@ async def run_microlot(lot: Dict[str, Any], dry_run: bool, client_id: int, stop_
             await watch_task
         await broker.disconnect()
         print(f"[{name}] microlot stopped and broker disconnected")
+
+    # Symbol rotation: if _lot_stop fired (not a global shutdown), self-restart so the
+    # startup scanner picks the new top coin.
+    if _lot_stop.is_set() and not stop.is_set():
+        print(f"[{name}] rotation: restarting microlot to pick new top symbol...")
+        asyncio.get_event_loop().create_task(
+            run_microlot(lot, dry_run, client_id, stop_all, lot_status),
+            name=f"microlot:{name}",
+        )
 
 
 if __name__ == "__main__":

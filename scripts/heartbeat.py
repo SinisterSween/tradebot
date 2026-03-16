@@ -101,6 +101,32 @@ def _format_daily_summary(date_str: str, lot_status: Dict) -> str:
     return "\n".join(lines)
 
 
+# ── one-shot alert helpers ────────────────────────────────────────────────────
+
+def notify_lot_started(lot_name: str, symbol: str, candidates: list, scanner_lines: str = "") -> None:
+    """
+    Post a startup message when a scanner-driven lot picks its symbol.
+    candidates: full ranked list (e.g. ['NVDA', 'AAPL', 'MSFT'])
+    scanner_lines: optional pre-formatted score detail from the scanner
+    """
+    others = ", ".join(candidates[1:]) if len(candidates) > 1 else "—"
+    msg = (
+        f"🔭 **[{lot_name}] Scanner selected `{symbol}`**\n"
+        f"Candidates: {', '.join(candidates)}\n"
+        f"Runner-up: {others}"
+    )
+    if scanner_lines:
+        msg += f"\n```\n{scanner_lines}\n```"
+    _notify(msg)
+
+
+def notify_rotation(lot_name: str, old_symbol: str, new_symbol: str) -> None:
+    """Post when a crypto lot rotates to a new top coin mid-session."""
+    _notify(
+        f"🔄 **[{lot_name}] Rotating** `{old_symbol}` → `{new_symbol}`"
+    )
+
+
 # ── main coroutine ────────────────────────────────────────────────────────────
 
 async def heartbeat_loop(lot_status: Dict, stop_event: asyncio.Event) -> None:

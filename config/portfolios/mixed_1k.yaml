@@ -45,3 +45,24 @@ microlots:
     max_risk_per_trade: 0.0075
     max_pos: 1
     day_trade_cap: 999
+
+  - name: EQ-DYN
+    cash_alloc: 500
+    universe: sp500_dynamic
+    profile: config/profile/equities.yaml
+    broker: ibkr_fractional
+    max_risk_per_trade: 0.02
+    max_pos: 1
+    day_trade_cap: 2
+    dry_run: true  # scanner-selected symbol, keep dry until first live equity session validated
+
+  - name: CRYPTO-DYN
+    cash_alloc: 50
+    universe: crypto_dynamic
+    profile: config/profile/crypto.yaml
+    broker: binanceus
+    max_risk_per_trade: 0.0075
+    max_pos: 1
+    day_trade_cap: 999
+    # Scans all Binance.US USDT pairs at startup, picks top 5 by ATR×trend score.
+    # Uses TrendPullback — naturally dormant in bear markets, auto-activates in bulls.

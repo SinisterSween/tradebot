@@ -1,0 +1,65 @@
+# Dynamic equity universe: scores all 14 symbols at lot startup via IBKR
+# reqHistoricalData, ranks by ATR×trend×gap, and trades the top candidate.
+# Strategy: hybrid_orb_vwap (same as sp500_fractional but picks the best
+# symbol each morning rather than rotating through all 14).
+
+symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - SMH
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - NVDA
+  - TSLA
+  - META
+  - NFLX
+  - AMD
+  - CRM
+asset_class: equity
+exchange: ibkr
+timezone: America/New_York
+
+# Scanner config — scores the 14 symbols above at startup, picks top_n
+scan_universe: true
+scan_params:
+  top_n: 3                       # score top 3, try in order until one resolves
+  lookback_days: 3               # days of 1m bars to fetch per symbol
+  prefer_trending: true          # weight EMA slope in score (good for ORB)
+  inter_request_sleep: 1.5       # seconds between IBKR historical requests (~21s total)
+
+backfill:
+  days: 30
+  timeframe: "1m"
+
+tick_size: 0.01
+point_value: 1
+fractional: true
+
+risk:
+  flat_time: "15:55"
+  max_notional_pct: 0.10
+  min_notional_usd: 10
+  max_daily_loss_R: 3
+  max_consec_losses: 3
+
+execution:
+  max_hold_min: 60
+  be_lock_min: 999999
+  be_req_profit_ticks: 999999
+
+strategy_name: hybrid_orb_vwap
+strategy:
+  orb_minutes: 15
+  atr_len: 14
+  break_eps_ticks: 2
+  atr_mult: 1.0
+  target_R: 1.0
+  slope_min: 0.06
+  stop_pad_ticks: 2
+  trail_pad_ticks: 2
+  session_windows:
+    - start: "09:30"
+      end: "15:55"

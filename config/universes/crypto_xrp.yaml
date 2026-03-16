@@ -60,6 +60,7 @@ strategy:
   require_early_done: false
   use_session_open_stop: true
   session_open_stop_atr_pad: 0.15
+  regime_skip_bear: true
   session_windows:
     - start: "00:00"
       end: "23:59"

@@ -11,7 +11,7 @@ backfill:
 
 tick_size: 0.01
 point_value: 1
-trade_min_qty: 0.0001
+trade_min_qty: 0.01
 
 risk:
   flat_time: "23:59"
@@ -21,27 +21,21 @@ risk:
   max_consec_losses: 999
 
 execution:
-  cooldown_bars: 5
-  max_hold_min: 30
+  cooldown_bars: 10
+  max_hold_min: 60
   be_lock_min: 999999
   be_req_profit_ticks: 999999
 
-strategy_name: vwap_reversion
+strategy_name: trend_pullback
 strategy:
   atr_len: 14
-  atr_mult: 1.0
+  atr_mult: 0.8
   target_R: 1.5
-  orb_minutes: 10
-  target_vwap: false
-  slope_max: 0.08
-  stop_pad_ticks: 1
-  min_atr_pct: 0.001
-  max_bar_range_atr: 6.0
-  vwap_entry_min_atr: 0.5
-  vwap_entry_max_atr: 3.5
-  ema_slope_max: 0.0
-  ema_max_dist_atr: 0.0
-  min_vwap_target_R: 0.25
+  slope_min: 0.1
+  pullback_atr: 0.5
+  stop_pad_ticks: 2
+  min_atr_pct: 0.003
+  max_bar_range_atr: 5.0
   regime_skip_bear: true
   session_windows:
     - start: "00:00"

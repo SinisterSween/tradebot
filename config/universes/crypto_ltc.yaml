@@ -42,6 +42,7 @@ strategy:
   ema_dist_atr_min: 5.0
   target_vwap: false
   min_atr_pct: 0.00005
+  regime_skip_bear: true
   session_windows:
     - start: "00:00"
       end: "23:59"

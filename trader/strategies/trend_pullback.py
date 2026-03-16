@@ -17,9 +17,11 @@ class StratConfig:
     min_notional_usd: float = 0.0
 
 class TrendPullback:
-    def __init__(self, cfg: StratConfig):
+    def __init__(self, cfg: StratConfig, *, debug_cfg_echo: bool = False):
         self.cfg = cfg
         self._dbg = 0
+        if debug_cfg_echo:
+            print(f"[STRAT.ECHO] TrendPullback cfg={self.cfg}")
 
     def window_ok(self, ts_local_str: str, windows) -> bool:
         return any(w["start"] <= ts_local_str <= w["end"] for w in windows)
